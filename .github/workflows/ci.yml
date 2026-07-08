@@ -88,7 +88,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/protocol/fuzz
+      # Explicit --target: prebuilt cargo-fuzz binaries are musl-built and
+      # would otherwise default the fuzz target to musl (no std/ASan there).
       - name: fuzz datagram parser
-        run: cargo +nightly fuzz run datagram_parse --fuzz-dir crates/protocol/fuzz -- -max_total_time=60
+        run: cargo +nightly fuzz run datagram_parse --fuzz-dir crates/protocol/fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=60
       - name: fuzz control decode
-        run: cargo +nightly fuzz run control_decode --fuzz-dir crates/protocol/fuzz -- -max_total_time=60
+        run: cargo +nightly fuzz run control_decode --fuzz-dir crates/protocol/fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=60
