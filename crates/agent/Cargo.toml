@@ -1,0 +1,34 @@
+[package]
+name = "gsa-agent"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "AGPL-3.0-only"
+description = "The game-streamer-agent host daemon and CLI"
+
+[[bin]]
+name = "gsa"
+path = "src/main.rs"
+
+[dependencies]
+gsa-core = { workspace = true }
+gsa-protocol = { workspace = true }
+gsa-capture-api = { workspace = true }
+gsa-encode-api = { workspace = true }
+gsa-transport = { workspace = true }
+gsa-session = { workspace = true }
+gsa-sources = { workspace = true }
+gsa-encode-sw = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

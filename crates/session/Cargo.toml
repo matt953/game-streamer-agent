@@ -1,0 +1,25 @@
+[package]
+name = "gsa-session"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "AGPL-3.0-only"
+description = "Session orchestration for game-streamer-agent: pipeline assembly, control protocol service, admin socket"
+
+[dependencies]
+gsa-core = { workspace = true }
+gsa-protocol = { workspace = true }
+gsa-capture-api = { workspace = true }
+gsa-encode-api = { workspace = true }
+gsa-transport = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

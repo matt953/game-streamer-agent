@@ -1,0 +1,22 @@
+[package]
+name = "gsa-client-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Embeddable streaming client core: connect, negotiate, reassemble, decode orchestration, stats"
+
+[dependencies]
+gsa-core = { workspace = true }
+gsa-protocol = { workspace = true }
+gsa-transport = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

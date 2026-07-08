@@ -1,0 +1,31 @@
+[package]
+name = "gsa-client-dev"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Developer debug client for game-streamer-agent: headless stats mode and windowed presentation"
+
+[[bin]]
+name = "gsa-client-dev"
+path = "src/main.rs"
+
+[dependencies]
+gsa-core = { workspace = true }
+gsa-protocol = { workspace = true }
+gsa-client-core = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+openh264 = { workspace = true }
+winit = { workspace = true }
+softbuffer = { workspace = true }
+
+[lints]
+workspace = true

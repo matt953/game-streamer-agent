@@ -1,0 +1,188 @@
+//! `gsa` — the game-streamer-agent binary. `gsa run` is the daemon;
+//! every other subcommand is a thin admin-socket client (spec 12).
+
+mod factories;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use gsa_core::config::{AgentConfig, default_control_socket};
+use gsa_session::admin::{AdminRequest, AdminResponse};
+use gsa_session::{AgentState, serve_connection};
+
+#[derive(Parser, Debug)]
+#[command(name = "gsa", version, about = "Game streamer agent")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the agent daemon (foreground).
+    Run {
+        /// Path to a TOML config file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the QUIC listen address (e.g. 127.0.0.1:0 for ephemeral).
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+        /// Override the admin socket path / pipe name.
+        #[arg(long)]
+        control_socket: Option<PathBuf>,
+    },
+    /// Query a running agent's status.
+    Status {
+        /// Emit raw JSON (scripting/CI).
+        #[arg(long)]
+        json: bool,
+        /// Admin socket path / pipe name of the target agent.
+        #[arg(long)]
+        control_socket: Option<PathBuf>,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
+    match cli.command {
+        Command::Run {
+            config,
+            listen,
+            control_socket,
+        } => {
+            init_tracing();
+            runtime.block_on(run(config, listen, control_socket))
+        }
+        Command::Status {
+            json,
+            control_socket,
+        } => runtime.block_on(status(json, control_socket)),
+    }
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+}
+
+fn load_config(
+    path: Option<PathBuf>,
+    listen: Option<std::net::SocketAddr>,
+    control_socket: Option<PathBuf>,
+) -> Result<AgentConfig> {
+    let mut cfg = match path {
+        Some(p) => {
+            let text = std::fs::read_to_string(&p)
+                .with_context(|| format!("read config {}", p.display()))?;
+            toml::from_str(&text).with_context(|| format!("parse config {}", p.display()))?
+        }
+        None => AgentConfig::default(),
+    };
+    if let Some(listen) = listen {
+        cfg.listen = listen;
+    }
+    if let Some(sock) = control_socket {
+        cfg.control_socket = Some(sock);
+    }
+    Ok(cfg)
+}
+
+async fn run(
+    config: Option<PathBuf>,
+    listen: Option<std::net::SocketAddr>,
+    control_socket: Option<PathBuf>,
+) -> Result<()> {
+    let cfg = load_config(config, listen, control_socket)?;
+
+    let identity = gsa_transport::Identity::generate().context("generate identity")?;
+    let endpoint = gsa_transport::server_endpoint(cfg.listen, &identity).context("bind QUIC")?;
+    let local_addr = endpoint.local_addr().context("local addr")?;
+
+    let socket_path = cfg
+        .control_socket
+        .clone()
+        .unwrap_or_else(default_control_socket);
+    let state = Arc::new(AgentState::new(
+        AgentConfig {
+            listen: local_addr,
+            ..cfg
+        },
+        identity.fingerprint(),
+    ));
+
+    tracing::info!(
+        listen = %local_addr,
+        fingerprint = state.fingerprint,
+        version = env!("CARGO_PKG_VERSION"),
+        "gsa agent running"
+    );
+
+    let admin_state = state.clone();
+    let admin_socket = socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) = gsa_session::admin::serve(admin_state, &admin_socket).await {
+            tracing::error!(error = %e, "admin socket failed");
+        }
+    });
+
+    let sources = Arc::new(factories::TestSources::new(state.clock.clone()));
+    let encoders = Arc::new(factories::SwEncoders::new(state.clock.clone()));
+
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break };
+                let state = state.clone();
+                let sources = sources.clone();
+                let encoders = encoders.clone();
+                tokio::spawn(async move {
+                    match incoming.await {
+                        Ok(conn) => serve_connection(conn, state, sources, encoders).await,
+                        Err(e) => tracing::warn!(error = %e, "handshake failed"),
+                    }
+                });
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutting down");
+                break;
+            }
+        }
+    }
+    endpoint.close(0u32.into(), b"agent shutdown");
+    Ok(())
+}
+
+async fn status(json: bool, control_socket: Option<PathBuf>) -> Result<()> {
+    let socket = control_socket.unwrap_or_else(default_control_socket);
+    let reply = gsa_session::admin::request(&socket, &AdminRequest::Status).await?;
+    match reply {
+        AdminResponse::Status(s) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&s)?);
+            } else {
+                println!("gsa agent v{} — up {}s", s.agent_version, s.uptime_s);
+                println!("  listening:   {}", s.listen);
+                println!("  fingerprint: {}", s.fingerprint);
+                if s.sessions.is_empty() {
+                    println!("  sessions:    none");
+                } else {
+                    for sess in &s.sessions {
+                        println!(
+                            "  session {}: {} {}x{}@{} — {} frames sent",
+                            sess.id, sess.peer, sess.width, sess.height, sess.fps, sess.frames_sent
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+    }
+}

@@ -1,0 +1,71 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/capture-api",
+    "crates/encode-api",
+    "crates/protocol",
+    "crates/transport",
+    "crates/sources",
+    "crates/encode-sw",
+    "crates/session",
+    "crates/client-core",
+    "crates/client-dev",
+    "crates/agent",
+    "xtask",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.93"
+repository = "https://github.com/matt953/game-streamer-agent"
+
+[workspace.dependencies]
+# intra-workspace
+gsa-core = { path = "crates/core" }
+gsa-capture-api = { path = "crates/capture-api" }
+gsa-encode-api = { path = "crates/encode-api" }
+gsa-protocol = { path = "crates/protocol" }
+gsa-transport = { path = "crates/transport" }
+gsa-sources = { path = "crates/sources" }
+gsa-encode-sw = { path = "crates/encode-sw" }
+gsa-session = { path = "crates/session" }
+gsa-client-core = { path = "crates/client-core" }
+
+# external
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+thiserror = "2"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+toml = "0.8"
+openh264 = "0.9"
+winit = "0.30"
+softbuffer = "0.4"
+anyhow = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# The software codec is real-time even in dev builds only when its C core
+# is optimized; everything else stays fast-compiling debug.
+[profile.dev.package.openh264]
+opt-level = 3
+[profile.dev.package.openh264-sys2]
+opt-level = 3

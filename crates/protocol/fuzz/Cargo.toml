@@ -1,0 +1,32 @@
+[package]
+name = "gsa-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gsa-protocol = { path = ".." }
+
+[[bin]]
+name = "datagram_parse"
+path = "fuzz_targets/datagram_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_decode"
+path = "fuzz_targets/control_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace: fuzz binaries are nightly-only and must not join
+# the main workspace's builds.
+[workspace]
+members = ["."]

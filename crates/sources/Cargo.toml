@@ -1,0 +1,18 @@
+[package]
+name = "gsa-sources"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "AGPL-3.0-only"
+description = "Non-desktop RenderSources for game-streamer-agent: test pattern (M0), emulator hosts (later)"
+
+[dependencies]
+gsa-core = { workspace = true }
+gsa-capture-api = { workspace = true }
+gsa-protocol = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

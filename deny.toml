@@ -1,0 +1,44 @@
+[graph]
+all-features = true
+
+[licenses]
+# Inbound-compatibility allowlist for an AGPLv3 agent + MIT/Apache shared
+# crates (spec 00 D8). Everything here combines cleanly into AGPL-3.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0", # webpki root-cert data via quinn's platform verifier
+    "AGPL-3.0-only",       # our own agent-side crates
+]
+confidence-threshold = 0.8
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # ttf-parser unmaintained; pulled in by winit's optional Wayland
+    # client-side-decoration theme (Linux, debug client only). Reassess
+    # when winit updates its decoration stack.
+    "RUSTSEC-2026-0192",
+    # quick-xml DoS advisories: reached only via wayland-scanner, a
+    # build-time code generator (Linux, debug client only) — it parses
+    # trusted protocol XML from the wayland crates, never attacker input.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace path dependencies carry no version by design.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,94 @@
+# CI per spec/13-ci.md. YAML stays a thin caller: logic lives in cargo
+# commands and xtask (spec 01 no-scripts policy).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ── Tier 0: every PR ────────────────────────────────────────────────
+  check:
+    name: build+test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the version; bare `cargo build` on a fresh
+      # runner IS the fresh-clone invariant (spec 01).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  deny:
+    name: cargo-deny (licenses + advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo hack check --workspace --each-feature --no-dev-deps
+
+  # ── Tier 1: merge to main (also on PRs while the suite is cheap) ────
+  e2e:
+    name: e2e loopback (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci-e2e --frames 300 --report target/e2e-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: latency-ledger-${{ matrix.os }}-${{ github.sha }}
+          path: target/e2e-report.json
+
+  fuzz-smoke:
+    name: fuzz smoke
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/protocol/fuzz
+      - name: fuzz datagram parser
+        run: cargo +nightly fuzz run datagram_parse --fuzz-dir crates/protocol/fuzz -- -max_total_time=60
+      - name: fuzz control decode
+        run: cargo +nightly fuzz run control_decode --fuzz-dir crates/protocol/fuzz -- -max_total_time=60
