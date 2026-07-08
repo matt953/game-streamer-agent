@@ -45,7 +45,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-toml = "0.8"
+toml = "1"
 openh264 = "0.9"
 winit = "0.30"
 softbuffer = "0.4"
