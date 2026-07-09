@@ -7,9 +7,11 @@
 //! (spec 06) — the verifier type is the seam.
 
 mod identity;
+mod peers;
 mod stream;
 
 pub use identity::{Identity, fingerprint};
+pub use peers::{Peer, PeerStore};
 pub use stream::{recv_msg, send_msg};
 
 use std::net::{SocketAddr, UdpSocket};
