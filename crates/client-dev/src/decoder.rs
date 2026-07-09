@@ -34,15 +34,10 @@ impl VideoDecoder for OpenH264Decoder {
         let mut rgba = vec![0u8; width * height * 4];
         yuv.write_rgba8(&mut rgba);
 
-        let (y_stride, _, _) = yuv.strides();
-        let luma = yuv.y().to_vec();
-
         Ok(Some(DecodedFrame {
             width: width as u32,
             height: height as u32,
             rgba,
-            luma,
-            luma_stride: y_stride,
         }))
     }
 }

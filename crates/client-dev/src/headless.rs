@@ -45,6 +45,8 @@ pub async fn run(
         None => sources.first().context("agent offers no sources")?,
     };
     tracing::info!(source = source.name, "starting session");
+    // Marker verification only means something for the synthetic pattern.
+    let check_markers = source.kind == gsa_protocol::control::SourceKind::TestPattern;
     let params = client.start_session(SourceId(source.id.0), None).await?;
 
     let mut decoder = OpenH264Decoder::new()?;
@@ -59,11 +61,10 @@ pub async fn run(
         };
         decoded += 1;
 
-        if let Some(marker) = gsa_core::pattern::read_marker_luma(
-            &out.frame.luma,
-            out.frame.luma_stride,
-            out.frame.width as usize,
-        ) {
+        if let Some(marker) = check_markers
+            .then(|| gsa_core::pattern::read_marker_rgba(&out.frame.rgba, out.frame.width as usize))
+            .flatten()
+        {
             marker_read_ok += 1;
             if let Some(prev) = last_marker {
                 // Markers may skip (dropped frames) but must never go back.

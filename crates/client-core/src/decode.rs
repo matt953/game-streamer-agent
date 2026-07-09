@@ -15,10 +15,9 @@ pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
     /// Tightly-packed RGBA8 (`width * height * 4` bytes) for presentation.
+    /// (Test-pattern marker readback samples this directly via
+    /// `pattern::read_marker_rgba` — no separate luma plane.)
     pub rgba: Vec<u8>,
-    /// Y plane (`luma_stride * height` bytes) for test-pattern readback.
-    pub luma: Vec<u8>,
-    pub luma_stride: usize,
 }
 
 /// An H.264 (M0) access-unit decoder.

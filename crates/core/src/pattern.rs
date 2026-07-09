@@ -57,6 +57,26 @@ pub fn read_marker_luma(y_plane: &[u8], stride: usize, width: usize) -> Option<u
     Some(index)
 }
 
+/// Read the marker from a packed 4-byte-per-pixel image (RGBA or BGRA —
+/// marker blocks are pure black/white so the green channel is a valid
+/// brightness proxy in either order). `width` in pixels, tightly packed.
+#[must_use]
+pub fn read_marker_rgba(buf: &[u8], width: usize) -> Option<u32> {
+    if width < MIN_WIDTH {
+        return None;
+    }
+    let mut index = 0u32;
+    for bit in 0..BLOCKS {
+        let cx = bit * BLOCK + BLOCK / 2;
+        let cy = BLOCK / 2;
+        let green = *buf.get((cy * width + cx) * 4 + 1)?;
+        if green > 0x80 {
+            index |= 1 << (31 - bit);
+        }
+    }
+    Some(index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +103,7 @@ mod tests {
             write_marker_bgra(&mut buf, stride, index);
             let luma = bgra_to_luma(&buf, stride, w, h);
             assert_eq!(read_marker_luma(&luma, w, w), Some(index));
+            assert_eq!(read_marker_rgba(&buf, w), Some(index));
         }
     }
 }
