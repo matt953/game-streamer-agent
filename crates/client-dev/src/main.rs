@@ -2,6 +2,7 @@
 //! `--headless` decodes N frames and emits a stats JSON blob (the CI/e2e
 //! mode); the default mode opens a window and presents the stream.
 
+mod audio_playback;
 mod decoder;
 #[cfg(target_os = "macos")]
 mod decoder_vt;

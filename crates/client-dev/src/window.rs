@@ -73,6 +73,18 @@ fn network_loop(
                 let _ = proxy.send_event(AppEvent::Ready(sender));
             }
 
+            // Start audio playback; keep `_audio` alive for the session. Video
+            // continues if the client has no audio device.
+            let _audio = match client.take_audio_output() {
+                Ok(rx) => crate::audio_playback::start(rx)
+                    .inspect_err(|e| tracing::warn!(error = %e, "audio playback unavailable"))
+                    .ok(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no audio output");
+                    None
+                }
+            };
+
             let mut decoder = make_decoder(force_sw)?;
             let mut frames = 0u64;
             while let Some(out) = client.recv_frame(decoder.as_mut()).await? {
