@@ -84,6 +84,9 @@ struct DelegateState {
     sink: FrameSink,
     audio_sink: AudioSink,
     clock: MediaClock,
+    /// Guards a one-shot debug log of the delivered audio layout (we assume
+    /// Float32; interleaved vs planar is handled either way).
+    audio_logged: std::sync::atomic::AtomicBool,
 }
 
 define_class!(
@@ -181,6 +184,20 @@ impl StreamOutput {
             return;
         }
 
+        let state = self.ivars();
+        if !state
+            .audio_logged
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::debug!(
+                buffers = list.n,
+                frames,
+                buf0_bytes = list.buffers[0].mDataByteSize,
+                buf0_channels = list.buffers[0].mNumberChannels,
+                "audio format (first buffer)"
+            );
+        }
+
         let mut pcm = vec![0i16; frames * AUDIO_CHANNELS];
         // SAFETY: each buffer's `mData` points to `mDataByteSize` bytes of f32
         // inside the retained block buffer we hold above.
@@ -204,7 +221,6 @@ impl StreamOutput {
             }
         }
 
-        let state = self.ivars();
         state.audio_sink.submit(AudioFrame {
             samples: pcm,
             sample_rate: AUDIO_SAMPLE_RATE as u32,
@@ -411,6 +427,7 @@ impl RenderSource for DesktopCapture {
             sink,
             audio_sink,
             clock: self.clock.clone(),
+            audio_logged: std::sync::atomic::AtomicBool::new(false),
         });
         let output_proto = ProtocolObject::from_ref(&*delegate);
 
