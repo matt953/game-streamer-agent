@@ -21,6 +21,10 @@ pub enum C2A {
         latest_decoded: FrameId,
         lost: Vec<FrameId>,
     },
+    /// Ask the agent to emit a keyframe (IDR) — the client's decoder lost
+    /// its reference chain (missed/corrupt frame) and needs to resync
+    /// (spec 04 loss-recovery ladder).
+    RequestKeyframe,
     StatsReport(ClientStats),
     Ping {
         client_ts_us: u64,
@@ -56,6 +60,8 @@ pub struct HelloAck {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecodeCaps {
     pub codecs: Vec<Codec>,
+    /// Highest H.264 profile the client can decode; the host encodes at or below it.
+    pub max_h264_profile: gsa_core::media::H264Profile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

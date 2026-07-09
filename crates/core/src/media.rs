@@ -10,6 +10,15 @@ pub enum Codec {
     Av1,
 }
 
+/// H.264 profile, ordered by capability so the session negotiates with a `min`
+/// (encoder ceiling vs client decode cap, spec 03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum H264Profile {
+    ConstrainedBaseline,
+    Main,
+    High,
+}
+
 /// Pixel formats crossing the capture → encode boundary.
 ///
 /// `Bgra444`/`P010` variants are reserved per spec 03 (4:4:4 option, HDR)

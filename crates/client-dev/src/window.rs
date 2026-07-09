@@ -42,12 +42,23 @@ fn network_loop(
     proxy: &EventLoopProxy<AppEvent>,
 ) {
     let outcome = (|| -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // Multi-threaded so the input-writer task runs on its own worker,
+        // independent of the frame-receive loop — otherwise, while parked
+        // on `read_datagram` (idle screen = no frames), queued input isn't
+        // flushed until the next frame wakes the runtime, delivering
+        // keystrokes in a delayed burst.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .context("client runtime")?;
         runtime.block_on(async {
-            let mut client = Client::connect(addr, "client-dev").await?;
+            let mut client = Client::connect(
+                addr,
+                "client-dev",
+                crate::decoder::decoder_max_profile(force_sw),
+            )
+            .await?;
             let sources = client.list_sources().await?;
             let source = match source_id {
                 Some(id) => sources

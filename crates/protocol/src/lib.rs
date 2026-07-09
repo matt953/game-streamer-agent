@@ -46,6 +46,7 @@ mod tests {
             client_name: "test".into(),
             decode_caps: DecodeCaps {
                 codecs: vec![gsa_core::media::Codec::H264],
+                max_h264_profile: gsa_core::media::H264Profile::High,
             },
         });
         let bytes = encode_msg(&hello).unwrap();

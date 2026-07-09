@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use gsa_capture_api::{RenderSource, SourceConfig, frame_channel};
-use gsa_core::media::{Codec, VideoMode};
+use gsa_core::media::{Codec, H264Profile, VideoMode};
 use gsa_core::time::wire_ts;
 use gsa_core::{Error, Result};
 use gsa_encode_api::{EncodeConfig, Encoder, FrameDirectives};
@@ -26,6 +26,16 @@ pub struct PipelineHandle {
     source: Box<dyn RenderSource>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
     pub frames_sent: Arc<AtomicU64>,
+    /// Set to force the next encoded frame to be an IDR (client loss
+    /// recovery, spec 04).
+    force_idr: Arc<AtomicBool>,
+}
+
+impl PipelineHandle {
+    /// Request a keyframe on the next frame (client couldn't decode).
+    pub fn request_keyframe(&self) {
+        self.force_idr.store(true, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for PipelineHandle {
@@ -45,23 +55,31 @@ pub fn start(
     conn: quinn::Connection,
     mode: VideoMode,
     bitrate_bps: u32,
+    h264_profile: H264Profile,
 ) -> Result<PipelineHandle> {
     let (sink, rx) = frame_channel();
     encoder.open(EncodeConfig {
         codec: Codec::H264,
         mode,
         bitrate_bps,
+        h264_profile,
     })?;
     source.start(SourceConfig { mode }, sink)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let frames_sent = Arc::new(AtomicU64::new(0));
+    let force_idr = Arc::new(AtomicBool::new(false));
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let stop_enc = stop.clone();
+    let force_idr_enc = force_idr.clone();
     let encode_thread = std::thread::Builder::new()
         .name("gsa-encode".into())
         .spawn(move || {
+            // Encode only real captures — never re-encode a held frame to
+            // synthesize a keyframe. Capture backends recycle their pooled
+            // IOSurfaces after the callback, so a held handle can read back
+            // stale pixels. A pending keyframe rides the next real capture.
             while !stop_enc.load(Ordering::Acquire) {
                 let Some(frame) = rx.recv_latest(Duration::from_millis(100)) else {
                     if rx.is_closed() {
@@ -69,7 +87,11 @@ pub fn start(
                     }
                     continue;
                 };
-                if let Err(e) = encoder.submit(&frame, FrameDirectives::default()) {
+                let directives = FrameDirectives {
+                    idr: force_idr_enc.swap(false, Ordering::AcqRel),
+                    ..Default::default()
+                };
+                if let Err(e) = encoder.submit(&frame, directives) {
                     tracing::error!(error = %e, "encode submit failed; stopping pipeline");
                     break;
                 }
@@ -151,6 +173,7 @@ pub fn start(
         source,
         encode_thread: Some(encode_thread),
         frames_sent,
+        force_idr,
     })
 }
 

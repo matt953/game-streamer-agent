@@ -7,7 +7,7 @@ use bytes::Bytes;
 use gsa_capture_api::GpuFrame;
 use gsa_core::Result;
 use gsa_core::id::FrameId;
-use gsa_core::media::{Codec, FrameKind, PixelFormat, VideoMode};
+use gsa_core::media::{Codec, FrameKind, H264Profile, PixelFormat, VideoMode};
 
 /// What a backend can do; drives session negotiation (spec 05) and the
 /// loss-recovery ladder (spec 04).
@@ -21,6 +21,8 @@ pub struct EncoderCaps {
     pub supports_slices: bool,
     pub supports_intra_refresh: bool,
     pub supports_ref_invalidation: bool,
+    /// Highest H.264 profile this backend emits.
+    pub max_h264_profile: H264Profile,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +30,8 @@ pub struct EncodeConfig {
     pub codec: Codec,
     pub mode: VideoMode,
     pub bitrate_bps: u32,
+    /// Negotiated H.264 profile (ignored for other codecs).
+    pub h264_profile: H264Profile,
 }
 
 /// Per-frame instructions from the session layer (loss recovery).

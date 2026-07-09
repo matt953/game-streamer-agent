@@ -60,6 +60,8 @@ async fn serve_inner(
 
     let mut active: Option<ActiveSession> = None;
     let mut helloed = false;
+    // Client's max decodable H.264 profile (from Hello), negotiated at session start.
+    let mut client_h264_profile = gsa_core::media::H264Profile::ConstrainedBaseline;
 
     let result = loop {
         let msg: C2A = match recv_msg(&mut recv).await {
@@ -83,7 +85,13 @@ async fn serve_inner(
                     ));
                 }
                 helloed = true;
-                tracing::info!(peer, client = hello.client_name, "hello");
+                client_h264_profile = hello.decode_caps.max_h264_profile;
+                tracing::info!(
+                    peer,
+                    client = hello.client_name,
+                    ?client_h264_profile,
+                    "hello"
+                );
                 send_msg(
                     &mut send,
                     &A2C::HelloAck(HelloAck {
@@ -118,7 +126,15 @@ async fn serve_inner(
                     .await?;
                     continue;
                 }
-                match start_session(conn, state, sources, encoders, peer, &req) {
+                match start_session(
+                    conn,
+                    state,
+                    sources,
+                    encoders,
+                    peer,
+                    &req,
+                    client_h264_profile,
+                ) {
                     Ok(started) => {
                         let (mode, bitrate) = (started.mode, started.bitrate);
                         let session_id = started.session.id;
@@ -163,7 +179,14 @@ async fn serve_inner(
                 )
                 .await?;
             }
-            C2A::FrameAck { .. } => { /* NACK/ref-invalidation ladder lands at M3 (spec 04) */ }
+            C2A::RequestKeyframe => {
+                if let Some(a) = &active {
+                    a.pipeline.request_keyframe();
+                    tracing::debug!(peer, session = a.id, "keyframe requested by client");
+                }
+            }
+            C2A::FrameAck { .. } => { /* full NACK/ref-invalidation ladder lands at M3 (spec 04) */
+            }
             C2A::StatsReport(stats) => {
                 tracing::debug!(peer, ?stats, "client stats");
             }
@@ -213,10 +236,13 @@ fn start_session(
     encoders: &Arc<dyn EncoderFactory>,
     peer: &str,
     req: &control::SessionRequest,
+    client_h264_profile: gsa_core::media::H264Profile,
 ) -> Result<StartedSession> {
     let source = sources.create(req.source)?;
     let descriptor = source.descriptor();
     let encoder = encoders.create(descriptor.kind())?;
+    // Richest profile both sides support: encoder ceiling ∩ client decode cap.
+    let h264_profile = encoder.caps().max_h264_profile.min(client_h264_profile);
     // Mode preference: client request > source native > agent config.
     let mode = req
         .mode
@@ -237,7 +263,7 @@ fn start_session(
         _ => None,
     };
 
-    let handle = pipeline::start(source, encoder, conn.clone(), mode, bitrate)?;
+    let handle = pipeline::start(source, encoder, conn.clone(), mode, bitrate, h264_profile)?;
     let id = state.allocate_session();
     state.register_session(
         id,
@@ -252,6 +278,7 @@ fn start_session(
         session = id,
         ?mode,
         bitrate,
+        ?h264_profile,
         injecting = injector.is_some(),
         "session started"
     );

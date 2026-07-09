@@ -7,7 +7,7 @@ use gsa_client_core::Client;
 use gsa_core::id::SourceId;
 use serde::Serialize;
 
-use crate::decoder::make_decoder;
+use crate::decoder::{decoder_max_profile, make_decoder};
 
 #[derive(Debug, Serialize)]
 struct Report {
@@ -32,7 +32,8 @@ pub async fn run(
     source_id: Option<u32>,
     force_sw: bool,
 ) -> Result<()> {
-    let mut client = Client::connect(addr, "client-dev-headless").await?;
+    let mut client =
+        Client::connect(addr, "client-dev-headless", decoder_max_profile(force_sw)).await?;
 
     let sources = client.list_sources().await?;
     for s in &sources {

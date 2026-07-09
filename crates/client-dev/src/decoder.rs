@@ -4,6 +4,7 @@
 
 use anyhow::Context;
 use gsa_client_core::{DecodedFrame, VideoDecoder};
+use gsa_core::media::H264Profile;
 use gsa_core::{Error, Result};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
@@ -18,6 +19,18 @@ pub fn make_decoder(force_sw: bool) -> anyhow::Result<Box<dyn VideoDecoder>> {
     let _ = force_sw;
     tracing::info!("using openh264 software decoder");
     Ok(Box::new(OpenH264Decoder::new()?))
+}
+
+/// Highest H.264 profile the decoder chosen by `make_decoder` can handle.
+/// Keep in sync with `make_decoder`.
+#[must_use]
+pub fn decoder_max_profile(force_sw: bool) -> H264Profile {
+    #[cfg(target_os = "macos")]
+    if !force_sw {
+        return H264Profile::High;
+    }
+    let _ = force_sw;
+    H264Profile::ConstrainedBaseline
 }
 
 pub struct OpenH264Decoder {

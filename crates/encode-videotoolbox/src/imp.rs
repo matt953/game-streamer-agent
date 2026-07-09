@@ -18,15 +18,16 @@ use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, kVTCompressionPropertyKey_AllowFrameReordering,
     kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_Main_AutoLevel,
-    kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
+    kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
+    kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel, kVTProfileLevel_H264_High_AutoLevel,
+    kVTProfileLevel_H264_Main_AutoLevel, kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
 };
 
 use gsa_capture_api::GpuFrame;
 use gsa_capture_macos::IoSurfaceFrame;
 use gsa_core::id::FrameId;
-use gsa_core::media::{Codec, FrameKind, PixelFormat, VideoMode};
+use gsa_core::media::{Codec, FrameKind, H264Profile, PixelFormat, VideoMode};
 use gsa_core::time::MediaClock;
 use gsa_core::{Error, Result};
 use gsa_encode_api::{EncodeConfig, EncodedChunk, Encoder, EncoderCaps, FrameDirectives};
@@ -35,12 +36,19 @@ use gsa_encode_api::{EncodeConfig, EncodedChunk, Encoder, EncoderCaps, FrameDire
 const CODEC_H264: CMVideoCodecType = u32::from_be_bytes(*b"avc1");
 /// CFNumber type for a 32-bit signed int (kCFNumberSInt32Type).
 const CF_NUMBER_SINT32: CFNumberType = CFNumberType(3);
+/// CFNumber type for a 64-bit float (kCFNumberFloat64Type).
+const CF_NUMBER_FLOAT64: CFNumberType = CFNumberType(6);
+/// Keyframe cadence: at least one IDR per this many seconds (self-heal).
+const KEYFRAME_INTERVAL_SECS: f64 = 1.0;
 
 pub struct VideoToolboxEncoder {
     clock: MediaClock,
     session: Option<CFRetained<VTCompressionSession>>,
     mode: VideoMode,
-    next_frame_id: u64,
+    /// Assigned in the output handler when a chunk is *emitted* — so frames
+    /// VideoToolbox drops/skips leave no hole in the numbering (a hole would
+    /// trip the client's loss recovery). Shared with the handler closures.
+    next_frame_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     force_idr: bool,
     tx: mpsc::Sender<EncodedChunk>,
     rx: mpsc::Receiver<EncodedChunk>,
@@ -72,7 +80,7 @@ impl VideoToolboxEncoder {
                 height: 0,
                 fps: 0,
             },
-            next_frame_id: 0,
+            next_frame_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             force_idr: true,
             tx,
             rx,
@@ -91,6 +99,7 @@ impl Encoder for VideoToolboxEncoder {
             supports_slices: false,
             supports_intra_refresh: false,
             supports_ref_invalidation: false,
+            max_h264_profile: H264Profile::High,
         }
     }
 
@@ -132,29 +141,44 @@ impl Encoder for VideoToolboxEncoder {
             .map(|p| unsafe { CFRetained::from_raw(p) })
             .ok_or_else(|| Error::Encode(format!("VTCompressionSessionCreate failed: {status}")))?;
 
-        // SAFETY: the property keys and profile-level value are `&'static`
+        // SAFETY: the property keys and profile-level values are `&'static`
         // CFString constants exported by VideoToolbox.
-        let (real_time, no_reorder, avg_bitrate, max_kf_interval, profile_key, profile_value) = unsafe {
+        let (real_time, no_reorder, avg_bitrate, kf_interval, kf_duration, profile_key) = unsafe {
             (
                 kVTCompressionPropertyKey_RealTime,
                 kVTCompressionPropertyKey_AllowFrameReordering,
                 kVTCompressionPropertyKey_AverageBitRate,
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                 kVTCompressionPropertyKey_ProfileLevel,
-                kVTProfileLevel_H264_Main_AutoLevel,
             )
+        };
+        // Profile negotiated per client (spec 03). SAFETY: `&'static` constants.
+        let profile_value = unsafe {
+            match cfg.h264_profile {
+                H264Profile::ConstrainedBaseline => {
+                    kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel
+                }
+                H264Profile::Main => kVTProfileLevel_H264_Main_AutoLevel,
+                H264Profile::High => kVTProfileLevel_H264_High_AutoLevel,
+            }
         };
         set_bool(&session, real_time, true)?;
         set_bool(&session, no_reorder, false)?;
         set_i32(&session, avg_bitrate, cfg.bitrate_bps as i32)?;
-        // No periodic IDR — keyframes on demand only (spec 03).
-        set_i32(&session, max_kf_interval, i32::MAX)?;
+        // Periodic keyframe heals static regions (no intra-refresh until NVENC,
+        // M4). A duration bound (not frame count) is what tracks wall-clock,
+        // since capture is on-change; the frame-count bound is a high-motion
+        // backstop. On-demand keyframes fire on top via `force_idr`.
+        set_f64(&session, kf_duration, KEYFRAME_INTERVAL_SECS)?;
+        set_i32(&session, kf_interval, (cfg.mode.fps.max(1) as i32) * 4)?;
         // SAFETY: valid session + key + CFString value.
         unsafe { set_property(&session, profile_key, Some(profile_value as &CFType))? };
 
         self.session = Some(session);
         self.mode = cfg.mode;
-        self.next_frame_id = 0;
+        self.next_frame_id
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.force_idr = true;
         Ok(())
     }
@@ -172,8 +196,6 @@ impl Encoder for VideoToolboxEncoder {
 
         let is_idr = directives.idr || self.force_idr;
         self.force_idr = false;
-        let frame_id = FrameId(self.next_frame_id);
-        self.next_frame_id += 1;
         let capture_ts_us = frame.capture_ts_us;
 
         let pts = CMTime {
@@ -197,6 +219,7 @@ impl Encoder for VideoToolboxEncoder {
 
         let tx = self.tx.clone();
         let clock = self.clock.clone();
+        let frame_ids = self.next_frame_id.clone();
         let handler = RcBlock::new(
             move |status: i32, _flags: VTEncodeInfoFlags, sample: *mut CMSampleBuffer| {
                 if status != 0 || sample.is_null() {
@@ -204,10 +227,17 @@ impl Encoder for VideoToolboxEncoder {
                 }
                 // SAFETY: non-null sample buffer from VideoToolbox.
                 let sample = unsafe { &*sample };
-                if let Some(data) = sample_to_annex_b(sample, is_idr) {
+                // Keyframe status is read from the bitstream (IDR NAL), not
+                // the directive — VideoToolbox also emits keyframes on its
+                // own periodic interval.
+                if let Some((kind, data)) = sample_to_annex_b(sample) {
+                    // Only consume a frame id for frames actually emitted;
+                    // no-reordering means handlers fire in submit order.
+                    let frame_id =
+                        FrameId(frame_ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
                     let _ = tx.send(EncodedChunk {
                         frame_id,
-                        kind: if is_idr { FrameKind::Idr } else { FrameKind::P },
+                        kind,
                         data: Bytes::from(data),
                         capture_ts_us,
                         encode_done_ts_us: clock.now_us(),
@@ -308,6 +338,20 @@ fn set_i32(session: &VTCompressionSession, key: &CFString, value: i32) -> Result
     unsafe { set_property(session, key, Some(&number)) }
 }
 
+fn set_f64(session: &VTCompressionSession, key: &CFString, value: f64) -> Result<()> {
+    // SAFETY: value_ptr points at a live f64 for the duration of the call.
+    let number = unsafe {
+        CFNumber::new(
+            None,
+            CF_NUMBER_FLOAT64,
+            (&value as *const f64).cast::<c_void>(),
+        )
+    }
+    .ok_or_else(|| Error::Encode("CFNumberCreate failed".into()))?;
+    // SAFETY: valid session + key + CFNumber value.
+    unsafe { set_property(session, key, Some(&number)) }
+}
+
 /// # Safety
 /// `key` must be a valid VideoToolbox property key; `value` a compatible type.
 unsafe fn set_property(
@@ -363,14 +407,60 @@ fn single_bool_dict(key: &CFString, value: bool) -> Result<CFRetained<CFDictiona
 }
 
 /// Convert a compressed CMSampleBuffer (AVCC length-prefixed) to Annex-B,
-/// inlining SPS/PPS from the format description on IDR frames.
-fn sample_to_annex_b(sample: &CMSampleBuffer, is_idr: bool) -> Option<Vec<u8>> {
+/// detecting keyframes from the bitstream (an IDR-slice NAL) and inlining
+/// SPS/PPS from the format description when it's a keyframe. Returns the
+/// detected [`FrameKind`] and the Annex-B bytes.
+fn sample_to_annex_b(sample: &CMSampleBuffer) -> Option<(FrameKind, Vec<u8>)> {
     const START_CODE: [u8; 4] = [0, 0, 0, 1];
-    let mut out = Vec::new();
+    /// H.264 NAL unit type for an IDR-picture slice.
+    const NAL_IDR_SLICE: u8 = 5;
 
-    if is_idr {
+    // SAFETY: compressed samples carry a data buffer.
+    let block = unsafe { sample.data_buffer() }?;
+    let mut total_len: usize = 0;
+    let mut len_at: usize = 0;
+    let mut data_ptr: *mut c_char = ptr::null_mut();
+    // SAFETY: valid block buffer; out-params live locals.
+    let status = unsafe { block.data_pointer(0, &mut len_at, &mut total_len, &mut data_ptr) };
+    if status != 0 || data_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: data_ptr..total_len is the contiguous AVCC payload.
+    let data = unsafe { std::slice::from_raw_parts(data_ptr.cast::<u8>(), total_len) };
+
+    // Walk 4-byte-length-prefixed NAL units → Annex-B start codes, noting
+    // whether any is an IDR slice (→ keyframe).
+    let mut slices = Vec::with_capacity(total_len + 8);
+    let mut is_keyframe = false;
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        let nal_len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        i += 4;
+        if nal_len == 0 || i + nal_len > data.len() {
+            break;
+        }
+        let nal = &data[i..i + nal_len];
+        if nal.first().map(|b| b & 0x1f) == Some(NAL_IDR_SLICE) {
+            is_keyframe = true;
+        }
+        slices.extend_from_slice(&START_CODE);
+        slices.extend_from_slice(nal);
+        i += nal_len;
+    }
+    if slices.is_empty() {
+        return None;
+    }
+
+    // Keyframes carry SPS/PPS out-of-band (in the format description); inline
+    // them ahead of the slice so the client's decoder can resync standalone.
+    let mut out = Vec::with_capacity(slices.len() + 64);
+    let fmt = if is_keyframe {
         // SAFETY: compressed samples carry a format description.
-        let fmt = unsafe { sample.format_description() }?;
+        unsafe { sample.format_description() }
+    } else {
+        None
+    };
+    if let Some(fmt) = fmt {
         for idx in 0..2usize {
             let mut ps_ptr: *const u8 = ptr::null();
             let mut ps_size: usize = 0;
@@ -388,40 +478,18 @@ fn sample_to_annex_b(sample: &CMSampleBuffer, is_idr: bool) -> Option<Vec<u8>> {
             if status != 0 || ps_ptr.is_null() || ps_size == 0 {
                 continue;
             }
-            // SAFETY: VideoToolbox guarantees ps_ptr..ps_size is valid while
-            // fmt is retained (it is, for this scope).
+            // SAFETY: ps_ptr..ps_size is valid while `fmt` is retained.
             let ps = unsafe { std::slice::from_raw_parts(ps_ptr, ps_size) };
             out.extend_from_slice(&START_CODE);
             out.extend_from_slice(ps);
         }
     }
+    out.extend_from_slice(&slices);
 
-    // SAFETY: compressed samples carry a data buffer.
-    let block = unsafe { sample.data_buffer() }?;
-    let mut total_len: usize = 0;
-    let mut len_at: usize = 0;
-    let mut data_ptr: *mut c_char = ptr::null_mut();
-    // SAFETY: valid block buffer; out-params live locals.
-    let status = unsafe { block.data_pointer(0, &mut len_at, &mut total_len, &mut data_ptr) };
-    if status != 0 || data_ptr.is_null() {
-        return None;
-    }
-    // SAFETY: data_ptr..total_len is the contiguous AVCC payload.
-    let data = unsafe { std::slice::from_raw_parts(data_ptr.cast::<u8>(), total_len) };
-
-    // Walk 4-byte-length-prefixed NAL units, rewriting each prefix as a
-    // start code.
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        let nal_len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
-        i += 4;
-        if nal_len == 0 || i + nal_len > data.len() {
-            break;
-        }
-        out.extend_from_slice(&START_CODE);
-        out.extend_from_slice(&data[i..i + nal_len]);
-        i += nal_len;
-    }
-
-    (!out.is_empty()).then_some(out)
+    let kind = if is_keyframe {
+        FrameKind::Idr
+    } else {
+        FrameKind::P
+    };
+    Some((kind, out))
 }

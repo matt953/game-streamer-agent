@@ -14,7 +14,7 @@ use openh264::formats::YUVBuffer;
 
 use gsa_capture_api::{GpuFrame, GpuHandle};
 use gsa_core::id::FrameId;
-use gsa_core::media::{Codec, FrameKind, PixelFormat, VideoMode};
+use gsa_core::media::{Codec, FrameKind, H264Profile, PixelFormat, VideoMode};
 use gsa_core::time::MediaClock;
 use gsa_core::{Error, Result};
 use gsa_encode_api::{EncodeConfig, EncodedChunk, Encoder, EncoderCaps, FrameDirectives};
@@ -80,6 +80,8 @@ impl Encoder for SwEncoder {
             supports_slices: false,
             supports_intra_refresh: false,
             supports_ref_invalidation: false,
+            // openh264 encodes Constrained Baseline only.
+            max_h264_profile: H264Profile::ConstrainedBaseline,
         }
     }
 
@@ -176,6 +178,7 @@ impl Encoder for SwEncoder {
             codec: Codec::H264,
             mode: open.mode,
             bitrate_bps,
+            h264_profile: H264Profile::ConstrainedBaseline,
         };
         open.encoder = Self::build_encoder(&cfg)?;
         self.force_idr = true;
@@ -234,6 +237,7 @@ mod tests {
             codec: Codec::H264,
             mode,
             bitrate_bps: 2_000_000,
+            h264_profile: H264Profile::ConstrainedBaseline,
         })
         .unwrap();
 
@@ -282,6 +286,7 @@ mod tests {
             codec: Codec::H264,
             mode,
             bitrate_bps: 2_000_000,
+            h264_profile: H264Profile::ConstrainedBaseline,
         })
         .unwrap();
         for i in 0..3u32 {

@@ -35,16 +35,16 @@ pub struct FrameOutput {
 
 /// Fire-and-forget input sink, decoupled from the frame-receive loop.
 /// Sync `send` (safe to call from a UI event loop); a background task on the
-/// client's runtime writes batches to the control stream in order.
+/// client's runtime writes messages to the control stream in order.
 #[derive(Debug, Clone)]
 pub struct InputSender {
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<gsa_protocol::input::InputEvent>>,
+    tx: tokio::sync::mpsc::UnboundedSender<C2A>,
 }
 
 impl InputSender {
     pub fn send(&self, events: Vec<gsa_protocol::input::InputEvent>) {
         if !events.is_empty() {
-            let _ = self.tx.send(events);
+            let _ = self.tx.send(C2A::InputBatch(events));
         }
     }
 }
@@ -54,11 +54,21 @@ pub struct Client {
     conn: quinn::Connection,
     control_send: Option<quinn::SendStream>,
     control_recv: quinn::RecvStream,
+    /// Present once the background control writer is running (windowed
+    /// client); `recv_frame` sends keyframe requests through it.
+    control_tx: Option<tokio::sync::mpsc::UnboundedSender<C2A>>,
     clock: MediaClock,
     clock_sync: ClockSync,
     reassembler: Reassembler,
     stats: LatencyStats,
     session: Option<SessionParams>,
+    /// Frame id of the last frame handed to the decoder (gap detection).
+    last_frame_id: Option<u32>,
+    /// Client-clock µs of the last keyframe request (rate limiting).
+    last_keyframe_request_us: u64,
+    /// True while the P-frame reference chain is broken (lost/undecodable
+    /// frame); we skip P-frames until a keyframe resyncs the decoder (spec 04).
+    awaiting_idr: bool,
 }
 
 impl std::fmt::Debug for Client {
@@ -71,7 +81,13 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     /// Connect, exchange hellos, and estimate the agent clock offset.
-    pub async fn connect(addr: std::net::SocketAddr, client_name: &str) -> Result<Self> {
+    /// `max_h264_profile` is the richest profile the embedder's decoder can
+    /// handle — the host encodes at or below it (spec 03).
+    pub async fn connect(
+        addr: std::net::SocketAddr,
+        client_name: &str,
+        max_h264_profile: gsa_core::media::H264Profile,
+    ) -> Result<Self> {
         let (endpoint, conn) = client_connect(addr).await?;
         let (mut control_send, mut control_recv) = conn
             .open_bi()
@@ -85,6 +101,7 @@ impl Client {
                 client_name: client_name.to_string(),
                 decode_caps: DecodeCaps {
                     codecs: vec![gsa_core::media::Codec::H264],
+                    max_h264_profile,
                 },
             }),
         )
@@ -108,11 +125,17 @@ impl Client {
             conn,
             control_send: Some(control_send),
             control_recv,
+            control_tx: None,
             clock,
             clock_sync: ClockSync::default(),
             reassembler: Reassembler::new(),
             stats: LatencyStats::default(),
             session: None,
+            last_frame_id: None,
+            last_keyframe_request_us: 0,
+            // Until the first keyframe, the decoder has no reference; skip any
+            // P-frames that arrive ahead of it.
+            awaiting_idr: true,
         };
         client.sync_clock(5).await?;
         Ok(client)
@@ -154,18 +177,16 @@ impl Client {
     /// receives frames + control replies).
     pub fn take_input_sender(&mut self) -> Option<InputSender> {
         let mut stream = self.control_send.take()?;
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<Vec<gsa_protocol::input::InputEvent>>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<C2A>();
         tokio::spawn(async move {
-            while let Some(events) = rx.recv().await {
-                if send_msg(&mut stream, &C2A::InputBatch(events))
-                    .await
-                    .is_err()
-                {
+            while let Some(msg) = rx.recv().await {
+                if send_msg(&mut stream, &msg).await.is_err() {
                     break;
                 }
             }
         });
+        // Keep a clone so recv_frame can send keyframe requests too.
+        self.control_tx = Some(tx.clone());
         Some(InputSender { tx })
     }
 
@@ -229,9 +250,50 @@ impl Client {
             };
             self.stats.on_frame_complete();
 
+            // Loss recovery (spec 04): on a reference-chain break (lost frame),
+            // hold the last good frame and skip P-frames until a keyframe
+            // resyncs — decoding a P-frame against a stale reference corrupts
+            // output. Request the keyframe immediately.
+            let is_idr = header.kind == gsa_core::media::FrameKind::Idr;
+            if is_idr {
+                self.awaiting_idr = false;
+            }
+            if let Some(last) = self.last_frame_id {
+                let delta = header.frame_id.wrapping_sub(last);
+                if delta == 0 || delta > u32::MAX / 2 {
+                    // Reassembler drops stale frames, so this should be
+                    // unreachable; if it fires, ordering is broken upstream.
+                    tracing::warn!(
+                        last,
+                        got = header.frame_id,
+                        "OUT-OF-ORDER frame reached decode"
+                    );
+                } else if delta != 1 && !is_idr && !self.awaiting_idr {
+                    tracing::debug!(
+                        gap_after = last,
+                        got = header.frame_id,
+                        "frame gap; freezing"
+                    );
+                    self.awaiting_idr = true;
+                    self.request_keyframe_throttled().await?;
+                }
+            }
+
+            // Frozen: skip P-frames (a broken reference is the corruption).
+            // Advance the id so we don't re-flag the gap; keep asking for a key.
+            if self.awaiting_idr && !is_idr {
+                self.last_frame_id = Some(header.frame_id);
+                self.request_keyframe_throttled().await?;
+                continue;
+            }
+
             let decode_start = self.clock.now_us();
-            match decoder.decode(&frame_data)? {
-                Some(frame) => {
+            let decoded = decoder.decode(&frame_data);
+            // The frame was consumed regardless of outcome; advance so the
+            // next frame isn't misread as another gap.
+            self.last_frame_id = Some(header.frame_id);
+            match decoded {
+                Ok(Some(frame)) => {
                     let now = self.clock.now_us();
                     let decode_us = (now - decode_start) as u32;
                     let latency_us = self.clock_sync.frame_latency_us(now, header.capture_ts_us);
@@ -243,8 +305,41 @@ impl Client {
                         decode_us,
                     }));
                 }
-                None => continue, // decoder buffering (e.g. SPS/PPS only)
+                Ok(None) => {
+                    // Decoder accepted the data but produced no frame
+                    // (parameter sets / buffering).
+                }
+                Err(e) => {
+                    // Undecodable (loss-damaged) frame: never fatal. Freeze and
+                    // request a healing keyframe.
+                    tracing::debug!(error = %e, "decode error; freezing until keyframe");
+                    self.awaiting_idr = true;
+                    self.request_keyframe_throttled().await?;
+                }
             }
+        }
+    }
+
+    /// Request a healing keyframe, rate-limited so a burst of gaps/errors
+    /// doesn't spam the agent (one keyframe fixes them all).
+    async fn request_keyframe_throttled(&mut self) -> Result<()> {
+        const MIN_INTERVAL_US: u64 = 250_000;
+        let now = self.clock.now_us();
+        if now.saturating_sub(self.last_keyframe_request_us) < MIN_INTERVAL_US {
+            return Ok(());
+        }
+        self.last_keyframe_request_us = now;
+        self.send_keyframe_request().await
+    }
+
+    async fn send_keyframe_request(&mut self) -> Result<()> {
+        if let Some(tx) = &self.control_tx {
+            let _ = tx.send(C2A::RequestKeyframe);
+            Ok(())
+        } else if let Some(stream) = self.control_send.as_mut() {
+            send_msg(stream, &C2A::RequestKeyframe).await
+        } else {
+            Ok(())
         }
     }
 
