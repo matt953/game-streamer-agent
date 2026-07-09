@@ -25,11 +25,25 @@ struct Report {
     decode_ms_p50: Option<f64>,
 }
 
-pub async fn run(addr: std::net::SocketAddr, frames: u32, json: bool) -> Result<()> {
+pub async fn run(
+    addr: std::net::SocketAddr,
+    frames: u32,
+    json: bool,
+    source_id: Option<u32>,
+) -> Result<()> {
     let mut client = Client::connect(addr, "client-dev-headless").await?;
 
     let sources = client.list_sources().await?;
-    let source = sources.first().context("agent offers no sources")?;
+    for s in &sources {
+        tracing::info!(id = s.id.0, name = s.name, kind = ?s.kind, "available source");
+    }
+    let source = match source_id {
+        Some(id) => sources
+            .iter()
+            .find(|s| s.id.0 == id)
+            .with_context(|| format!("agent has no source {id}"))?,
+        None => sources.first().context("agent offers no sources")?,
+    };
     tracing::info!(source = source.name, "starting session");
     let params = client.start_session(SourceId(source.id.0), None).await?;
 

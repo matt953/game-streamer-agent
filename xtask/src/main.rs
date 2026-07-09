@@ -29,12 +29,66 @@ enum Cmd {
         #[arg(long, default_value = "target/e2e-report.json")]
         report: PathBuf,
     },
+    /// macOS: code-sign the built debug binaries with a stable identity so
+    /// Screen Recording / Accessibility grants survive rebuilds.
+    DevSign {
+        /// Signing identity (default: the first Apple Development identity).
+        #[arg(long)]
+        identity: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::CiE2e { frames, report } => ci_e2e(frames, &report),
+        Cmd::DevSign { identity } => dev_sign(identity),
     }
+}
+
+/// Code-sign debug binaries with a stable identity (macOS TCC stability).
+#[cfg(target_os = "macos")]
+fn dev_sign(identity: Option<String>) -> Result<()> {
+    let identity = match identity {
+        Some(id) => id,
+        None => first_apple_dev_identity()?,
+    };
+    eprintln!("[dev-sign] signing with: {identity}");
+    for bin in ["gsa", "gsa-client-dev"] {
+        let path = format!("target/debug/{bin}");
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("[dev-sign] skip {path} (build it first)");
+            continue;
+        }
+        let status = Command::new("codesign")
+            .args(["--force", "--sign", &identity, "--timestamp=none", &path])
+            .status()
+            .context("run codesign")?;
+        if !status.success() {
+            bail!("codesign failed for {path}");
+        }
+        eprintln!("[dev-sign] signed {path}");
+    }
+    eprintln!("[dev-sign] done — TCC grants now persist across rebuilds of these binaries");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dev_sign(_identity: Option<String>) -> Result<()> {
+    bail!("dev-sign is macOS-only")
+}
+
+#[cfg(target_os = "macos")]
+fn first_apple_dev_identity() -> Result<String> {
+    let out = Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .context("run security find-identity")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find(|l| l.contains("Apple Development") || l.contains("Developer ID"))
+        .and_then(|l| l.split('"').nth(1))
+        .map(String::from)
+        .context("no Apple Development signing identity found (open Xcode → Settings → Accounts)")
 }
 
 struct KillOnDrop(Child);

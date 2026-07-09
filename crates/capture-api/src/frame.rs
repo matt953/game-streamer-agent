@@ -24,13 +24,35 @@ pub struct CpuFrame {
     pub stride: usize,
 }
 
+/// A backend-owned GPU frame (macOS IOSurface, D3D11 texture, DMA-BUF).
+///
+/// Type-erased so `capture-api` stays platform-free and `unsafe`-free: the
+/// capture crate boxes a concrete wrapper (which asserts the platform
+/// handle's thread-safety in its own FFI crate) and the encoder downcasts
+/// via [`PlatformFrame::as_any`]. Pixels never leave the GPU.
+pub trait PlatformFrame: std::fmt::Debug + Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// Platform frame handle. Pixels never leave the GPU on real backends;
 /// `Cpu` exists for tests and software encode (spec 01).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum GpuHandle {
     Cpu(CpuFrame),
-    // M1+: IoSurface(..) [macos], D3d11(..) [windows], DmaBuf(..) [linux]
+    /// Backend GPU surface; downcast through [`PlatformFrame::as_any`].
+    Platform(Arc<dyn PlatformFrame>),
+}
+
+impl GpuHandle {
+    /// Downcast a platform handle to a concrete backend frame type.
+    #[must_use]
+    pub fn downcast_platform<T: 'static>(&self) -> Option<&T> {
+        match self {
+            GpuHandle::Platform(p) => p.as_any().downcast_ref::<T>(),
+            GpuHandle::Cpu(_) => None,
+        }
+    }
 }
 
 /// One captured frame moving from a `RenderSource` toward an encoder.

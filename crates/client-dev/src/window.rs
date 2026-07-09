@@ -21,20 +21,24 @@ enum AppEvent {
     StreamEnded(String),
 }
 
-pub fn run(addr: std::net::SocketAddr) -> Result<()> {
+pub fn run(addr: std::net::SocketAddr, source_id: Option<u32>) -> Result<()> {
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
     std::thread::Builder::new()
         .name("gsa-client-net".into())
-        .spawn(move || network_loop(addr, &proxy))?;
+        .spawn(move || network_loop(addr, source_id, &proxy))?;
 
     let mut app = App::default();
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-fn network_loop(addr: std::net::SocketAddr, proxy: &EventLoopProxy<AppEvent>) {
+fn network_loop(
+    addr: std::net::SocketAddr,
+    source_id: Option<u32>,
+    proxy: &EventLoopProxy<AppEvent>,
+) {
     let outcome = (|| -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -43,7 +47,13 @@ fn network_loop(addr: std::net::SocketAddr, proxy: &EventLoopProxy<AppEvent>) {
         runtime.block_on(async {
             let mut client = Client::connect(addr, "client-dev").await?;
             let sources = client.list_sources().await?;
-            let source = sources.first().context("agent offers no sources")?;
+            let source = match source_id {
+                Some(id) => sources
+                    .iter()
+                    .find(|s| s.id.0 == id)
+                    .with_context(|| format!("agent has no source {id}"))?,
+                None => sources.first().context("agent offers no sources")?,
+            };
             client.start_session(SourceId(source.id.0), None).await?;
 
             let mut decoder = OpenH264Decoder::new()?;

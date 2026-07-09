@@ -132,8 +132,8 @@ async fn run(
         }
     });
 
-    let sources = Arc::new(factories::TestSources::new(state.clock.clone()));
-    let encoders = Arc::new(factories::SwEncoders::new(state.clock.clone()));
+    let sources = Arc::new(factories::Sources::new(state.clock.clone()));
+    let encoders = Arc::new(factories::Encoders::new(state.clock.clone()));
 
     loop {
         tokio::select! {

@@ -24,6 +24,9 @@ struct Cli {
     /// Emit machine-readable JSON (headless mode).
     #[arg(long)]
     json: bool,
+    /// Source id to stream (default: the agent's first source).
+    #[arg(long)]
+    source: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -38,8 +41,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.headless {
         let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(headless::run(cli.connect, cli.frames, cli.json))
+        runtime.block_on(headless::run(cli.connect, cli.frames, cli.json, cli.source))
     } else {
-        window::run(cli.connect)
+        window::run(cli.connect, cli.source)
     }
 }

@@ -16,6 +16,11 @@ use gsa_protocol::datagram::{VideoDatagramHeader, chunk_video_frame};
 /// Fallback when quinn hasn't discovered the path MTU yet.
 const DEFAULT_MAX_DATAGRAM: usize = 1200;
 
+/// Upper bound on waiting for an async encoder to emit a submitted frame.
+/// Normal delivery is ~encode latency (single-digit ms); this only trips on
+/// a dropped or failed frame, so it's generous.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
+
 pub struct PipelineHandle {
     stop: Arc<AtomicBool>,
     source: Box<dyn RenderSource>,
@@ -68,18 +73,26 @@ pub fn start(
                     tracing::error!(error = %e, "encode submit failed; stopping pipeline");
                     break;
                 }
-                loop {
-                    match encoder.poll_bitstream() {
-                        Ok(Some(chunk)) => {
-                            if chunk_tx.send(chunk).is_err() {
-                                return; // sender task gone (connection closed)
-                            }
+                // Block for this frame's bitstream (async hw encoders deliver
+                // it ~encode-latency later) so it goes out immediately instead
+                // of waiting for the next captured frame to wake this loop.
+                // The bound only trips on a genuinely dropped/failed frame.
+                match encoder.next_chunk(DRAIN_TIMEOUT) {
+                    Ok(Some(chunk)) => {
+                        if chunk_tx.send(chunk).is_err() {
+                            return; // sender task gone (connection closed)
                         }
-                        Ok(None) => break,
-                        Err(e) => {
-                            tracing::error!(error = %e, "encoder poll failed");
-                            break;
-                        }
+                    }
+                    Ok(None) => {} // dropped frame or timeout; move on
+                    Err(e) => {
+                        tracing::error!(error = %e, "encoder drain failed");
+                        break;
+                    }
+                }
+                // Sweep up any additional chunks without blocking.
+                while let Ok(Some(chunk)) = encoder.poll_bitstream() {
+                    if chunk_tx.send(chunk).is_err() {
+                        return;
                     }
                 }
             }

@@ -62,8 +62,17 @@ pub trait Encoder: Send {
     /// more than one frame of latency.
     fn submit(&mut self, frame: &GpuFrame, directives: FrameDirectives) -> Result<()>;
 
-    /// Drain the next encoded chunk if one is ready.
+    /// Drain the next encoded chunk if one is ready (non-blocking).
     fn poll_bitstream(&mut self) -> Result<Option<EncodedChunk>>;
+
+    /// Block up to `timeout` for the next encoded chunk.
+    ///
+    /// Hardware encoders (e.g. VideoToolbox) deliver a frame's bitstream
+    /// asynchronously, shortly after `submit`. The pipeline calls this right
+    /// after submitting so the chunk goes out the instant it's ready rather
+    /// than waiting for the next captured frame to wake the loop. Synchronous
+    /// encoders return the already-ready chunk immediately.
+    fn next_chunk(&mut self, timeout: std::time::Duration) -> Result<Option<EncodedChunk>>;
 
     /// ABR bitrate update without reopening (spec 03). Backends that can't
     /// do it live may reopen internally (must re-IDR).

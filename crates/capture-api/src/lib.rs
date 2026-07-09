@@ -7,7 +7,7 @@ mod frame;
 mod sink;
 mod source;
 
-pub use frame::{CpuFrame, GpuFrame, GpuHandle, Rect};
+pub use frame::{CpuFrame, GpuFrame, GpuHandle, PlatformFrame, Rect};
 pub use sink::{FrameReceiver, FrameSink, frame_channel};
 pub use source::{RenderSource, SourceConfig, SourceDescriptor, VirtualDisplay};
 

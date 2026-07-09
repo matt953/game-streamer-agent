@@ -159,6 +159,11 @@ impl Encoder for SwEncoder {
         Ok(self.state.as_mut().and_then(|o| o.pending.take()))
     }
 
+    fn next_chunk(&mut self, _timeout: std::time::Duration) -> Result<Option<EncodedChunk>> {
+        // Synchronous: the chunk was produced during `submit`.
+        self.poll_bitstream()
+    }
+
     fn update_rate(&mut self, bitrate_bps: u32) -> Result<()> {
         // openh264's safe wrapper has no live rate update; reopen (debug
         // backend — an IDR hiccup is acceptable here, spec 03 contract

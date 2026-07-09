@@ -8,7 +8,7 @@ use gsa_core::id::SourceId;
 use gsa_core::media::VideoMode;
 use gsa_core::{Error, Result};
 use gsa_encode_api::Encoder;
-use gsa_protocol::control::{A2C, C2A, HelloAck, ProtoErrorMsg, SessionParams};
+use gsa_protocol::control::{A2C, C2A, HelloAck, ProtoErrorMsg, SessionParams, SourceKind};
 use gsa_protocol::{PROTO_VERSION, control};
 use gsa_transport::{recv_msg, send_msg};
 
@@ -22,10 +22,11 @@ pub trait SourceFactory: Send + Sync {
     fn create(&self, id: SourceId) -> Result<Box<dyn RenderSource>>;
 }
 
-/// Produces an encoder per session (probing/selection per spec 03 lands
-/// with hardware backends).
+/// Produces an encoder compatible with a given source's frame format
+/// (spec 03). E.g. a real display yields IOSurface/NV12 frames → hardware
+/// encoder; the test pattern yields CPU/BGRA → software encoder.
 pub trait EncoderFactory: Send + Sync {
-    fn create(&self) -> Result<Box<dyn Encoder>>;
+    fn create(&self, source_kind: SourceKind) -> Result<Box<dyn Encoder>>;
 }
 
 /// Drive one client connection until it closes. The first bi stream the
@@ -188,7 +189,7 @@ fn start_session(
     req: &control::SessionRequest,
 ) -> Result<(u64, pipeline::PipelineHandle, VideoMode, u32)> {
     let source = sources.create(req.source)?;
-    let encoder = encoders.create()?;
+    let encoder = encoders.create(source.descriptor().kind())?;
     let mode = req.mode.unwrap_or(state.config.video.mode);
     let bitrate = state.config.video.bitrate_bps;
 

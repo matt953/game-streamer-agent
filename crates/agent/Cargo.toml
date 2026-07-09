@@ -21,6 +21,10 @@ gsa-transport = { workspace = true }
 gsa-session = { workspace = true }
 gsa-sources = { workspace = true }
 gsa-encode-sw = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gsa-capture-macos = { workspace = true }
+gsa-encode-videotoolbox = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

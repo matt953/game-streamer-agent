@@ -11,6 +11,8 @@ members = [
     "crates/session",
     "crates/client-core",
     "crates/client-dev",
+    "crates/capture-macos",
+    "crates/encode-videotoolbox",
     "crates/agent",
     "xtask",
 ]
@@ -31,6 +33,8 @@ gsa-sources = { path = "crates/sources" }
 gsa-encode-sw = { path = "crates/encode-sw" }
 gsa-session = { path = "crates/session" }
 gsa-client-core = { path = "crates/client-core" }
+gsa-capture-macos = { path = "crates/capture-macos" }
+gsa-encode-videotoolbox = { path = "crates/encode-videotoolbox" }
 
 # external
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
@@ -50,6 +54,19 @@ openh264 = "0.9"
 winit = "0.30"
 softbuffer = "0.4"
 anyhow = "1"
+
+# Apple FFI (macOS backends only)
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-core-graphics = "0.3"
+objc2-video-toolbox = "0.3"
+objc2-io-surface = "0.3"
+dispatch2 = "0.3"
+block2 = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
