@@ -5,8 +5,16 @@
 //! N: the sample with the lowest RTT carries the least queueing noise) and
 //! then latency of a frame = estimated-agent-now − capture_ts.
 
+use std::collections::VecDeque;
+
 use gsa_core::time::wire_ts_delta_us;
 use serde::{Deserialize, Serialize};
+
+/// Percentiles are computed over the most recent `WINDOW` frames so the tail
+/// reflects *current* conditions rather than being dominated forever by
+/// startup transients (decoder warmup, first keyframe). ~60 s at 60 fps —
+/// generous enough that a typical CI/headless run is still whole-run.
+const WINDOW: usize = 3600;
 
 #[derive(Debug, Default)]
 pub struct ClockSync {
@@ -48,8 +56,16 @@ impl ClockSync {
 pub struct LatencyStats {
     frames_complete: u64,
     frames_decoded: u64,
-    latencies_us: Vec<u32>,
-    decode_us: Vec<u32>,
+    // Rolling windows (last `WINDOW` samples); the counters above stay total.
+    latencies_us: VecDeque<u32>,
+    decode_us: VecDeque<u32>,
+}
+
+fn push_capped(buf: &mut VecDeque<u32>, v: u32) {
+    if buf.len() == WINDOW {
+        buf.pop_front();
+    }
+    buf.push_back(v);
 }
 
 impl LatencyStats {
@@ -60,21 +76,23 @@ impl LatencyStats {
     pub fn on_frame_decoded(&mut self, latency_us: Option<u32>, decode_us: u32) {
         self.frames_decoded += 1;
         if let Some(l) = latency_us {
-            self.latencies_us.push(l);
+            push_capped(&mut self.latencies_us, l);
         }
-        self.decode_us.push(decode_us);
+        push_capped(&mut self.decode_us, decode_us);
     }
 
     #[must_use]
     pub fn summary(&self, frames_dropped: u64) -> StatsSummary {
+        let latencies: Vec<u32> = self.latencies_us.iter().copied().collect();
+        let decodes: Vec<u32> = self.decode_us.iter().copied().collect();
         StatsSummary {
             frames_complete: self.frames_complete,
             frames_decoded: self.frames_decoded,
             frames_dropped_incomplete: frames_dropped,
-            latency_ms_p50: percentile(&self.latencies_us, 50).map(us_to_ms),
-            latency_ms_p95: percentile(&self.latencies_us, 95).map(us_to_ms),
-            latency_ms_p99: percentile(&self.latencies_us, 99).map(us_to_ms),
-            decode_ms_p50: percentile(&self.decode_us, 50).map(us_to_ms),
+            latency_ms_p50: percentile(&latencies, 50).map(us_to_ms),
+            latency_ms_p95: percentile(&latencies, 95).map(us_to_ms),
+            latency_ms_p99: percentile(&latencies, 99).map(us_to_ms),
+            decode_ms_p50: percentile(&decodes, 50).map(us_to_ms),
         }
     }
 }
