@@ -32,6 +32,10 @@ enum Command {
         /// Override the admin socket path / pipe name.
         #[arg(long)]
         control_socket: Option<PathBuf>,
+        /// Video bitrate in megabits/sec (overrides config; higher = sharper
+        /// text, more bandwidth).
+        #[arg(long)]
+        bitrate: Option<u32>,
     },
     /// Query a running agent's status.
     Status {
@@ -52,9 +56,10 @@ fn main() -> Result<()> {
             config,
             listen,
             control_socket,
+            bitrate,
         } => {
             init_tracing();
-            runtime.block_on(run(config, listen, control_socket))
+            runtime.block_on(run(config, listen, control_socket, bitrate))
         }
         Command::Status {
             json,
@@ -85,6 +90,7 @@ fn load_config(
     path: Option<PathBuf>,
     listen: Option<std::net::SocketAddr>,
     control_socket: Option<PathBuf>,
+    bitrate_mbps: Option<u32>,
 ) -> Result<AgentConfig> {
     let mut cfg = match path {
         Some(p) => {
@@ -100,6 +106,9 @@ fn load_config(
     if let Some(sock) = control_socket {
         cfg.control_socket = Some(sock);
     }
+    if let Some(mbps) = bitrate_mbps {
+        cfg.video.bitrate_bps = mbps.saturating_mul(1_000_000);
+    }
     Ok(cfg)
 }
 
@@ -107,8 +116,9 @@ async fn run(
     config: Option<PathBuf>,
     listen: Option<std::net::SocketAddr>,
     control_socket: Option<PathBuf>,
+    bitrate_mbps: Option<u32>,
 ) -> Result<()> {
-    let cfg = load_config(config, listen, control_socket)?;
+    let cfg = load_config(config, listen, control_socket, bitrate_mbps)?;
 
     let identity = gsa_transport::Identity::generate().context("generate identity")?;
     let endpoint = gsa_transport::server_endpoint(cfg.listen, &identity).context("bind QUIC")?;
