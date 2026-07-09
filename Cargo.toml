@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/capture-api",
     "crates/encode-api",
+    "crates/audio",
     "crates/protocol",
     "crates/transport",
     "crates/sources",
@@ -28,6 +29,7 @@ repository = "https://github.com/matt953/game-streamer-agent"
 gsa-core = { path = "crates/core" }
 gsa-capture-api = { path = "crates/capture-api" }
 gsa-encode-api = { path = "crates/encode-api" }
+gsa-audio = { path = "crates/audio" }
 gsa-protocol = { path = "crates/protocol" }
 gsa-transport = { path = "crates/transport" }
 gsa-sources = { path = "crates/sources" }
