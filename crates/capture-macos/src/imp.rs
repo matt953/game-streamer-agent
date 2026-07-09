@@ -88,12 +88,7 @@ define_class!(
 
     unsafe impl SCStreamOutput for StreamOutput {
         #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
-        fn did_output(
-            &self,
-            _stream: &SCStream,
-            sample: &CMSampleBuffer,
-            ty: SCStreamOutputType,
-        ) {
+        fn did_output(&self, _stream: &SCStream, sample: &CMSampleBuffer, ty: SCStreamOutputType) {
             if ty.0 != OUTPUT_TYPE_SCREEN {
                 return;
             }
@@ -151,8 +146,13 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
     let mut out = Vec::new();
     for display in &displays {
         // SAFETY: each element is a valid SCDisplay.
-        let (id, width, height) =
-            unsafe { (display.displayID(), display.width() as u32, display.height() as u32) };
+        let (id, width, height) = unsafe {
+            (
+                display.displayID(),
+                display.width() as u32,
+                display.height() as u32,
+            )
+        };
         out.push(DisplayInfo { id, width, height });
     }
     Ok(out)
@@ -165,25 +165,29 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
 /// `!Send`) and reconstruct it on the caller's thread.
 fn shareable_content() -> Result<Retained<SCShareableContent>> {
     let (tx, rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
-    let handler = RcBlock::new(move |content: *mut SCShareableContent, error: *mut NSError| {
-        let msg = if content.is_null() {
-            Err(error_detail(error))
-        } else {
-            // SAFETY: non-null content from SCK; retain, then leak into a raw
-            // pointer for transfer across the channel (reclaimed below).
-            let retained = unsafe { Retained::retain(content) }.expect("non-null content");
-            Ok(Retained::into_raw(retained) as usize)
-        };
-        let _ = tx.send(msg);
-    });
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            let msg = if content.is_null() {
+                Err(error_detail(error))
+            } else {
+                // SAFETY: non-null content from SCK; retain, then leak into a raw
+                // pointer for transfer across the channel (reclaimed below).
+                let retained = unsafe { Retained::retain(content) }.expect("non-null content");
+                Ok(Retained::into_raw(retained) as usize)
+            };
+            let _ = tx.send(msg);
+        },
+    );
     // SAFETY: valid escaping completion block; SCK invokes it once.
     unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
 
     match rx.recv_timeout(Duration::from_secs(10)) {
         // SAFETY: reclaim the exact pointer leaked in the handler — a single
         // ownership transfer, no double retain/release.
-        Ok(Ok(addr)) => Ok(unsafe { Retained::from_raw(addr as *mut SCShareableContent) }
-            .expect("non-null content")),
+        Ok(Ok(addr)) => Ok(
+            unsafe { Retained::from_raw(addr as *mut SCShareableContent) }
+                .expect("non-null content"),
+        ),
         Ok(Err(detail)) => Err(Error::Capture(format!(
             "ScreenCaptureKit unavailable (screen-recording permission?): {detail}"
         ))),
@@ -220,7 +224,13 @@ impl std::fmt::Debug for DesktopCapture {
 impl DesktopCapture {
     #[must_use]
     pub fn new(source_id: gsa_core::id::SourceId, display: DisplayInfo, clock: MediaClock) -> Self {
-        Self { source_id, display, clock, stream: None, delegate: None }
+        Self {
+            source_id,
+            display,
+            clock,
+            stream: None,
+            delegate: None,
+        }
     }
 }
 
@@ -285,7 +295,10 @@ impl RenderSource for DesktopCapture {
             });
         }
 
-        let delegate = StreamOutput::new(DelegateState { sink, clock: self.clock.clone() });
+        let delegate = StreamOutput::new(DelegateState {
+            sink,
+            clock: self.clock.clone(),
+        });
         let output_proto = ProtocolObject::from_ref(&*delegate);
 
         // SAFETY: valid filter + config; nil stream delegate is allowed.
@@ -313,7 +326,10 @@ impl RenderSource for DesktopCapture {
         start_capture_blocking(&stream)?;
         self.stream = Some(stream);
         self.delegate = Some(delegate);
-        tracing::info!(display = self.display.id, "ScreenCaptureKit capture started");
+        tracing::info!(
+            display = self.display.id,
+            "ScreenCaptureKit capture started"
+        );
         Ok(())
     }
 
@@ -324,7 +340,9 @@ impl RenderSource for DesktopCapture {
     }
 
     fn reconfigure(&mut self, _cfg: SourceConfig) -> Result<()> {
-        Err(Error::Capture("live reconfigure not yet implemented".into()))
+        Err(Error::Capture(
+            "live reconfigure not yet implemented".into(),
+        ))
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -345,7 +363,11 @@ impl Drop for DesktopCapture {
 fn start_capture_blocking(stream: &SCStream) -> Result<()> {
     let (tx, rx) = mpsc::sync_channel::<Option<String>>(1);
     let handler = RcBlock::new(move |error: *mut NSError| {
-        let detail = if error.is_null() { None } else { Some(error_detail(error)) };
+        let detail = if error.is_null() {
+            None
+        } else {
+            Some(error_detail(error))
+        };
         let _ = tx.send(detail);
     });
     // SAFETY: valid stream + escaping completion block.
@@ -360,7 +382,11 @@ fn start_capture_blocking(stream: &SCStream) -> Result<()> {
 fn stop_capture_blocking(stream: &SCStream) -> Result<()> {
     let (tx, rx) = mpsc::sync_channel::<Option<String>>(1);
     let handler = RcBlock::new(move |error: *mut NSError| {
-        let detail = if error.is_null() { None } else { Some(error_detail(error)) };
+        let detail = if error.is_null() {
+            None
+        } else {
+            Some(error_detail(error))
+        };
         let _ = tx.send(detail);
     });
     // SAFETY: valid stream + escaping completion block.

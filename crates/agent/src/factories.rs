@@ -31,7 +31,11 @@ impl Sources {
             .into_iter()
             .find(|d| d.id == id.0)
             .ok_or_else(|| Error::Session(format!("unknown display {id:?}")))?;
-        Ok(Box::new(gsa_capture_macos::DesktopCapture::new(id, display, self.clock.clone())))
+        Ok(Box::new(gsa_capture_macos::DesktopCapture::new(
+            id,
+            display,
+            self.clock.clone(),
+        )))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -94,7 +98,9 @@ impl EncoderFactory for Encoders {
             SourceKind::Display | SourceKind::VirtualDisplay => Ok(Box::new(
                 gsa_encode_videotoolbox::VideoToolboxEncoder::new(self.clock.clone()),
             )),
-            other => Err(Error::Encode(format!("no encoder for source kind {other:?}"))),
+            other => Err(Error::Encode(format!(
+                "no encoder for source kind {other:?}"
+            ))),
         }
     }
 }

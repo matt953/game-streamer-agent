@@ -48,7 +48,9 @@ pub struct VideoToolboxEncoder {
 
 impl std::fmt::Debug for VideoToolboxEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VideoToolboxEncoder").field("open", &self.session.is_some()).finish()
+        f.debug_struct("VideoToolboxEncoder")
+            .field("open", &self.session.is_some())
+            .finish()
     }
 }
 
@@ -65,7 +67,11 @@ impl VideoToolboxEncoder {
         Self {
             clock,
             session: None,
-            mode: VideoMode { width: 0, height: 0, fps: 0 },
+            mode: VideoMode {
+                width: 0,
+                height: 0,
+                fps: 0,
+            },
             next_frame_id: 0,
             force_idr: true,
             tx,
@@ -90,7 +96,10 @@ impl Encoder for VideoToolboxEncoder {
 
     fn open(&mut self, cfg: EncodeConfig) -> Result<()> {
         if cfg.codec != Codec::H264 {
-            return Err(Error::Encode(format!("VideoToolbox M1 does H264 only, got {:?}", cfg.codec)));
+            return Err(Error::Encode(format!(
+                "VideoToolbox M1 does H264 only, got {:?}",
+                cfg.codec
+            )));
         }
         // Dedicated low-latency rate control (macOS 11.3+): trims the
         // encoder's pipeline latency vs plain real-time mode (spec 03).
@@ -151,7 +160,10 @@ impl Encoder for VideoToolboxEncoder {
     }
 
     fn submit(&mut self, frame: &GpuFrame, directives: FrameDirectives) -> Result<()> {
-        let session = self.session.as_ref().ok_or_else(|| Error::Encode("encoder not open".into()))?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| Error::Encode("encoder not open".into()))?;
         let io = frame
             .handle
             .downcast_platform::<IoSurfaceFrame>()
@@ -177,7 +189,11 @@ impl Encoder for VideoToolboxEncoder {
             epoch: 0,
         };
 
-        let frame_props = if is_idr { Some(force_keyframe_dict()?) } else { None };
+        let frame_props = if is_idr {
+            Some(force_keyframe_dict()?)
+        } else {
+            None
+        };
 
         let tx = self.tx.clone();
         let clock = self.clock.clone();
@@ -214,7 +230,9 @@ impl Encoder for VideoToolboxEncoder {
             )
         };
         if status != 0 {
-            return Err(Error::Encode(format!("VTCompressionSessionEncodeFrame: {status}")));
+            return Err(Error::Encode(format!(
+                "VTCompressionSessionEncodeFrame: {status}"
+            )));
         }
         Ok(())
     }
@@ -230,7 +248,10 @@ impl Encoder for VideoToolboxEncoder {
     }
 
     fn update_rate(&mut self, bitrate_bps: u32) -> Result<()> {
-        let session = self.session.as_ref().ok_or_else(|| Error::Encode("encoder not open".into()))?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| Error::Encode("encoder not open".into()))?;
         // SAFETY: `&'static` CFString constant.
         let key = unsafe { kVTCompressionPropertyKey_AverageBitRate };
         set_i32(session, key, bitrate_bps as i32)
@@ -262,7 +283,11 @@ fn set_bool(session: &VTCompressionSession, key: &CFString, value: bool) -> Resu
     // SAFETY: constant CFBoolean values. Must pass an explicit false — a NULL
     // value is rejected by VTSessionSetProperty (kVTPropertyNotSupportedErr).
     let cf = unsafe {
-        if value { kCFBooleanTrue } else { kCFBooleanFalse }
+        if value {
+            kCFBooleanTrue
+        } else {
+            kCFBooleanFalse
+        }
     }
     .map(|b| b as &CFType);
     // SAFETY: valid session + key + CFBoolean value.
@@ -272,7 +297,11 @@ fn set_bool(session: &VTCompressionSession, key: &CFString, value: bool) -> Resu
 fn set_i32(session: &VTCompressionSession, key: &CFString, value: i32) -> Result<()> {
     // SAFETY: value_ptr points at a live i32 for the duration of the call.
     let number = unsafe {
-        CFNumber::new(None, CF_NUMBER_SINT32, (&value as *const i32).cast::<c_void>())
+        CFNumber::new(
+            None,
+            CF_NUMBER_SINT32,
+            (&value as *const i32).cast::<c_void>(),
+        )
     }
     .ok_or_else(|| Error::Encode("CFNumberCreate failed".into()))?;
     // SAFETY: valid session + key + CFNumber value.
@@ -306,7 +335,11 @@ fn force_keyframe_dict() -> Result<CFRetained<CFDictionary>> {
 fn single_bool_dict(key: &CFString, value: bool) -> Result<CFRetained<CFDictionary>> {
     // SAFETY: constant CFBoolean values.
     let boolean = unsafe {
-        if value { kCFBooleanTrue } else { kCFBooleanFalse }
+        if value {
+            kCFBooleanTrue
+        } else {
+            kCFBooleanFalse
+        }
     }
     .ok_or_else(|| Error::Encode("CFBoolean constant null".into()))?;
 
@@ -369,8 +402,7 @@ fn sample_to_annex_b(sample: &CMSampleBuffer, is_idr: bool) -> Option<Vec<u8>> {
     let mut len_at: usize = 0;
     let mut data_ptr: *mut c_char = ptr::null_mut();
     // SAFETY: valid block buffer; out-params live locals.
-    let status =
-        unsafe { block.data_pointer(0, &mut len_at, &mut total_len, &mut data_ptr) };
+    let status = unsafe { block.data_pointer(0, &mut len_at, &mut total_len, &mut data_ptr) };
     if status != 0 || data_ptr.is_null() {
         return None;
     }
@@ -381,8 +413,7 @@ fn sample_to_annex_b(sample: &CMSampleBuffer, is_idr: bool) -> Option<Vec<u8>> {
     // start code.
     let mut i = 0;
     while i + 4 <= data.len() {
-        let nal_len =
-            u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        let nal_len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
         i += 4;
         if nal_len == 0 || i + nal_len > data.len() {
             break;
