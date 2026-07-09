@@ -5,8 +5,9 @@
 //! (macOS/Linux) or named pipe (Windows). Caller identity = OS user (the
 //! socket is owner-permissioned); local socket ⇒ implicit admin scope.
 
+use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gsa_core::{Error, Result};
 use gsa_protocol::control::SourceInfo;
@@ -15,12 +16,46 @@ use serde::{Deserialize, Serialize};
 use crate::service::SourceFactory;
 use crate::state::{AgentState, SessionSummary};
 
+/// Bounded in-memory ring of recent formatted log lines, shared by the tracing
+/// layer (writer) and the admin `logs` command (reader).
+#[derive(Clone, Default)]
+pub struct LogBuffer(Arc<Mutex<VecDeque<String>>>);
+
+impl std::fmt::Debug for LogBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogBuffer").finish_non_exhaustive()
+    }
+}
+
+impl LogBuffer {
+    const CAP: usize = 2000;
+
+    pub fn push(&self, line: String) {
+        let mut buf = self.0.lock().expect("log ring");
+        if buf.len() >= Self::CAP {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+    }
+
+    /// The most recent `n` lines, oldest-first.
+    #[must_use]
+    pub fn recent(&self, n: usize) -> Vec<String> {
+        let buf = self.0.lock().expect("log ring");
+        buf.iter()
+            .skip(buf.len().saturating_sub(n))
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AdminRequest {
     Status,
     Sources,
     Sessions,
+    Logs { lines: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +64,7 @@ pub enum AdminResponse {
     Status(StatusReport),
     Sources { sources: Vec<SourceInfo> },
     Sessions { sessions: Vec<SessionSummary> },
+    Logs { lines: Vec<String> },
     Error { message: String },
 }
 
@@ -44,6 +80,7 @@ pub struct StatusReport {
 fn handle_request(
     state: &AgentState,
     sources: &dyn SourceFactory,
+    logs: &LogBuffer,
     req: &AdminRequest,
 ) -> AdminResponse {
     match req {
@@ -60,12 +97,20 @@ fn handle_request(
         AdminRequest::Sessions => AdminResponse::Sessions {
             sessions: state.session_summaries(),
         },
+        AdminRequest::Logs { lines } => AdminResponse::Logs {
+            lines: logs.recent(*lines),
+        },
     }
 }
 
-fn process_line(state: &AgentState, sources: &dyn SourceFactory, line: &str) -> String {
+fn process_line(
+    state: &AgentState,
+    sources: &dyn SourceFactory,
+    logs: &LogBuffer,
+    line: &str,
+) -> String {
     let response = match serde_json::from_str::<AdminRequest>(line) {
-        Ok(req) => handle_request(state, sources, &req),
+        Ok(req) => handle_request(state, sources, logs, &req),
         Err(e) => AdminResponse::Error {
             message: format!("bad request: {e}"),
         },
@@ -79,6 +124,7 @@ fn process_line(state: &AgentState, sources: &dyn SourceFactory, line: &str) -> 
 pub async fn serve(
     state: Arc<AgentState>,
     sources: Arc<dyn SourceFactory>,
+    logs: LogBuffer,
     socket_path: &Path,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -99,11 +145,12 @@ pub async fn serve(
             .map_err(|e| Error::Session(format!("admin accept: {e}")))?;
         let state = state.clone();
         let sources = sources.clone();
+        let logs = logs.clone();
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let reply = process_line(&state, sources.as_ref(), &line);
+                let reply = process_line(&state, sources.as_ref(), &logs, &line);
                 if write.write_all(reply.as_bytes()).await.is_err()
                     || write.write_all(b"\n").await.is_err()
                 {
@@ -144,6 +191,7 @@ pub async fn request(socket_path: &Path, req: &AdminRequest) -> Result<AdminResp
 pub async fn serve(
     state: Arc<AgentState>,
     sources: Arc<dyn SourceFactory>,
+    logs: LogBuffer,
     socket_path: &Path,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -168,11 +216,12 @@ pub async fn serve(
 
         let state = state.clone();
         let sources = sources.clone();
+        let logs = logs.clone();
         tokio::spawn(async move {
             let (read, mut write) = tokio::io::split(connected);
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let reply = process_line(&state, sources.as_ref(), &line);
+                let reply = process_line(&state, sources.as_ref(), &logs, &line);
                 if write.write_all(reply.as_bytes()).await.is_err()
                     || write.write_all(b"\n").await.is_err()
                 {
@@ -227,7 +276,12 @@ mod tests {
     #[test]
     fn status_request_round_trips_as_json() {
         let state = AgentState::new(AgentConfig::default(), "ab".repeat(32));
-        let reply = process_line(&state, &NoSources, r#"{"cmd":"status"}"#);
+        let reply = process_line(
+            &state,
+            &NoSources,
+            &LogBuffer::default(),
+            r#"{"cmd":"status"}"#,
+        );
         let parsed: AdminResponse = serde_json::from_str(&reply).unwrap();
         match parsed {
             AdminResponse::Status(s) => {
@@ -242,11 +296,11 @@ mod tests {
     fn sources_and_sessions_reply() {
         let state = AgentState::new(AgentConfig::default(), String::new());
         assert!(matches!(
-            serde_json::from_str(&process_line(&state, &NoSources, r#"{"cmd":"sources"}"#)).unwrap(),
+            serde_json::from_str(&process_line(&state, &NoSources, &LogBuffer::default(), r#"{"cmd":"sources"}"#)).unwrap(),
             AdminResponse::Sources { sources } if sources.is_empty()
         ));
         assert!(matches!(
-            serde_json::from_str(&process_line(&state, &NoSources, r#"{"cmd":"sessions"}"#))
+            serde_json::from_str(&process_line(&state, &NoSources, &LogBuffer::default(), r#"{"cmd":"sessions"}"#))
                 .unwrap(),
             AdminResponse::Sessions { sessions } if sessions.is_empty()
         ));
@@ -255,7 +309,7 @@ mod tests {
     #[test]
     fn bad_request_yields_error_reply() {
         let state = AgentState::new(AgentConfig::default(), String::new());
-        let reply = process_line(&state, &NoSources, "not json");
+        let reply = process_line(&state, &NoSources, &LogBuffer::default(), "not json");
         assert!(reply.contains(r#""reply":"error""#));
     }
 }

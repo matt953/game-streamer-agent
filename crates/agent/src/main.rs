@@ -67,6 +67,14 @@ enum Command {
         #[arg(long)]
         control_socket: Option<PathBuf>,
     },
+    /// Print the agent's recent log lines.
+    Logs {
+        /// How many recent lines to show.
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
+        #[arg(long)]
+        control_socket: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -79,8 +87,8 @@ fn main() -> Result<()> {
             control_socket,
             bitrate,
         } => {
-            init_tracing();
-            runtime.block_on(run(config, listen, control_socket, bitrate))
+            let logs = init_tracing();
+            runtime.block_on(run(config, listen, control_socket, bitrate, logs))
         }
         Command::Status {
             json,
@@ -95,6 +103,10 @@ fn main() -> Result<()> {
             json,
             control_socket,
         } => runtime.block_on(sessions_cmd(json, control_socket)),
+        Command::Logs {
+            lines,
+            control_socket,
+        } => runtime.block_on(logs_cmd(lines, control_socket)),
     }
 }
 
@@ -107,13 +119,50 @@ fn primary_lan_ip() -> Option<std::net::IpAddr> {
     sock.local_addr().ok().map(|a| a.ip())
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+/// A tracing writer that appends each formatted (plain-text) line to the shared
+/// [`LogBuffer`], so `gsa logs` can return recent output.
+struct RingWriter(gsa_session::admin::LogBuffer);
+
+impl std::io::Write for RingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(s) = std::str::from_utf8(buf) {
+            let line = s.trim_end();
+            if !line.is_empty() {
+                self.0.push(line.to_string());
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RingWriter {
+    type Writer = RingWriter;
+    fn make_writer(&'a self) -> RingWriter {
+        RingWriter(self.0.clone())
+    }
+}
+
+/// Set up tracing to stderr plus an in-memory ring (for `gsa logs`); returns
+/// the shared buffer.
+fn init_tracing() -> gsa_session::admin::LogBuffer {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let logs = gsa_session::admin::LogBuffer::default();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(RingWriter(logs.clone())),
         )
         .init();
+    logs
 }
 
 fn load_config(
@@ -147,6 +196,7 @@ async fn run(
     listen: Option<std::net::SocketAddr>,
     control_socket: Option<PathBuf>,
     bitrate_mbps: Option<u32>,
+    logs: gsa_session::admin::LogBuffer,
 ) -> Result<()> {
     let cfg = load_config(config, listen, control_socket, bitrate_mbps)?;
 
@@ -195,7 +245,9 @@ async fn run(
     let admin_sources = sources.clone();
     let admin_socket = socket_path.clone();
     tokio::spawn(async move {
-        if let Err(e) = gsa_session::admin::serve(admin_state, admin_sources, &admin_socket).await {
+        if let Err(e) =
+            gsa_session::admin::serve(admin_state, admin_sources, logs, &admin_socket).await
+        {
             tracing::error!(error = %e, "admin socket failed");
         }
     });
@@ -265,6 +317,20 @@ async fn sources_cmd(json: bool, control_socket: Option<PathBuf>) -> Result<()> 
                 for s in &sources {
                     println!("  {} [{:?}] {}", s.id.0, s.kind, s.name);
                 }
+            }
+            Ok(())
+        }
+        AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+async fn logs_cmd(lines: usize, control_socket: Option<PathBuf>) -> Result<()> {
+    let socket = control_socket.unwrap_or_else(default_control_socket);
+    match gsa_session::admin::request(&socket, &AdminRequest::Logs { lines }).await? {
+        AdminResponse::Logs { lines } => {
+            for line in &lines {
+                println!("{line}");
             }
             Ok(())
         }
