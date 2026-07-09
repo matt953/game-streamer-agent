@@ -12,6 +12,7 @@ description = "Embeddable streaming client core: connect, negotiate, reassemble,
 gsa-core = { workspace = true }
 gsa-protocol = { workspace = true }
 gsa-transport = { workspace = true }
+gsa-audio = { workspace = true }
 quinn = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }

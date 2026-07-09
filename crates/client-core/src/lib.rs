@@ -4,6 +4,7 @@
 //! (or `client-dev`) supplies a [`VideoDecoder`] and owns presentation.
 //! This boundary is what makes the M2 UniFFI factoring mechanical.
 
+mod audio;
 mod decode;
 mod reassembly;
 mod stats;
@@ -69,6 +70,9 @@ pub struct Client {
     /// True while the P-frame reference chain is broken (lost/undecodable
     /// frame); we skip P-frames until a keyframe resyncs the decoder (spec 04).
     awaiting_idr: bool,
+    /// Audio receive+decode, present once the embedder takes the audio output
+    /// ([`Client::take_audio_output`]); `None` means audio datagrams are dropped.
+    audio: Option<audio::AudioReceive>,
 }
 
 impl std::fmt::Debug for Client {
@@ -136,6 +140,7 @@ impl Client {
             // Until the first keyframe, the decoder has no reference; skip any
             // P-frames that arrive ahead of it.
             awaiting_idr: true,
+            audio: None,
         };
         client.sync_clock(5).await?;
         Ok(client)
@@ -190,6 +195,18 @@ impl Client {
         Some(InputSender { tx })
     }
 
+    /// Take the audio output channel — interleaved-i16 PCM frames for the
+    /// embedder to play. Enables audio decode (until called, audio datagrams
+    /// are dropped). Call once.
+    pub fn take_audio_output(&mut self) -> Result<std::sync::mpsc::Receiver<Vec<i16>>> {
+        if self.audio.is_some() {
+            return Err(Error::Session("audio output already taken".into()));
+        }
+        let (recv, rx) = audio::AudioReceive::new()?;
+        self.audio = Some(recv);
+        Ok(rx)
+    }
+
     pub async fn list_sources(&mut self) -> Result<Vec<SourceInfo>> {
         send_msg(self.ctl()?, &C2A::ListSources).await?;
         match recv_msg::<A2C>(&mut self.control_recv).await? {
@@ -238,6 +255,25 @@ impl Client {
                 | Err(quinn::ConnectionError::LocallyClosed) => return Ok(None),
                 Err(e) => return Err(Error::Transport(format!("read datagram: {e}"))),
             };
+            // Route by datagram type: audio is decoded+played as a side effect;
+            // recv_frame only returns on a completed video frame.
+            match datagram
+                .first()
+                .copied()
+                .map(gsa_protocol::DatagramType::from_wire)
+            {
+                Some(Ok(gsa_protocol::DatagramType::Audio)) => {
+                    if let Some(a) = &mut self.audio {
+                        a.handle(&datagram);
+                    }
+                    continue;
+                }
+                Some(Ok(gsa_protocol::DatagramType::Video)) => {}
+                _ => {
+                    tracing::warn!("unknown datagram dropped");
+                    continue;
+                }
+            }
             let (header, payload) = match VideoDatagramHeader::parse(&datagram) {
                 Ok(p) => p,
                 Err(e) => {
