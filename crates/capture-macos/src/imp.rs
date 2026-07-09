@@ -137,6 +137,13 @@ pub struct DisplayInfo {
     pub height: u32,
 }
 
+/// Whether this process holds the Screen Recording TCC grant (capture needs
+/// it). Checks without prompting, unlike the first capture call.
+#[must_use]
+pub fn screen_recording_authorized() -> bool {
+    objc2_core_graphics::CGPreflightScreenCaptureAccess()
+}
+
 /// Enumerate capturable displays. Blocks on ScreenCaptureKit's async query;
 /// the Screen Recording TCC prompt surfaces here on first use.
 pub fn list_displays() -> Result<Vec<DisplayInfo>> {

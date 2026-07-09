@@ -21,7 +21,7 @@ objc2-screen-capture-kit = { workspace = true, features = ["SCShareableContent",
 objc2-core-foundation = { workspace = true }
 objc2-core-media = { workspace = true, features = ["CMSampleBuffer", "CMTime", "CMBase"] }
 objc2-core-video = { workspace = true, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface"] }
-objc2-core-graphics = { workspace = true, features = ["CGDirectDisplay"] }
+objc2-core-graphics = { workspace = true, features = ["CGDirectDisplay", "CGWindow"] }
 objc2-io-surface = { workspace = true, features = ["IOSurfaceRef"] }
 dispatch2 = { workspace = true }
 block2 = { workspace = true }

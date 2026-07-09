@@ -51,6 +51,21 @@ impl std::fmt::Debug for CgInjector {
 // thread; the session owns this injector and calls it serially.
 unsafe impl Send for CgInjector {}
 
+/// Whether this process holds the Accessibility TCC grant. Without it
+/// `CGEventPost` silently no-ops, so `gsa doctor` reports it.
+#[must_use]
+pub fn accessibility_authorized() -> bool {
+    // SAFETY: no arguments, returns a CoreFoundation `Boolean` (0 or 1).
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+// `AXIsProcessTrusted` lives in ApplicationServices; no objc2 binding exists,
+// so declare it directly.
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> u8;
+}
+
 /// Modifier flag for a HID usage, or `None` if it's not a modifier.
 fn modifier_flag(usage: u16) -> Option<CGEventFlags> {
     match usage {

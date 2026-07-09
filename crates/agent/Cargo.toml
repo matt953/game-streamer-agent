@@ -21,6 +21,7 @@ gsa-transport = { workspace = true }
 gsa-session = { workspace = true }
 gsa-sources = { workspace = true }
 gsa-encode-sw = { workspace = true }
+gsa-input = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

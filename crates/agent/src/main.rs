@@ -1,6 +1,7 @@
 //! `gsa` — the game-streamer-agent binary. `gsa run` is the daemon;
 //! every other subcommand is a thin admin-socket client (spec 12).
 
+mod doctor;
 mod factories;
 
 use std::path::PathBuf;
@@ -46,6 +47,12 @@ enum Command {
         #[arg(long)]
         control_socket: Option<PathBuf>,
     },
+    /// Check host readiness (capture/injection permissions, backends).
+    Doctor {
+        /// Emit raw JSON (scripting/CI).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -65,6 +72,7 @@ fn main() -> Result<()> {
             json,
             control_socket,
         } => runtime.block_on(status(json, control_socket)),
+        Command::Doctor { json } => std::process::exit(doctor::run(json)),
     }
 }
 

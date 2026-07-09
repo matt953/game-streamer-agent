@@ -30,3 +30,19 @@ pub fn platform_injector() -> Option<Box<dyn Injector>> {
         None // per-OS injection backends land at M4/M5 (spec 07)
     }
 }
+
+/// Whether OS-level injection is authorized: `Some(true/false)` where the
+/// platform has a checkable grant, `None` where injection isn't implemented.
+/// On macOS this is the Accessibility TCC grant — without it `CGEventPost`
+/// silently no-ops, so this is the only reliable readiness signal.
+#[must_use]
+pub fn injection_authorized() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(macos::accessibility_authorized())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}

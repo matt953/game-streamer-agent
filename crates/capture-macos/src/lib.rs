@@ -7,4 +7,6 @@
 mod imp;
 
 #[cfg(target_os = "macos")]
-pub use imp::{DesktopCapture, DisplayInfo, IoSurfaceFrame, list_displays};
+pub use imp::{
+    DesktopCapture, DisplayInfo, IoSurfaceFrame, list_displays, screen_recording_authorized,
+};

@@ -853,6 +853,7 @@ dependencies = [
  "gsa-encode-api",
  "gsa-encode-sw",
  "gsa-encode-videotoolbox",
+ "gsa-input",
  "gsa-protocol",
  "gsa-session",
  "gsa-sources",
