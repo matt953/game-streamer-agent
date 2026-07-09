@@ -42,29 +42,34 @@ impl Sources {
     fn create_display(&self, id: SourceId) -> Result<Box<dyn RenderSource>> {
         Err(Error::Session(format!("unknown source {id:?}")))
     }
+
+    #[cfg(target_os = "macos")]
+    fn display_descriptors(&self) -> Vec<SourceDescriptor> {
+        match gsa_capture_macos::list_displays() {
+            Ok(displays) => displays
+                .into_iter()
+                .map(|d| {
+                    gsa_capture_macos::DesktopCapture::new(SourceId(d.id), d, self.clock.clone())
+                        .descriptor()
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "display enumeration failed");
+                Vec::new()
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn display_descriptors(&self) -> Vec<SourceDescriptor> {
+        Vec::new() // platform capture backends land at M4/M5
+    }
 }
 
 impl SourceFactory for Sources {
     fn list(&self) -> Vec<SourceDescriptor> {
         let mut out = vec![TestPattern::new(TEST_PATTERN_ID, self.clock.clone()).descriptor()];
-        #[cfg(target_os = "macos")]
-        {
-            match gsa_capture_macos::list_displays() {
-                Ok(displays) => {
-                    for d in displays {
-                        out.push(
-                            gsa_capture_macos::DesktopCapture::new(
-                                SourceId(d.id),
-                                d,
-                                self.clock.clone(),
-                            )
-                            .descriptor(),
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "display enumeration failed"),
-            }
-        }
+        out.extend(self.display_descriptors());
         out
     }
 
