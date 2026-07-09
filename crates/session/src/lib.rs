@@ -3,6 +3,7 @@
 //! exposes the local admin API (`ControlService`).
 
 pub mod admin;
+pub mod audio_pipeline;
 pub mod pipeline;
 pub mod service;
 pub mod state;

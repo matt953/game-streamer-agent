@@ -1027,6 +1027,7 @@ name = "gsa-session"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "gsa-audio",
  "gsa-capture-api",
  "gsa-core",
  "gsa-encode-api",

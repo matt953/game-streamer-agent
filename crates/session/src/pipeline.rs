@@ -25,6 +25,8 @@ pub struct PipelineHandle {
     stop: Arc<AtomicBool>,
     source: Box<dyn RenderSource>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
+    /// Audio sub-pipeline, present when the source captures audio (spec 07).
+    audio: Option<crate::audio_pipeline::AudioPipelineHandle>,
     pub frames_sent: Arc<AtomicU64>,
     /// Set to force the next encoded frame to be an IDR (client loss
     /// recovery, spec 04).
@@ -65,6 +67,12 @@ pub fn start(
         h264_profile,
     })?;
     source.start(SourceConfig { mode }, sink)?;
+
+    // If the source captures audio, run the audio pipeline beside the video one.
+    let audio = match source.audio() {
+        Some(rx) => Some(crate::audio_pipeline::start(rx, conn.clone())?),
+        None => None,
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let frames_sent = Arc::new(AtomicU64::new(0));
@@ -172,6 +180,7 @@ pub fn start(
         stop,
         source,
         encode_thread: Some(encode_thread),
+        audio,
         frames_sent,
         force_idr,
     })
@@ -182,6 +191,9 @@ impl PipelineHandle {
     pub fn stop(&mut self) -> Result<()> {
         self.stop.store(true, Ordering::Release);
         self.source.stop()?; // closes the sink → encode thread drains out
+        if let Some(mut audio) = self.audio.take() {
+            audio.stop(); // capture sink now dropped → audio thread exits
+        }
         if let Some(t) = self.encode_thread.take() {
             t.join()
                 .map_err(|_| Error::Session("encode thread panicked".into()))?;
