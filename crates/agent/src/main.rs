@@ -344,13 +344,17 @@ async fn run(
                         Ok(conn) => {
                             // A pinned peer (cert in the store) streams at its
                             // granted scope; an anonymous connection pairs.
-                            let scope = gsa_transport::peer_pin(&conn)
-                                .and_then(|pin| peers.get(&pin))
-                                .map(|p| p.scope);
+                            let pin = gsa_transport::peer_pin(&conn);
+                            let scope = pin.as_ref().and_then(|p| peers.get(p)).map(|peer| peer.scope);
                             if open {
                                 serve_connection(conn, state, sources, encoders, Scope::Interact).await;
-                            } else if let Some(scope) = scope {
-                                serve_connection(conn, state, sources, encoders, scope).await;
+                            } else if let (Some(pin), Some(scope)) = (pin, scope) {
+                                // Track the live connection so `gsa revoke`
+                                // can drop it mid-session.
+                                let sid = conn.stable_id();
+                                state.conns.register(pin.clone(), conn.clone());
+                                serve_connection(conn, state.clone(), sources, encoders, scope).await;
+                                state.conns.unregister(&pin, sid);
                             } else {
                                 serve_pairing(conn, state, peers, pairing).await;
                             }
@@ -425,9 +429,12 @@ async fn peers_cmd(json: bool, control_socket: Option<PathBuf>) -> Result<()> {
 async fn revoke_cmd(pin: String, control_socket: Option<PathBuf>) -> Result<()> {
     let socket = control_socket.unwrap_or_else(default_control_socket);
     match gsa_session::admin::request(&socket, &AdminRequest::Revoke { pin: pin.clone() }).await? {
-        AdminResponse::Revoke { removed } => {
+        AdminResponse::Revoke {
+            removed,
+            sessions_closed,
+        } => {
             if removed {
-                println!("revoked {pin}");
+                println!("revoked {pin} ({sessions_closed} live session(s) closed)");
             } else {
                 println!("no peer with pin {pin}");
             }

@@ -79,14 +79,29 @@ pub enum AdminRequest {
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum AdminResponse {
     Status(StatusReport),
-    Sources { sources: Vec<SourceInfo> },
-    Sessions { sessions: Vec<SessionSummary> },
-    Logs { lines: Vec<String> },
-    Peers { peers: Vec<Peer> },
-    Revoke { removed: bool },
-    Pairing { code: String },
+    Sources {
+        sources: Vec<SourceInfo>,
+    },
+    Sessions {
+        sessions: Vec<SessionSummary>,
+    },
+    Logs {
+        lines: Vec<String>,
+    },
+    Peers {
+        peers: Vec<Peer>,
+    },
+    Revoke {
+        removed: bool,
+        sessions_closed: usize,
+    },
+    Pairing {
+        code: String,
+    },
     PairingStatus(PairingStatusReport),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Serializable projection of the pairing window's state for `gsa pair`.
@@ -141,7 +156,12 @@ fn handle_request(
             peers: peers.list(),
         },
         AdminRequest::Revoke { pin } => match peers.remove(pin) {
-            Ok(removed) => AdminResponse::Revoke { removed },
+            // Removing the pin blocks future handshakes; also drop any live
+            // session so revocation takes effect immediately (spec 06).
+            Ok(removed) => AdminResponse::Revoke {
+                removed,
+                sessions_closed: state.conns.close_peer(pin),
+            },
             Err(e) => AdminResponse::Error {
                 message: e.to_string(),
             },

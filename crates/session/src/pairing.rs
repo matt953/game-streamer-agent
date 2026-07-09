@@ -19,6 +19,11 @@ use crate::state::AgentState;
 /// How long an armed pairing window stays open for a client to complete it.
 const WINDOW: Duration = Duration::from_secs(120);
 
+/// Wrong-code guesses tolerated on one window before it's burned. Each SPAKE2
+/// attempt is a single online guess against a 40-bit code, so a handful is
+/// ample headroom for typos while keeping brute force hopeless (spec 06).
+const MAX_ATTEMPTS: u32 = 5;
+
 /// The result of a completed pairing, held until the CLI polls for it.
 #[derive(Debug, Clone)]
 pub struct PairOutcome {
@@ -45,6 +50,7 @@ struct Pending {
     scope: Scope,
     expires: Instant,
     outcome: Option<PairOutcome>,
+    attempts: u32,
 }
 
 /// The agent's single active pairing window (at most one at a time).
@@ -74,8 +80,23 @@ impl PairingState {
             scope,
             expires: Instant::now() + WINDOW,
             outcome: None,
+            attempts: 0,
         });
         code
+    }
+
+    /// Record a wrong-code attempt; burns the window once [`MAX_ATTEMPTS`] is
+    /// reached. Returns true if the window was burned.
+    fn record_failure(&self) -> bool {
+        let mut guard = self.inner.lock().expect("pairing state");
+        if let Some(p) = guard.as_mut() {
+            p.attempts += 1;
+            if p.attempts >= MAX_ATTEMPTS {
+                *guard = None;
+                return true;
+            }
+        }
+        false
     }
 
     /// The armed `(code, authorized scope)` if a window is open and unclaimed.
@@ -162,6 +183,9 @@ async fn pair_inner(
 
     let confirm: PairConfirm = recv_msg(&mut recv).await?;
     if !agent.verify(&confirm) {
+        if pairing.record_failure() {
+            tracing::warn!("pairing window closed after too many failed attempts");
+        }
         send_msg(
             &mut send,
             &PairResult::Rejected {
@@ -182,4 +206,22 @@ async fn pair_inner(
         scope: granted,
     });
     Ok(Some(confirm.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_burns_after_max_failed_attempts() {
+        let p = PairingState::new();
+        p.begin(Scope::Interact);
+        for _ in 0..MAX_ATTEMPTS - 1 {
+            assert!(!p.record_failure(), "under the cap keeps the window open");
+            assert!(p.armed().is_some());
+        }
+        assert!(p.record_failure(), "the last attempt burns the window");
+        assert!(p.armed().is_none());
+        assert!(matches!(p.poll(), PairingPoll::Idle));
+    }
 }

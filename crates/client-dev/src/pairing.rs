@@ -92,8 +92,10 @@ pub async fn run_pair(addr: std::net::SocketAddr, code: &str, name: &str) -> Res
         "Pairing with {addr} (this client's pin {})...",
         identity.fingerprint()
     );
+    // Request the max; the agent caps the grant to what the owner authorized
+    // when arming the window (`gsa pair --scope ...`).
     let PairedAgent { agent_pin, scope } =
-        gsa_client_core::pair(addr, code, &identity, name, Scope::Interact).await?;
+        gsa_client_core::pair(addr, code, &identity, name, Scope::Manage).await?;
     PairedAgentRecord {
         agent_pin: agent_pin.clone(),
         scope,

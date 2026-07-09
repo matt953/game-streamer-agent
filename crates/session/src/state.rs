@@ -8,6 +8,7 @@ use std::time::Instant;
 use gsa_core::config::AgentConfig;
 use gsa_core::media::VideoMode;
 use gsa_core::time::MediaClock;
+use quinn::Connection;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
@@ -16,8 +17,54 @@ pub struct AgentState {
     pub clock: MediaClock,
     pub started: Instant,
     pub fingerprint: String,
+    /// Live streaming connections keyed by peer pin, so revocation can drop
+    /// them mid-session.
+    pub conns: LiveConns,
     next_session: AtomicU64,
     sessions: Mutex<HashMap<u64, SessionEntry>>,
+}
+
+/// Registry of live QUIC connections by peer pin. Registered when a paired
+/// peer starts streaming, dropped when the connection ends, and force-closed
+/// on revocation.
+#[derive(Debug, Default)]
+pub struct LiveConns {
+    by_pin: Mutex<HashMap<String, Vec<Connection>>>,
+}
+
+impl LiveConns {
+    pub fn register(&self, pin: String, conn: Connection) {
+        self.by_pin
+            .lock()
+            .expect("live conns")
+            .entry(pin)
+            .or_default()
+            .push(conn);
+    }
+
+    pub fn unregister(&self, pin: &str, stable_id: usize) {
+        let mut map = self.by_pin.lock().expect("live conns");
+        if let Some(v) = map.get_mut(pin) {
+            v.retain(|c| c.stable_id() != stable_id);
+            if v.is_empty() {
+                map.remove(pin);
+            }
+        }
+    }
+
+    /// Close every live connection for `pin` (revocation). Returns the count.
+    pub fn close_peer(&self, pin: &str) -> usize {
+        let conns = self
+            .by_pin
+            .lock()
+            .expect("live conns")
+            .remove(pin)
+            .unwrap_or_default();
+        for c in &conns {
+            c.close(1u32.into(), b"peer revoked");
+        }
+        conns.len()
+    }
 }
 
 #[derive(Debug)]
@@ -46,6 +93,7 @@ impl AgentState {
             clock: MediaClock::new(),
             started: Instant::now(),
             fingerprint,
+            conns: LiveConns::default(),
             next_session: AtomicU64::new(1),
             sessions: Mutex::new(HashMap::new()),
         }
