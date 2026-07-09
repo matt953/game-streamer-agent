@@ -4,6 +4,9 @@
 
 use serde::Serialize;
 
+// `Ok` is only constructed by the macOS checks; on other platforms host
+// support isn't implemented yet, so allow the variant to be unused there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Level {
@@ -36,17 +39,20 @@ pub fn run(json: bool) -> i32 {
     i32::from(failed)
 }
 
+#[cfg(target_os = "macos")]
 fn collect() -> Vec<Check> {
     let mut checks = Vec::new();
-    #[cfg(target_os = "macos")]
     macos_checks(&mut checks);
-    #[cfg(not(target_os = "macos"))]
-    checks.push(Check {
+    checks
+}
+
+#[cfg(not(target_os = "macos"))]
+fn collect() -> Vec<Check> {
+    vec![Check {
         name: "host capture",
         level: Level::Warn,
         detail: "platform capture/injection backends land at M4/M5 (spec 11)".into(),
-    });
-    checks
+    }]
 }
 
 #[cfg(target_os = "macos")]
