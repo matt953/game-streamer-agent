@@ -22,7 +22,69 @@ use gsa_protocol::control::{
     A2C, C2A, DecodeCaps, Hello, SessionParams, SessionRequest, SourceInfo,
 };
 use gsa_protocol::datagram::VideoDatagramHeader;
-use gsa_transport::{client_connect, recv_msg, send_msg};
+use gsa_protocol::grant::Scope;
+use gsa_protocol::pairing::{PairResponse, PairResult};
+use gsa_transport::{
+    ClientPairing, Identity, client_connect_anonymous, client_connect_pinned, recv_msg, send_msg,
+};
+
+pub use gsa_transport::Identity as ClientIdentity;
+
+/// How the client authenticates the agent for a streaming connection.
+#[derive(Debug)]
+pub enum ServerAuth<'a> {
+    /// Dev/e2e only: accept any agent cert and present no client cert.
+    Open,
+    /// Pinned mutual TLS: verify the agent against `agent_pin` and present
+    /// `identity` (whose fingerprint the agent pinned at pairing).
+    Pinned {
+        agent_pin: &'a str,
+        identity: &'a Identity,
+    },
+}
+
+/// The outcome of [`pair`]: the agent's pin (to pin it on future connects)
+/// and the scope it granted.
+#[derive(Debug, Clone)]
+pub struct PairedAgent {
+    pub agent_pin: String,
+    pub scope: Scope,
+}
+
+/// Pair with an agent: run the SPAKE2 exchange over an anonymous connection
+/// (the pairing `code` is the shared secret) and return the agent's pin +
+/// granted scope. `identity` is the client's persistent identity; its
+/// fingerprint becomes this peer's pin in the agent's store.
+pub async fn pair(
+    addr: std::net::SocketAddr,
+    code: &str,
+    identity: &Identity,
+    name: &str,
+    requested_scope: Scope,
+) -> Result<PairedAgent> {
+    let (endpoint, conn) = client_connect_anonymous(addr).await?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| Error::Transport(format!("open pairing stream: {e}")))?;
+
+    let (client, hello) = ClientPairing::start(
+        code,
+        identity.fingerprint(),
+        name.to_string(),
+        requested_scope,
+    );
+    send_msg(&mut send, &hello).await?;
+    let response: PairResponse = recv_msg(&mut recv).await?;
+    let (confirmed, confirm) = client.confirm(&response)?;
+    send_msg(&mut send, &confirm).await?;
+    let result: PairResult = recv_msg(&mut recv).await?;
+    let (agent_pin, scope) = confirmed.finish(result)?;
+
+    conn.close(0u32.into(), b"paired");
+    endpoint.wait_idle().await;
+    Ok(PairedAgent { agent_pin, scope })
+}
 
 /// One decoded frame plus its measurements, handed to the embedder.
 #[derive(Debug)]
@@ -91,8 +153,15 @@ impl Client {
         addr: std::net::SocketAddr,
         client_name: &str,
         max_h264_profile: gsa_core::media::H264Profile,
+        auth: ServerAuth<'_>,
     ) -> Result<Self> {
-        let (endpoint, conn) = client_connect(addr).await?;
+        let (endpoint, conn) = match auth {
+            ServerAuth::Open => client_connect_anonymous(addr).await?,
+            ServerAuth::Pinned {
+                agent_pin,
+                identity,
+            } => client_connect_pinned(addr, agent_pin, identity).await?,
+        };
         let (mut control_send, mut control_recv) = conn
             .open_bi()
             .await

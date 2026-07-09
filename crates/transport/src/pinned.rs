@@ -97,6 +97,13 @@ impl ClientCertVerifier for PinnedClientVerifier {
         &[]
     }
 
+    /// Client auth is offered but not required: a peer with no cert completes
+    /// the handshake anonymously so it can run the pairing exchange. A peer
+    /// that *does* present a cert must be pinned (see `verify_client_cert`).
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,

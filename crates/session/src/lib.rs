@@ -4,10 +4,12 @@
 
 pub mod admin;
 pub mod audio_pipeline;
+pub mod pairing;
 pub mod pipeline;
 pub mod service;
 pub mod state;
 
+pub use pairing::{PairingPoll, PairingState, serve_pairing};
 pub use pipeline::PipelineHandle;
 pub use service::{EncoderFactory, SourceFactory, serve_connection};
 pub use state::AgentState;

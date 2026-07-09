@@ -8,9 +8,10 @@ mod decoder;
 mod decoder_vt;
 mod headless;
 mod input_capture;
+mod pairing;
 mod window;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
@@ -34,6 +35,15 @@ struct Cli {
     /// Force the software (openh264) decoder instead of platform hardware.
     #[arg(long)]
     sw_decode: bool,
+    /// Pair with the agent instead of streaming: enter the code from `gsa pair`.
+    #[arg(long)]
+    pair: bool,
+    /// Pairing code (with --pair).
+    #[arg(long)]
+    code: Option<String>,
+    /// Name recorded on the agent when pairing.
+    #[arg(long, default_value = "gsa-client-dev")]
+    name: String,
 }
 
 fn main() -> Result<()> {
@@ -46,6 +56,14 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if cli.pair {
+        let code = cli.code.as_deref().context("--pair requires --code")?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        return runtime.block_on(pairing::run_pair(cli.connect, code, &cli.name));
+    }
+
+    let auth = pairing::load_auth()?;
     if cli.headless {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(headless::run(
@@ -54,8 +72,9 @@ fn main() -> Result<()> {
             cli.json,
             cli.source,
             cli.sw_decode,
+            auth,
         ))
     } else {
-        window::run(cli.connect, cli.source, cli.sw_decode)
+        window::run(cli.connect, cli.source, cli.sw_decode, auth)
     }
 }

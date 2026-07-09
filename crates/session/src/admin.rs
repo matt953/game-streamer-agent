@@ -11,8 +11,11 @@ use std::sync::{Arc, Mutex};
 
 use gsa_core::{Error, Result};
 use gsa_protocol::control::SourceInfo;
+use gsa_protocol::grant::Scope;
+use gsa_transport::{Peer, PeerStore};
 use serde::{Deserialize, Serialize};
 
+use crate::pairing::{PairingPoll, PairingState};
 use crate::service::SourceFactory;
 use crate::state::{AgentState, SessionSummary};
 
@@ -55,7 +58,21 @@ pub enum AdminRequest {
     Status,
     Sources,
     Sessions,
-    Logs { lines: usize },
+    Logs {
+        lines: usize,
+    },
+    /// List paired peers.
+    Peers,
+    /// Revoke a peer by its pin.
+    Revoke {
+        pin: String,
+    },
+    /// Arm a pairing window authorizing up to `scope`; returns the code.
+    BeginPairing {
+        scope: Scope,
+    },
+    /// Poll the armed pairing window.
+    PairingStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +82,25 @@ pub enum AdminResponse {
     Sources { sources: Vec<SourceInfo> },
     Sessions { sessions: Vec<SessionSummary> },
     Logs { lines: Vec<String> },
+    Peers { peers: Vec<Peer> },
+    Revoke { removed: bool },
+    Pairing { code: String },
+    PairingStatus(PairingStatusReport),
     Error { message: String },
+}
+
+/// Serializable projection of the pairing window's state for `gsa pair`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PairingStatusReport {
+    Idle,
+    Waiting,
+    Completed {
+        name: String,
+        pin: String,
+        scope: Scope,
+    },
+    Expired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +116,8 @@ fn handle_request(
     state: &AgentState,
     sources: &dyn SourceFactory,
     logs: &LogBuffer,
+    peers: &PeerStore,
+    pairing: &PairingState,
     req: &AdminRequest,
 ) -> AdminResponse {
     match req {
@@ -100,6 +137,28 @@ fn handle_request(
         AdminRequest::Logs { lines } => AdminResponse::Logs {
             lines: logs.recent(*lines),
         },
+        AdminRequest::Peers => AdminResponse::Peers {
+            peers: peers.list(),
+        },
+        AdminRequest::Revoke { pin } => match peers.remove(pin) {
+            Ok(removed) => AdminResponse::Revoke { removed },
+            Err(e) => AdminResponse::Error {
+                message: e.to_string(),
+            },
+        },
+        AdminRequest::BeginPairing { scope } => AdminResponse::Pairing {
+            code: pairing.begin(*scope),
+        },
+        AdminRequest::PairingStatus => AdminResponse::PairingStatus(match pairing.poll() {
+            PairingPoll::Idle => PairingStatusReport::Idle,
+            PairingPoll::Waiting => PairingStatusReport::Waiting,
+            PairingPoll::Completed(o) => PairingStatusReport::Completed {
+                name: o.name,
+                pin: o.pin,
+                scope: o.scope,
+            },
+            PairingPoll::Expired => PairingStatusReport::Expired,
+        }),
     }
 }
 
@@ -107,10 +166,12 @@ fn process_line(
     state: &AgentState,
     sources: &dyn SourceFactory,
     logs: &LogBuffer,
+    peers: &PeerStore,
+    pairing: &PairingState,
     line: &str,
 ) -> String {
     let response = match serde_json::from_str::<AdminRequest>(line) {
-        Ok(req) => handle_request(state, sources, logs, &req),
+        Ok(req) => handle_request(state, sources, logs, peers, pairing, &req),
         Err(e) => AdminResponse::Error {
             message: format!("bad request: {e}"),
         },
@@ -121,10 +182,13 @@ fn process_line(
 
 /// Serve the admin socket forever. Call in a spawned task.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     state: Arc<AgentState>,
     sources: Arc<dyn SourceFactory>,
     logs: LogBuffer,
+    peers: Arc<PeerStore>,
+    pairing: Arc<PairingState>,
     socket_path: &Path,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -146,11 +210,13 @@ pub async fn serve(
         let state = state.clone();
         let sources = sources.clone();
         let logs = logs.clone();
+        let peers = peers.clone();
+        let pairing = pairing.clone();
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let reply = process_line(&state, sources.as_ref(), &logs, &line);
+                let reply = process_line(&state, sources.as_ref(), &logs, &peers, &pairing, &line);
                 if write.write_all(reply.as_bytes()).await.is_err()
                     || write.write_all(b"\n").await.is_err()
                 {
@@ -188,10 +254,13 @@ pub async fn request(socket_path: &Path, req: &AdminRequest) -> Result<AdminResp
 
 /// Serve the admin named pipe forever. Call in a spawned task.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     state: Arc<AgentState>,
     sources: Arc<dyn SourceFactory>,
     logs: LogBuffer,
+    peers: Arc<PeerStore>,
+    pairing: Arc<PairingState>,
     socket_path: &Path,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -217,11 +286,13 @@ pub async fn serve(
         let state = state.clone();
         let sources = sources.clone();
         let logs = logs.clone();
+        let peers = peers.clone();
+        let pairing = pairing.clone();
         tokio::spawn(async move {
             let (read, mut write) = tokio::io::split(connected);
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let reply = process_line(&state, sources.as_ref(), &logs, &line);
+                let reply = process_line(&state, sources.as_ref(), &logs, &peers, &pairing, &line);
                 if write.write_all(reply.as_bytes()).await.is_err()
                     || write.write_all(b"\n").await.is_err()
                 {
@@ -273,13 +344,30 @@ mod tests {
         }
     }
 
+    fn empty_peers(tag: &str) -> Arc<PeerStore> {
+        let dir = std::env::temp_dir().join(format!("gsa-admin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(PeerStore::load_or_empty(&dir).unwrap())
+    }
+
+    fn line(state: &AgentState, peers: &PeerStore, pairing: &PairingState, req: &str) -> String {
+        process_line(
+            state,
+            &NoSources,
+            &LogBuffer::default(),
+            peers,
+            pairing,
+            req,
+        )
+    }
+
     #[test]
     fn status_request_round_trips_as_json() {
         let state = AgentState::new(AgentConfig::default(), "ab".repeat(32));
-        let reply = process_line(
+        let reply = line(
             &state,
-            &NoSources,
-            &LogBuffer::default(),
+            &empty_peers("status"),
+            &PairingState::new(),
             r#"{"cmd":"status"}"#,
         );
         let parsed: AdminResponse = serde_json::from_str(&reply).unwrap();
@@ -295,21 +383,49 @@ mod tests {
     #[test]
     fn sources_and_sessions_reply() {
         let state = AgentState::new(AgentConfig::default(), String::new());
+        let peers = empty_peers("srcsess");
+        let pairing = PairingState::new();
         assert!(matches!(
-            serde_json::from_str(&process_line(&state, &NoSources, &LogBuffer::default(), r#"{"cmd":"sources"}"#)).unwrap(),
+            serde_json::from_str(&line(&state, &peers, &pairing, r#"{"cmd":"sources"}"#)).unwrap(),
             AdminResponse::Sources { sources } if sources.is_empty()
         ));
         assert!(matches!(
-            serde_json::from_str(&process_line(&state, &NoSources, &LogBuffer::default(), r#"{"cmd":"sessions"}"#))
-                .unwrap(),
+            serde_json::from_str(&line(&state, &peers, &pairing, r#"{"cmd":"sessions"}"#)).unwrap(),
             AdminResponse::Sessions { sessions } if sessions.is_empty()
+        ));
+    }
+
+    #[test]
+    fn begin_pairing_returns_code_then_status_reports_waiting() {
+        let state = AgentState::new(AgentConfig::default(), String::new());
+        let peers = empty_peers("pair");
+        let pairing = PairingState::new();
+        let reply = line(
+            &state,
+            &peers,
+            &pairing,
+            r#"{"cmd":"begin_pairing","scope":"Interact"}"#,
+        );
+        assert!(matches!(
+            serde_json::from_str(&reply).unwrap(),
+            AdminResponse::Pairing { code } if code.len() == 9
+        ));
+        let status = line(&state, &peers, &pairing, r#"{"cmd":"pairing_status"}"#);
+        assert!(matches!(
+            serde_json::from_str(&status).unwrap(),
+            AdminResponse::PairingStatus(PairingStatusReport::Waiting)
         ));
     }
 
     #[test]
     fn bad_request_yields_error_reply() {
         let state = AgentState::new(AgentConfig::default(), String::new());
-        let reply = process_line(&state, &NoSources, &LogBuffer::default(), "not json");
+        let reply = line(
+            &state,
+            &empty_peers("bad"),
+            &PairingState::new(),
+            "not json",
+        );
         assert!(reply.contains(r#""reply":"error""#));
     }
 }

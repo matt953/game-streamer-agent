@@ -9,6 +9,7 @@ use gsa_core::media::VideoMode;
 use gsa_core::{Error, Result};
 use gsa_encode_api::Encoder;
 use gsa_protocol::control::{A2C, C2A, HelloAck, ProtoErrorMsg, SessionParams, SourceKind};
+use gsa_protocol::grant::Scope;
 use gsa_protocol::{PROTO_VERSION, control};
 use gsa_transport::{recv_msg, send_msg};
 
@@ -36,10 +37,11 @@ pub async fn serve_connection(
     state: Arc<AgentState>,
     sources: Arc<dyn SourceFactory>,
     encoders: Arc<dyn EncoderFactory>,
+    peer_scope: Scope,
 ) {
     let peer = conn.remote_address().to_string();
-    tracing::info!(peer, "client connected");
-    if let Err(e) = serve_inner(&conn, &state, &sources, &encoders, &peer).await {
+    tracing::info!(peer, ?peer_scope, "client connected");
+    if let Err(e) = serve_inner(&conn, &state, &sources, &encoders, &peer, peer_scope).await {
         tracing::info!(peer, error = %e, "connection ended");
     } else {
         tracing::info!(peer, "client disconnected");
@@ -52,6 +54,7 @@ async fn serve_inner(
     sources: &Arc<dyn SourceFactory>,
     encoders: &Arc<dyn EncoderFactory>,
     peer: &str,
+    peer_scope: Scope,
 ) -> Result<()> {
     let (mut send, mut recv) = conn
         .accept_bi()
@@ -191,7 +194,10 @@ async fn serve_inner(
                 tracing::debug!(peer, ?stats, "client stats");
             }
             C2A::InputBatch(events) => {
-                if let Some(a) = &mut active
+                // Injection requires the `interact` scope; a view-only peer's
+                // input is silently dropped (spec 06).
+                if peer_scope >= Scope::Interact
+                    && let Some(a) = &mut active
                     && let Some(injector) = &mut a.injector
                 {
                     for event in &events {

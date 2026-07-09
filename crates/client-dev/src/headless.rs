@@ -31,9 +31,15 @@ pub async fn run(
     json: bool,
     source_id: Option<u32>,
     force_sw: bool,
+    auth: crate::pairing::Auth,
 ) -> Result<()> {
-    let mut client =
-        Client::connect(addr, "client-dev-headless", decoder_max_profile(force_sw)).await?;
+    let mut client = Client::connect(
+        addr,
+        "client-dev-headless",
+        decoder_max_profile(force_sw),
+        auth.server_auth(),
+    )
+    .await?;
 
     let sources = client.list_sources().await?;
     for s in &sources {

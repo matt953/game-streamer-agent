@@ -22,13 +22,18 @@ enum AppEvent {
     StreamEnded(String),
 }
 
-pub fn run(addr: std::net::SocketAddr, source_id: Option<u32>, force_sw: bool) -> Result<()> {
+pub fn run(
+    addr: std::net::SocketAddr,
+    source_id: Option<u32>,
+    force_sw: bool,
+    auth: crate::pairing::Auth,
+) -> Result<()> {
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
     std::thread::Builder::new()
         .name("gsa-client-net".into())
-        .spawn(move || network_loop(addr, source_id, force_sw, &proxy))?;
+        .spawn(move || network_loop(addr, source_id, force_sw, auth, &proxy))?;
 
     let mut app = App::default();
     event_loop.run_app(&mut app)?;
@@ -39,6 +44,7 @@ fn network_loop(
     addr: std::net::SocketAddr,
     source_id: Option<u32>,
     force_sw: bool,
+    auth: crate::pairing::Auth,
     proxy: &EventLoopProxy<AppEvent>,
 ) {
     let outcome = (|| -> Result<()> {
@@ -57,6 +63,7 @@ fn network_loop(
                 addr,
                 "client-dev",
                 crate::decoder::decoder_max_profile(force_sw),
+                auth.server_auth(),
             )
             .await?;
             let sources = client.list_sources().await?;

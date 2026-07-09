@@ -6,12 +6,14 @@ mod factories;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gsa_core::config::{AgentConfig, default_control_socket};
-use gsa_session::admin::{AdminRequest, AdminResponse};
-use gsa_session::{AgentState, serve_connection};
+use gsa_protocol::grant::Scope;
+use gsa_session::admin::{AdminRequest, AdminResponse, PairingStatusReport};
+use gsa_session::{AgentState, PairingState, serve_connection, serve_pairing};
 
 #[derive(Parser, Debug)]
 #[command(name = "gsa", version, about = "Game streamer agent")]
@@ -75,6 +77,47 @@ enum Command {
         #[arg(long)]
         control_socket: Option<PathBuf>,
     },
+    /// Pair a new client: arm a pairing window and print the code to enter
+    /// on the client.
+    Pair {
+        /// Scope to grant the peer.
+        #[arg(long, value_enum, default_value_t = ScopeArg::Interact)]
+        scope: ScopeArg,
+        #[arg(long)]
+        control_socket: Option<PathBuf>,
+    },
+    /// List paired peers.
+    Peers {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        control_socket: Option<PathBuf>,
+    },
+    /// Revoke a paired peer by its pin (see `gsa peers`).
+    Revoke {
+        /// The peer's pin (cert fingerprint).
+        pin: String,
+        #[arg(long)]
+        control_socket: Option<PathBuf>,
+    },
+}
+
+/// CLI spelling of [`Scope`].
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum ScopeArg {
+    View,
+    Interact,
+    Manage,
+}
+
+impl From<ScopeArg> for Scope {
+    fn from(s: ScopeArg) -> Self {
+        match s {
+            ScopeArg::View => Scope::View,
+            ScopeArg::Interact => Scope::Interact,
+            ScopeArg::Manage => Scope::Manage,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -107,6 +150,18 @@ fn main() -> Result<()> {
             lines,
             control_socket,
         } => runtime.block_on(logs_cmd(lines, control_socket)),
+        Command::Pair {
+            scope,
+            control_socket,
+        } => runtime.block_on(pair_cmd(scope.into(), control_socket)),
+        Command::Peers {
+            json,
+            control_socket,
+        } => runtime.block_on(peers_cmd(json, control_socket)),
+        Command::Revoke {
+            pin,
+            control_socket,
+        } => runtime.block_on(revoke_cmd(pin, control_socket)),
     }
 }
 
@@ -200,9 +255,22 @@ async fn run(
 ) -> Result<()> {
     let cfg = load_config(config, listen, control_socket, bitrate_mbps)?;
 
-    let identity = gsa_transport::Identity::load_or_generate(&gsa_core::config::data_dir())
-        .context("load identity")?;
-    let endpoint = gsa_transport::server_endpoint(cfg.listen, &identity).context("bind QUIC")?;
+    let data_dir = gsa_core::config::data_dir();
+    let identity = gsa_transport::Identity::load_or_generate(&data_dir).context("load identity")?;
+    let peers =
+        Arc::new(gsa_transport::PeerStore::load_or_empty(&data_dir).context("load peer store")?);
+    let pairing = Arc::new(PairingState::new());
+
+    // Dev-open mode (e2e/CI) disables pinned mutual TLS: all clients connect
+    // anonymously and stream without pairing. Off by default — the secure
+    // path requires a paired, pinned client.
+    let open = std::env::var_os("GSA_DEV_OPEN").is_some();
+    if open {
+        tracing::warn!("GSA_DEV_OPEN set — pairing disabled, accepting any client (dev only)");
+    }
+    let endpoint =
+        gsa_transport::server_endpoint(cfg.listen, &identity, (!open).then(|| peers.clone()))
+            .context("bind QUIC")?;
     let local_addr = endpoint.local_addr().context("local addr")?;
 
     let socket_path = cfg
@@ -244,10 +312,19 @@ async fn run(
 
     let admin_state = state.clone();
     let admin_sources = sources.clone();
+    let admin_peers = peers.clone();
+    let admin_pairing = pairing.clone();
     let admin_socket = socket_path.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            gsa_session::admin::serve(admin_state, admin_sources, logs, &admin_socket).await
+        if let Err(e) = gsa_session::admin::serve(
+            admin_state,
+            admin_sources,
+            logs,
+            admin_peers,
+            admin_pairing,
+            &admin_socket,
+        )
+        .await
         {
             tracing::error!(error = %e, "admin socket failed");
         }
@@ -260,9 +337,24 @@ async fn run(
                 let state = state.clone();
                 let sources = sources.clone();
                 let encoders = encoders.clone();
+                let peers = peers.clone();
+                let pairing = pairing.clone();
                 tokio::spawn(async move {
                     match incoming.await {
-                        Ok(conn) => serve_connection(conn, state, sources, encoders).await,
+                        Ok(conn) => {
+                            // A pinned peer (cert in the store) streams at its
+                            // granted scope; an anonymous connection pairs.
+                            let scope = gsa_transport::peer_pin(&conn)
+                                .and_then(|pin| peers.get(&pin))
+                                .map(|p| p.scope);
+                            if open {
+                                serve_connection(conn, state, sources, encoders, Scope::Interact).await;
+                            } else if let Some(scope) = scope {
+                                serve_connection(conn, state, sources, encoders, scope).await;
+                            } else {
+                                serve_pairing(conn, state, peers, pairing).await;
+                            }
+                        }
                         Err(e) => tracing::warn!(error = %e, "handshake failed"),
                     }
                 });
@@ -275,6 +367,75 @@ async fn run(
     }
     endpoint.close(0u32.into(), b"agent shutdown");
     Ok(())
+}
+
+/// `gsa pair`: arm a pairing window and print the code, then poll until a
+/// client completes it (or the window expires).
+async fn pair_cmd(scope: Scope, control_socket: Option<PathBuf>) -> Result<()> {
+    let socket = control_socket.unwrap_or_else(default_control_socket);
+    let code =
+        match gsa_session::admin::request(&socket, &AdminRequest::BeginPairing { scope }).await? {
+            AdminResponse::Pairing { code } => code,
+            AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        };
+    println!("Pairing code: {code}   (grant: {scope:?})");
+    println!("On the client:  gsa-client-dev --connect <agent-addr> --pair --code {code}");
+    println!("Waiting for the client...");
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        match gsa_session::admin::request(&socket, &AdminRequest::PairingStatus).await? {
+            AdminResponse::PairingStatus(PairingStatusReport::Completed { name, pin, scope }) => {
+                println!("✓ paired with \"{name}\" (scope {scope:?})");
+                println!("  pin {pin}");
+                return Ok(());
+            }
+            AdminResponse::PairingStatus(PairingStatusReport::Expired) => {
+                anyhow::bail!("pairing window expired with no client");
+            }
+            // Idle/Waiting: keep polling.
+            AdminResponse::PairingStatus(_) => {}
+            AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
+    }
+}
+
+async fn peers_cmd(json: bool, control_socket: Option<PathBuf>) -> Result<()> {
+    let socket = control_socket.unwrap_or_else(default_control_socket);
+    match gsa_session::admin::request(&socket, &AdminRequest::Peers).await? {
+        AdminResponse::Peers { peers } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&peers)?);
+            } else if peers.is_empty() {
+                println!("no paired peers");
+            } else {
+                for p in &peers {
+                    println!("  {}  scope={:?}  pin={}", p.name, p.scope, p.pin);
+                }
+            }
+            Ok(())
+        }
+        AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+async fn revoke_cmd(pin: String, control_socket: Option<PathBuf>) -> Result<()> {
+    let socket = control_socket.unwrap_or_else(default_control_socket);
+    match gsa_session::admin::request(&socket, &AdminRequest::Revoke { pin: pin.clone() }).await? {
+        AdminResponse::Revoke { removed } => {
+            if removed {
+                println!("revoked {pin}");
+            } else {
+                println!("no peer with pin {pin}");
+            }
+            Ok(())
+        }
+        AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
 }
 
 async fn status(json: bool, control_socket: Option<PathBuf>) -> Result<()> {

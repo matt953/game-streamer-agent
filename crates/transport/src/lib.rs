@@ -1,10 +1,12 @@
 //! QUIC transport (spec 04): one connection per session carrying video
 //! datagrams, a reliable input stream, and reliable control streams.
 //!
-//! M0 trust model: self-signed per-run identities; the client uses a
-//! deliberately-loud TOFU verifier (`DevTrustVerifier`) that logs the
-//! agent's fingerprint. Real pairing + pinned mTLS replaces it at M2
-//! (spec 06) — the verifier type is the seam.
+//! Trust model (spec 06): persistent self-signed identities pinned by their
+//! cert SHA-256. A streaming connection is mutual-TLS — the client pins the
+//! agent ([`client_connect_pinned`]) and the agent pins the client
+//! ([`server_endpoint`] with a peer store). Pairing runs over an anonymous
+//! connection ([`client_connect_anonymous`]) where SPAKE2 provides the
+//! authentication before any pins exist.
 
 mod identity;
 mod pairing;
@@ -25,6 +27,7 @@ use std::time::Duration;
 use gsa_core::{Error, Result};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{EndpointConfig, TransportConfig};
+use rustls::pki_types::CertificateDer;
 use socket2::{Domain, Protocol, Socket, Type};
 
 /// ALPN for our protocol; version-gated at the TLS layer.
@@ -75,11 +78,23 @@ fn transport_config() -> TransportConfig {
 
 /// Build a listening endpoint from an identity. Returns the endpoint;
 /// its local address carries the OS-assigned port when `addr` used :0.
-pub fn server_endpoint(addr: SocketAddr, identity: &Identity) -> Result<quinn::Endpoint> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
+///
+/// With `peers`, the endpoint requires mutual TLS: a client that presents a
+/// cert must be a paired peer, while an anonymous client (pairing) is still
+/// admitted. Without it (dev-open mode) all clients connect anonymously.
+pub fn server_endpoint(
+    addr: SocketAddr,
+    identity: &Identity,
+    peers: Option<Arc<PeerStore>>,
+) -> Result<quinn::Endpoint> {
+    let base = rustls::ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
-        .map_err(|e| Error::Transport(format!("tls versions: {e}")))?
-        .with_no_client_auth()
+        .map_err(|e| Error::Transport(format!("tls versions: {e}")))?;
+    let with_auth = match peers {
+        Some(store) => base.with_client_cert_verifier(Arc::new(PinnedClientVerifier::new(store))),
+        None => base.with_no_client_auth(),
+    };
+    let mut tls = with_auth
         .with_single_cert(
             vec![identity.cert_der.clone()],
             identity.key_der.clone_key(),
@@ -103,18 +118,62 @@ pub fn server_endpoint(addr: SocketAddr, identity: &Identity) -> Result<quinn::E
     .map_err(|e| Error::Transport(format!("server endpoint {addr}: {e}")))
 }
 
-/// Connect to an agent with the dev-TOFU verifier. Returns the endpoint
-/// (owns the socket; keep it alive and `wait_idle` it for clean shutdown)
-/// and the connection. The peer's fingerprint is logged at `INFO`.
-pub async fn client_connect(addr: SocketAddr) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| Error::Transport(format!("tls versions: {e}")))?
-        .dangerous()
+/// Connect anonymously (no client cert; accept any agent cert). Used for
+/// pairing — where SPAKE2 authenticates and no pins exist yet — and for
+/// dev-open streaming. The agent's fingerprint is logged at `INFO`.
+pub async fn client_connect_anonymous(
+    addr: SocketAddr,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let tls = client_tls_base()?
         .with_custom_certificate_verifier(Arc::new(identity::DevTrustVerifier::new()))
         .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    connect_with(addr, tls).await
+}
 
+/// Connect with pinned mutual TLS: verify the agent against `agent_pin` and
+/// present `identity` as the client cert (its fingerprint is the pin the
+/// agent recorded at pairing). Returns the endpoint (keep it alive) + conn.
+pub async fn client_connect_pinned(
+    addr: SocketAddr,
+    agent_pin: &str,
+    identity: &Identity,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let tls = client_tls_base()?
+        .with_custom_certificate_verifier(Arc::new(PinnedServerVerifier::new(
+            agent_pin.to_string(),
+        )))
+        .with_client_auth_cert(
+            vec![identity.cert_der.clone()],
+            identity.key_der.clone_key(),
+        )
+        .map_err(|e| Error::Transport(format!("client auth cert: {e}")))?;
+    connect_with(addr, tls).await
+}
+
+/// The pin (cert SHA-256) of the connected peer, if it presented a client
+/// cert. `None` for an anonymous (pairing) connection.
+#[must_use]
+pub fn peer_pin(conn: &quinn::Connection) -> Option<String> {
+    let certs = conn
+        .peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()?;
+    certs.first().map(identity::fingerprint)
+}
+
+fn client_tls_base() -> Result<rustls::client::danger::DangerousClientConfigBuilder> {
+    Ok(rustls::ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Transport(format!("tls versions: {e}")))?
+        .dangerous())
+}
+
+/// Bind an ephemeral client endpoint and open a connection with the given TLS.
+async fn connect_with(
+    addr: SocketAddr,
+    mut tls: rustls::ClientConfig,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    tls.alpn_protocols = vec![ALPN.to_vec()];
     let quic = QuicClientConfig::try_from(tls)
         .map_err(|e| Error::Transport(format!("quic client config: {e}")))?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic));
@@ -136,10 +195,9 @@ pub async fn client_connect(addr: SocketAddr) -> Result<(quinn::Endpoint, quinn:
     .map_err(|e| Error::Transport(format!("client bind: {e}")))?;
     endpoint.set_default_client_config(client_config);
 
-    let connecting = endpoint
+    let conn = endpoint
         .connect(addr, "gsa-agent")
-        .map_err(|e| Error::Transport(format!("connect {addr}: {e}")))?;
-    let conn = connecting
+        .map_err(|e| Error::Transport(format!("connect {addr}: {e}")))?
         .await
         .map_err(|e| Error::Transport(format!("handshake: {e}")))?;
     Ok((endpoint, conn))
@@ -157,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn loopback_control_and_datagrams() {
         let identity = Identity::generate().unwrap();
-        let server = server_endpoint("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap(), &identity, None).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let server_task = tokio::spawn(async move {
@@ -175,7 +233,7 @@ mod tests {
             let _ = conn.accept_uni().await;
         });
 
-        let (endpoint, conn) = client_connect(server_addr).await.unwrap();
+        let (endpoint, conn) = client_connect_anonymous(server_addr).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         let hello = C2A::Hello(Hello {
             proto: gsa_protocol::PROTO_VERSION,
@@ -199,5 +257,76 @@ mod tests {
         conn.close(0u32.into(), b"done");
         endpoint.wait_idle().await;
         server_task.await.unwrap();
+    }
+
+    fn tmp_store(tag: &str) -> Arc<PeerStore> {
+        let dir = std::env::temp_dir().join(format!("gsa-mtls-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(PeerStore::load_or_empty(&dir).unwrap())
+    }
+
+    #[tokio::test]
+    async fn pinned_streaming_and_anonymous_pairing() {
+        use gsa_protocol::grant::Scope;
+        let agent = Identity::generate().unwrap();
+        let client = Identity::generate().unwrap();
+        let store = tmp_store("ok");
+        store
+            .add("laptop".into(), client.fingerprint(), Scope::Interact)
+            .unwrap();
+
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap(), &agent, Some(store)).unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let c1 = server.accept().await.unwrap().await.unwrap();
+            let pinned = peer_pin(&c1).is_some();
+            let c2 = server.accept().await.unwrap().await.unwrap();
+            let anon = peer_pin(&c2).is_none();
+            (pinned, anon)
+        });
+
+        // Paired client: pinned mutual TLS presents a client pin.
+        let (_e1, _c1) = client_connect_pinned(addr, &agent.fingerprint(), &client)
+            .await
+            .unwrap();
+        // Anonymous client (pairing): admitted with no pin.
+        let (_e2, _c2) = client_connect_anonymous(addr).await.unwrap();
+
+        let (pinned, anon) = srv.await.unwrap();
+        assert!(pinned, "paired client presents its pin");
+        assert!(anon, "anonymous client presents no pin");
+    }
+
+    #[tokio::test]
+    async fn stranger_client_cert_is_rejected() {
+        let agent = Identity::generate().unwrap();
+        let stranger = Identity::generate().unwrap();
+        let server = server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &agent,
+            Some(tmp_store("bad")),
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            if let Some(inc) = server.accept().await {
+                let _ = inc.await; // handshake rejects the stranger cert
+            }
+        });
+
+        // In TLS 1.3 the client finishes its side before the server validates
+        // the client cert, so connect() may resolve; the rejection surfaces as
+        // the server closing the connection immediately after.
+        let closed = match client_connect_pinned(addr, &agent.fingerprint(), &stranger).await {
+            Ok((_ep, conn)) => tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .is_ok(),
+            Err(_) => true, // rejected outright — also acceptable
+        };
+        assert!(
+            closed,
+            "an unpaired client must not hold a usable connection"
+        );
+        srv.abort();
     }
 }

@@ -130,6 +130,8 @@ fn ci_e2e(frames: u32, report_path: &PathBuf) -> Result<()> {
         Command::new(exe("gsa"))
             .args(["run", "--listen", &addr, "--control-socket", &socket])
             .env("RUST_LOG", "info")
+            // Dev-open: skip pairing so the e2e connects anonymously.
+            .env("GSA_DEV_OPEN", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -147,6 +149,7 @@ fn ci_e2e(frames: u32, report_path: &PathBuf) -> Result<()> {
             "--frames",
             &frames.to_string(),
         ])
+        .env("GSA_DEV_OPEN", "1")
         .stderr(Stdio::inherit())
         .output()
         .context("run client")?;
