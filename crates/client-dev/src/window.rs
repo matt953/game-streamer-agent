@@ -100,6 +100,8 @@ fn network_loop(
                     let s = client.stats();
                     tracing::info!(
                         frames,
+                        recent_p50 = ?s.recent_latency_ms_p50,
+                        recent_p99 = ?s.recent_latency_ms_p99,
                         latency_ms_p50 = ?s.latency_ms_p50,
                         latency_ms_p99 = ?s.latency_ms_p99,
                         decode_ms_p50 = ?s.decode_ms_p50,

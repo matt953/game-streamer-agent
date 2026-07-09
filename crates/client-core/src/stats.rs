@@ -10,11 +10,13 @@ use std::collections::VecDeque;
 use gsa_core::time::wire_ts_delta_us;
 use serde::{Deserialize, Serialize};
 
-/// Percentiles are computed over the most recent `WINDOW` frames so the tail
-/// reflects *current* conditions rather than being dominated forever by
-/// startup transients (decoder warmup, first keyframe). ~60 s at 60 fps —
-/// generous enough that a typical CI/headless run is still whole-run.
+/// Latency samples are kept for the most recent `WINDOW` frames and reported
+/// at two horizons: the full window (~60 s at 60 fps — a stable baseline,
+/// generous enough that a typical CI/headless run is still whole-run) and a
+/// short `RECENT` tail (~5 s — responsive to a spike as it happens). Both
+/// shed startup transients (decoder warmup, first keyframe) over time.
 const WINDOW: usize = 3600;
+const RECENT: usize = 300;
 
 #[derive(Debug, Default)]
 pub struct ClockSync {
@@ -85,6 +87,7 @@ impl LatencyStats {
     pub fn summary(&self, frames_dropped: u64) -> StatsSummary {
         let latencies: Vec<u32> = self.latencies_us.iter().copied().collect();
         let decodes: Vec<u32> = self.decode_us.iter().copied().collect();
+        let recent: Vec<u32> = tail(&self.latencies_us, RECENT);
         StatsSummary {
             frames_complete: self.frames_complete,
             frames_decoded: self.frames_decoded,
@@ -93,8 +96,18 @@ impl LatencyStats {
             latency_ms_p95: percentile(&latencies, 95).map(us_to_ms),
             latency_ms_p99: percentile(&latencies, 99).map(us_to_ms),
             decode_ms_p50: percentile(&decodes, 50).map(us_to_ms),
+            recent_latency_ms_p50: percentile(&recent, 50).map(us_to_ms),
+            recent_latency_ms_p99: percentile(&recent, 99).map(us_to_ms),
         }
     }
+}
+
+/// The last `n` samples (all of them if fewer), oldest-first.
+fn tail(buf: &VecDeque<u32>, n: usize) -> Vec<u32> {
+    buf.iter()
+        .skip(buf.len().saturating_sub(n))
+        .copied()
+        .collect()
 }
 
 /// JSON-friendly aggregate (client-dev `--json`, CI latency ledger).
@@ -107,6 +120,9 @@ pub struct StatsSummary {
     pub latency_ms_p95: Option<f64>,
     pub latency_ms_p99: Option<f64>,
     pub decode_ms_p50: Option<f64>,
+    /// Same latency, over the short `RECENT` tail — a "right now" read.
+    pub recent_latency_ms_p50: Option<f64>,
+    pub recent_latency_ms_p99: Option<f64>,
 }
 
 fn us_to_ms(us: u32) -> f64 {
@@ -152,5 +168,21 @@ mod tests {
         assert_eq!(percentile(&s, 50), Some(50));
         assert_eq!(percentile(&s, 99), Some(99));
         assert_eq!(percentile(&[], 50), None);
+    }
+
+    #[test]
+    fn recent_window_tracks_the_tail_not_the_baseline() {
+        let mut s = LatencyStats::default();
+        for _ in 0..1000 {
+            s.on_frame_decoded(Some(10_000), 1000); // 10 ms baseline
+        }
+        for _ in 0..RECENT {
+            s.on_frame_decoded(Some(100_000), 1000); // 100 ms recent spike
+        }
+        let sum = s.summary(0);
+        // Full window is still dominated by the 1000 fast frames.
+        assert!(sum.latency_ms_p50.unwrap() < 20.0);
+        // The short window sees only the spike.
+        assert!(sum.recent_latency_ms_p50.unwrap() > 90.0);
     }
 }
