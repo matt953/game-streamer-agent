@@ -251,7 +251,13 @@ impl RenderSource for DesktopCapture {
                     self.display.id, self.display.width, self.display.height
                 ),
             },
-            modes: Vec::new(),
+            // Native resolution first — the session default when the client
+            // doesn't request a mode (avoids capture-downscale blur).
+            modes: vec![gsa_core::media::VideoMode {
+                width: self.display.width,
+                height: self.display.height,
+                fps: 60,
+            }],
         }
     }
 

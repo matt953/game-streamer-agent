@@ -10,14 +10,24 @@ use gsa_core::Result;
 /// surfaces (spec 01: platform textures stay on-GPU) arrive with the
 /// platform decoders; this type then grows a handle variant, and `bgra`
 /// becomes the debug path.
+/// Byte order of a 4-byte pixel. Green sits at byte 1 in both, so
+/// brightness-based readers (test-pattern marker) work on either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelOrder {
+    Rgba,
+    Bgra,
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
-    /// Tightly-packed RGBA8 (`width * height * 4` bytes) for presentation.
-    /// (Test-pattern marker readback samples this directly via
-    /// `pattern::read_marker_rgba` — no separate luma plane.)
-    pub rgba: Vec<u8>,
+    /// Tightly-packed 4-byte pixels (`width * height * 4` bytes) in `order`.
+    /// Decoders emit whatever order is free for them (BGRA from
+    /// VideoToolbox, RGBA from openh264); presenters pick the matching
+    /// texture format rather than swizzling on the CPU.
+    pub pixels: Vec<u8>,
+    pub order: PixelOrder,
 }
 
 /// An H.264 (M0) access-unit decoder.

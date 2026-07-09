@@ -1,12 +1,24 @@
-//! openh264 implementation of client-core's `VideoDecoder` seam. The real
-//! apps use VideoToolbox/MediaCodec here (D9); this is the portable debug
-//! decoder.
+//! Decoder selection + the portable openh264 software decoder. On macOS the
+//! default is hardware VideoToolbox decode (`decoder_vt`), with software as
+//! the explicit fallback / cross-platform path.
 
 use anyhow::Context;
 use gsa_client_core::{DecodedFrame, VideoDecoder};
 use gsa_core::{Error, Result};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
+
+/// Pick the platform's best decoder (`force_sw` pins openh264).
+pub fn make_decoder(force_sw: bool) -> anyhow::Result<Box<dyn VideoDecoder>> {
+    #[cfg(target_os = "macos")]
+    if !force_sw {
+        tracing::info!("using VideoToolbox hardware decoder");
+        return Ok(Box::new(crate::decoder_vt::VideoToolboxDecoder::new()));
+    }
+    let _ = force_sw;
+    tracing::info!("using openh264 software decoder");
+    Ok(Box::new(OpenH264Decoder::new()?))
+}
 
 pub struct OpenH264Decoder {
     inner: Decoder,
@@ -31,13 +43,14 @@ impl VideoDecoder for OpenH264Decoder {
         };
 
         let (width, height) = yuv.dimensions();
-        let mut rgba = vec![0u8; width * height * 4];
-        yuv.write_rgba8(&mut rgba);
+        let mut pixels = vec![0u8; width * height * 4];
+        yuv.write_rgba8(&mut pixels);
 
         Ok(Some(DecodedFrame {
             width: width as u32,
             height: height as u32,
-            rgba,
+            pixels,
+            order: gsa_client_core::PixelOrder::Rgba,
         }))
     }
 }

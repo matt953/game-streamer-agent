@@ -25,7 +25,22 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 openh264 = { workspace = true }
 winit = { workspace = true }
-softbuffer = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
 
-[lints]
-workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { workspace = true, features = ["CFNumber", "CFDictionary", "CFString"] }
+objc2-core-media = { workspace = true, features = ["CMSampleBuffer", "CMTime", "CMFormatDescription", "CMBlockBuffer"] }
+objc2-core-video = { workspace = true, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-video-toolbox = { workspace = true, features = ["VTDecompressionSession", "VTDecompressionProperties", "VTSession", "VTErrors", "objc2-core-media", "block2"] }
+block2 = { workspace = true }
+
+# Hosts the VideoToolbox decoder FFI (decoder_vt.rs): opts out of the
+# workspace-wide `unsafe_code = "forbid"`; unsafe blocks must carry SAFETY
+# comments (undocumented_unsafe_blocks = deny).
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

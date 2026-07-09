@@ -37,13 +37,16 @@ impl Default for AgentConfig {
 
 impl Default for VideoConfig {
     fn default() -> Self {
+        // Mode is the fallback for sources with no native mode (test
+        // pattern); real displays stream at native resolution, so the
+        // bitrate default targets 1080p60.
         Self {
             mode: VideoMode {
                 width: 1280,
                 height: 720,
                 fps: 60,
             },
-            bitrate_bps: 8_000_000,
+            bitrate_bps: 15_000_000,
         }
     }
 }

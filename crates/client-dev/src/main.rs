@@ -3,6 +3,8 @@
 //! mode); the default mode opens a window and presents the stream.
 
 mod decoder;
+#[cfg(target_os = "macos")]
+mod decoder_vt;
 mod headless;
 mod window;
 
@@ -27,6 +29,9 @@ struct Cli {
     /// Source id to stream (default: the agent's first source).
     #[arg(long)]
     source: Option<u32>,
+    /// Force the software (openh264) decoder instead of platform hardware.
+    #[arg(long)]
+    sw_decode: bool,
 }
 
 fn main() -> Result<()> {
@@ -41,8 +46,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.headless {
         let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(headless::run(cli.connect, cli.frames, cli.json, cli.source))
+        runtime.block_on(headless::run(
+            cli.connect,
+            cli.frames,
+            cli.json,
+            cli.source,
+            cli.sw_decode,
+        ))
     } else {
-        window::run(cli.connect, cli.source)
+        window::run(cli.connect, cli.source, cli.sw_decode)
     }
 }

@@ -52,7 +52,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 toml = "1"
 openh264 = "0.9"
 winit = "0.30"
-softbuffer = "0.4"
+wgpu = "30"
+pollster = "0.4"
 anyhow = "1"
 
 # Apple FFI (macOS backends only)

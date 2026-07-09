@@ -189,8 +189,13 @@ fn start_session(
     req: &control::SessionRequest,
 ) -> Result<(u64, pipeline::PipelineHandle, VideoMode, u32)> {
     let source = sources.create(req.source)?;
-    let encoder = encoders.create(source.descriptor().kind())?;
-    let mode = req.mode.unwrap_or(state.config.video.mode);
+    let descriptor = source.descriptor();
+    let encoder = encoders.create(descriptor.kind())?;
+    // Mode preference: client request > source native > agent config.
+    let mode = req
+        .mode
+        .or_else(|| descriptor.modes.first().copied())
+        .unwrap_or(state.config.video.mode);
     let bitrate = state.config.video.bitrate_bps;
 
     let handle = pipeline::start(source, encoder, conn.clone(), mode, bitrate)?;

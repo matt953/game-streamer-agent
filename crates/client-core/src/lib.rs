@@ -8,7 +8,7 @@ mod decode;
 mod reassembly;
 mod stats;
 
-pub use decode::{DecodedFrame, VideoDecoder};
+pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
 pub use reassembly::Reassembler;
 pub use stats::{ClockSync, LatencyStats, StatsSummary};
 

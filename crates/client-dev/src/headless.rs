@@ -7,7 +7,7 @@ use gsa_client_core::Client;
 use gsa_core::id::SourceId;
 use serde::Serialize;
 
-use crate::decoder::OpenH264Decoder;
+use crate::decoder::make_decoder;
 
 #[derive(Debug, Serialize)]
 struct Report {
@@ -30,6 +30,7 @@ pub async fn run(
     frames: u32,
     json: bool,
     source_id: Option<u32>,
+    force_sw: bool,
 ) -> Result<()> {
     let mut client = Client::connect(addr, "client-dev-headless").await?;
 
@@ -49,20 +50,22 @@ pub async fn run(
     let check_markers = source.kind == gsa_protocol::control::SourceKind::TestPattern;
     let params = client.start_session(SourceId(source.id.0), None).await?;
 
-    let mut decoder = OpenH264Decoder::new()?;
+    let mut decoder = make_decoder(force_sw)?;
     let mut decoded = 0u32;
     let mut marker_read_ok = 0u64;
     let mut marker_regressions = 0u64;
     let mut last_marker: Option<u32> = None;
 
     while decoded < frames {
-        let Some(out) = client.recv_frame(&mut decoder).await? else {
+        let Some(out) = client.recv_frame(decoder.as_mut()).await? else {
             bail!("connection closed after {decoded} frames");
         };
         decoded += 1;
 
         if let Some(marker) = check_markers
-            .then(|| gsa_core::pattern::read_marker_rgba(&out.frame.rgba, out.frame.width as usize))
+            .then(|| {
+                gsa_core::pattern::read_marker_rgba(&out.frame.pixels, out.frame.width as usize)
+            })
             .flatten()
         {
             marker_read_ok += 1;
