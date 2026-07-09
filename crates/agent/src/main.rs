@@ -53,6 +53,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List the agent's available capture sources.
+    Sources {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        control_socket: Option<PathBuf>,
+    },
+    /// List the agent's active streaming sessions.
+    Sessions {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        control_socket: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -73,6 +87,14 @@ fn main() -> Result<()> {
             control_socket,
         } => runtime.block_on(status(json, control_socket)),
         Command::Doctor { json } => std::process::exit(doctor::run(json)),
+        Command::Sources {
+            json,
+            control_socket,
+        } => runtime.block_on(sources_cmd(json, control_socket)),
+        Command::Sessions {
+            json,
+            control_socket,
+        } => runtime.block_on(sessions_cmd(json, control_socket)),
     }
 }
 
@@ -166,16 +188,17 @@ async fn run(
         tracing::info!("listening on loopback only — pass `--listen 0.0.0.0:PORT` for LAN access");
     }
 
+    let sources = Arc::new(factories::Sources::new(state.clock.clone()));
+    let encoders = Arc::new(factories::Encoders::new(state.clock.clone()));
+
     let admin_state = state.clone();
+    let admin_sources = sources.clone();
     let admin_socket = socket_path.clone();
     tokio::spawn(async move {
-        if let Err(e) = gsa_session::admin::serve(admin_state, &admin_socket).await {
+        if let Err(e) = gsa_session::admin::serve(admin_state, admin_sources, &admin_socket).await {
             tracing::error!(error = %e, "admin socket failed");
         }
     });
-
-    let sources = Arc::new(factories::Sources::new(state.clock.clone()));
-    let encoders = Arc::new(factories::Encoders::new(state.clock.clone()));
 
     loop {
         tokio::select! {
@@ -226,5 +249,49 @@ async fn status(json: bool, control_socket: Option<PathBuf>) -> Result<()> {
             Ok(())
         }
         AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+async fn sources_cmd(json: bool, control_socket: Option<PathBuf>) -> Result<()> {
+    let socket = control_socket.unwrap_or_else(default_control_socket);
+    match gsa_session::admin::request(&socket, &AdminRequest::Sources).await? {
+        AdminResponse::Sources { sources } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sources)?);
+            } else if sources.is_empty() {
+                println!("no sources");
+            } else {
+                for s in &sources {
+                    println!("  {} [{:?}] {}", s.id.0, s.kind, s.name);
+                }
+            }
+            Ok(())
+        }
+        AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+async fn sessions_cmd(json: bool, control_socket: Option<PathBuf>) -> Result<()> {
+    let socket = control_socket.unwrap_or_else(default_control_socket);
+    match gsa_session::admin::request(&socket, &AdminRequest::Sessions).await? {
+        AdminResponse::Sessions { sessions } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else if sessions.is_empty() {
+                println!("no active sessions");
+            } else {
+                for s in &sessions {
+                    println!(
+                        "  session {}: {} {}x{}@{} — {} frames sent",
+                        s.id, s.peer, s.width, s.height, s.fps, s.frames_sent
+                    );
+                }
+            }
+            Ok(())
+        }
+        AdminResponse::Error { message } => anyhow::bail!("agent error: {message}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
     }
 }

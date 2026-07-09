@@ -9,20 +9,26 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gsa_core::{Error, Result};
+use gsa_protocol::control::SourceInfo;
 use serde::{Deserialize, Serialize};
 
+use crate::service::SourceFactory;
 use crate::state::{AgentState, SessionSummary};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AdminRequest {
     Status,
+    Sources,
+    Sessions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum AdminResponse {
     Status(StatusReport),
+    Sources { sources: Vec<SourceInfo> },
+    Sessions { sessions: Vec<SessionSummary> },
     Error { message: String },
 }
 
@@ -35,7 +41,11 @@ pub struct StatusReport {
     pub sessions: Vec<SessionSummary>,
 }
 
-fn handle_request(state: &AgentState, req: &AdminRequest) -> AdminResponse {
+fn handle_request(
+    state: &AgentState,
+    sources: &dyn SourceFactory,
+    req: &AdminRequest,
+) -> AdminResponse {
     match req {
         AdminRequest::Status => AdminResponse::Status(StatusReport {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -44,12 +54,18 @@ fn handle_request(state: &AgentState, req: &AdminRequest) -> AdminResponse {
             fingerprint: state.fingerprint.clone(),
             sessions: state.session_summaries(),
         }),
+        AdminRequest::Sources => AdminResponse::Sources {
+            sources: sources.list().into_iter().map(|d| d.info).collect(),
+        },
+        AdminRequest::Sessions => AdminResponse::Sessions {
+            sessions: state.session_summaries(),
+        },
     }
 }
 
-fn process_line(state: &AgentState, line: &str) -> String {
+fn process_line(state: &AgentState, sources: &dyn SourceFactory, line: &str) -> String {
     let response = match serde_json::from_str::<AdminRequest>(line) {
-        Ok(req) => handle_request(state, &req),
+        Ok(req) => handle_request(state, sources, &req),
         Err(e) => AdminResponse::Error {
             message: format!("bad request: {e}"),
         },
@@ -60,7 +76,11 @@ fn process_line(state: &AgentState, line: &str) -> String {
 
 /// Serve the admin socket forever. Call in a spawned task.
 #[cfg(unix)]
-pub async fn serve(state: Arc<AgentState>, socket_path: &Path) -> Result<()> {
+pub async fn serve(
+    state: Arc<AgentState>,
+    sources: Arc<dyn SourceFactory>,
+    socket_path: &Path,
+) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     // Stale socket from a previous run.
@@ -78,11 +98,12 @@ pub async fn serve(state: Arc<AgentState>, socket_path: &Path) -> Result<()> {
             .await
             .map_err(|e| Error::Session(format!("admin accept: {e}")))?;
         let state = state.clone();
+        let sources = sources.clone();
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let reply = process_line(&state, &line);
+                let reply = process_line(&state, sources.as_ref(), &line);
                 if write.write_all(reply.as_bytes()).await.is_err()
                     || write.write_all(b"\n").await.is_err()
                 {
@@ -120,7 +141,11 @@ pub async fn request(socket_path: &Path, req: &AdminRequest) -> Result<AdminResp
 
 /// Serve the admin named pipe forever. Call in a spawned task.
 #[cfg(windows)]
-pub async fn serve(state: Arc<AgentState>, socket_path: &Path) -> Result<()> {
+pub async fn serve(
+    state: Arc<AgentState>,
+    sources: Arc<dyn SourceFactory>,
+    socket_path: &Path,
+) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -142,11 +167,12 @@ pub async fn serve(state: Arc<AgentState>, socket_path: &Path) -> Result<()> {
             .map_err(|e| Error::Session(format!("recreate admin pipe: {e}")))?;
 
         let state = state.clone();
+        let sources = sources.clone();
         tokio::spawn(async move {
             let (read, mut write) = tokio::io::split(connected);
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let reply = process_line(&state, &line);
+                let reply = process_line(&state, sources.as_ref(), &line);
                 if write.write_all(reply.as_bytes()).await.is_err()
                     || write.write_all(b"\n").await.is_err()
                 {
@@ -184,12 +210,24 @@ pub async fn request(socket_path: &Path, req: &AdminRequest) -> Result<AdminResp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gsa_capture_api::{RenderSource, SourceDescriptor};
     use gsa_core::config::AgentConfig;
+    use gsa_core::id::SourceId;
+
+    struct NoSources;
+    impl SourceFactory for NoSources {
+        fn list(&self) -> Vec<SourceDescriptor> {
+            Vec::new()
+        }
+        fn create(&self, _id: SourceId) -> Result<Box<dyn RenderSource>> {
+            Err(Error::Session("no sources".into()))
+        }
+    }
 
     #[test]
     fn status_request_round_trips_as_json() {
         let state = AgentState::new(AgentConfig::default(), "ab".repeat(32));
-        let reply = process_line(&state, r#"{"cmd":"status"}"#);
+        let reply = process_line(&state, &NoSources, r#"{"cmd":"status"}"#);
         let parsed: AdminResponse = serde_json::from_str(&reply).unwrap();
         match parsed {
             AdminResponse::Status(s) => {
@@ -201,9 +239,23 @@ mod tests {
     }
 
     #[test]
+    fn sources_and_sessions_reply() {
+        let state = AgentState::new(AgentConfig::default(), String::new());
+        assert!(matches!(
+            serde_json::from_str(&process_line(&state, &NoSources, r#"{"cmd":"sources"}"#)).unwrap(),
+            AdminResponse::Sources { sources } if sources.is_empty()
+        ));
+        assert!(matches!(
+            serde_json::from_str(&process_line(&state, &NoSources, r#"{"cmd":"sessions"}"#))
+                .unwrap(),
+            AdminResponse::Sessions { sessions } if sessions.is_empty()
+        ));
+    }
+
+    #[test]
     fn bad_request_yields_error_reply() {
         let state = AgentState::new(AgentConfig::default(), String::new());
-        let reply = process_line(&state, "not json");
+        let reply = process_line(&state, &NoSources, "not json");
         assert!(reply.contains(r#""reply":"error""#));
     }
 }
