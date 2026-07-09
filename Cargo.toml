@@ -13,6 +13,7 @@ members = [
     "crates/client-dev",
     "crates/capture-macos",
     "crates/encode-videotoolbox",
+    "crates/input",
     "crates/agent",
     "xtask",
 ]
@@ -35,6 +36,7 @@ gsa-session = { path = "crates/session" }
 gsa-client-core = { path = "crates/client-core" }
 gsa-capture-macos = { path = "crates/capture-macos" }
 gsa-encode-videotoolbox = { path = "crates/encode-videotoolbox" }
+gsa-input = { path = "crates/input" }
 
 # external
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }

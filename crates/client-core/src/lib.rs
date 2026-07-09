@@ -9,6 +9,7 @@ mod reassembly;
 mod stats;
 
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
+pub use gsa_protocol::input::{InputEvent, MouseButton, MouseMove};
 pub use reassembly::Reassembler;
 pub use stats::{ClockSync, LatencyStats, StatsSummary};
 
@@ -32,10 +33,26 @@ pub struct FrameOutput {
     pub decode_us: u32,
 }
 
+/// Fire-and-forget input sink, decoupled from the frame-receive loop.
+/// Sync `send` (safe to call from a UI event loop); a background task on the
+/// client's runtime writes batches to the control stream in order.
+#[derive(Debug, Clone)]
+pub struct InputSender {
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<gsa_protocol::input::InputEvent>>,
+}
+
+impl InputSender {
+    pub fn send(&self, events: Vec<gsa_protocol::input::InputEvent>) {
+        if !events.is_empty() {
+            let _ = self.tx.send(events);
+        }
+    }
+}
+
 pub struct Client {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
-    control_send: quinn::SendStream,
+    control_send: Option<quinn::SendStream>,
     control_recv: quinn::RecvStream,
     clock: MediaClock,
     clock_sync: ClockSync,
@@ -89,7 +106,7 @@ impl Client {
         let mut client = Self {
             endpoint,
             conn,
-            control_send,
+            control_send: Some(control_send),
             control_recv,
             clock,
             clock_sync: ClockSync::default(),
@@ -105,7 +122,7 @@ impl Client {
     async fn sync_clock(&mut self, rounds: u32) -> Result<()> {
         for _ in 0..rounds {
             let sent = self.clock.now_us();
-            send_msg(&mut self.control_send, &C2A::Ping { client_ts_us: sent }).await?;
+            send_msg(self.ctl()?, &C2A::Ping { client_ts_us: sent }).await?;
             match recv_msg::<A2C>(&mut self.control_recv).await? {
                 A2C::Pong {
                     client_ts_us,
@@ -125,8 +142,35 @@ impl Client {
         Ok(())
     }
 
+    fn ctl(&mut self) -> Result<&mut quinn::SendStream> {
+        self.control_send
+            .as_mut()
+            .ok_or_else(|| Error::Session("control stream moved to input sender".into()))
+    }
+
+    /// Move the control send-stream into a background writer task and return
+    /// a sync [`InputSender`] for a UI thread. Call after `start_session`;
+    /// the client can no longer send control messages afterward (it only
+    /// receives frames + control replies).
+    pub fn take_input_sender(&mut self) -> Option<InputSender> {
+        let mut stream = self.control_send.take()?;
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<Vec<gsa_protocol::input::InputEvent>>();
+        tokio::spawn(async move {
+            while let Some(events) = rx.recv().await {
+                if send_msg(&mut stream, &C2A::InputBatch(events))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Some(InputSender { tx })
+    }
+
     pub async fn list_sources(&mut self) -> Result<Vec<SourceInfo>> {
-        send_msg(&mut self.control_send, &C2A::ListSources).await?;
+        send_msg(self.ctl()?, &C2A::ListSources).await?;
         match recv_msg::<A2C>(&mut self.control_recv).await? {
             A2C::Sources(s) => Ok(s),
             A2C::Error(e) => Err(Error::Session(e.message)),
@@ -140,7 +184,7 @@ impl Client {
         mode: Option<VideoMode>,
     ) -> Result<SessionParams> {
         send_msg(
-            &mut self.control_send,
+            self.ctl()?,
             &C2A::StartSession(SessionRequest {
                 source,
                 codec_prefs: vec![gsa_core::media::Codec::H264],

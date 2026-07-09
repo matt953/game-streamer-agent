@@ -6,6 +6,7 @@ mod decoder;
 #[cfg(target_os = "macos")]
 mod decoder_vt;
 mod headless;
+mod input_capture;
 mod window;
 
 use anyhow::Result;

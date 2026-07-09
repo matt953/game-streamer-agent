@@ -58,7 +58,7 @@ async fn serve_inner(
         .await
         .map_err(|e| Error::Transport(format!("accept control stream: {e}")))?;
 
-    let mut active: Option<(u64, pipeline::PipelineHandle)> = None;
+    let mut active: Option<ActiveSession> = None;
     let mut helloed = false;
 
     let result = loop {
@@ -119,12 +119,14 @@ async fn serve_inner(
                     continue;
                 }
                 match start_session(conn, state, sources, encoders, peer, &req) {
-                    Ok((id, handle, mode, bitrate)) => {
-                        active = Some((id, handle));
+                    Ok(started) => {
+                        let (mode, bitrate) = (started.mode, started.bitrate);
+                        let session_id = started.session.id;
+                        active = Some(started.session);
                         send_msg(
                             &mut send,
                             &A2C::SessionStarted(SessionParams {
-                                session: gsa_core::id::SessionId(id),
+                                session: gsa_core::id::SessionId(session_id),
                                 codec: gsa_core::media::Codec::H264,
                                 mode,
                                 bitrate_bps: bitrate,
@@ -145,10 +147,10 @@ async fn serve_inner(
                 }
             }
             C2A::StopSession => {
-                if let Some((id, mut handle)) = active.take() {
-                    let _ = handle.stop();
-                    state.remove_session(id);
-                    tracing::info!(peer, session = id, "session stopped by client");
+                if let Some(mut a) = active.take() {
+                    let _ = a.pipeline.stop();
+                    state.remove_session(a.id);
+                    tracing::info!(peer, session = a.id, "session stopped by client");
                 }
             }
             C2A::Ping { client_ts_us } => {
@@ -165,19 +167,43 @@ async fn serve_inner(
             C2A::StatsReport(stats) => {
                 tracing::debug!(peer, ?stats, "client stats");
             }
-            C2A::InputBatch(_) => { /* input injection lands at M1 (spec 07) */ }
+            C2A::InputBatch(events) => {
+                if let Some(a) = &mut active
+                    && let Some(injector) = &mut a.injector
+                {
+                    for event in &events {
+                        injector.inject(event);
+                    }
+                }
+            }
             // C2A is non_exhaustive: newer clients may send messages this
             // agent version doesn't know; ignoring them is the compat rule.
             _ => {}
         }
     };
 
-    if let Some((id, mut handle)) = active.take() {
-        let _ = handle.stop();
-        state.remove_session(id);
-        tracing::info!(peer, session = id, "session cleaned up on disconnect");
+    if let Some(mut a) = active.take() {
+        let _ = a.pipeline.stop();
+        state.remove_session(a.id);
+        tracing::info!(peer, session = a.id, "session cleaned up on disconnect");
     }
     result
+}
+
+/// Live session state held by the connection loop.
+struct ActiveSession {
+    id: u64,
+    pipeline: pipeline::PipelineHandle,
+    /// OS input injector for desktop/virtual-display sources (spec 07);
+    /// `None` for emulator sources (which consume input in-process) or when
+    /// no injector is available.
+    injector: Option<Box<dyn gsa_input::Injector>>,
+}
+
+struct StartedSession {
+    session: ActiveSession,
+    mode: VideoMode,
+    bitrate: u32,
 }
 
 fn start_session(
@@ -187,7 +213,7 @@ fn start_session(
     encoders: &Arc<dyn EncoderFactory>,
     peer: &str,
     req: &control::SessionRequest,
-) -> Result<(u64, pipeline::PipelineHandle, VideoMode, u32)> {
+) -> Result<StartedSession> {
     let source = sources.create(req.source)?;
     let descriptor = source.descriptor();
     let encoder = encoders.create(descriptor.kind())?;
@@ -197,6 +223,19 @@ fn start_session(
         .or_else(|| descriptor.modes.first().copied())
         .unwrap_or(state.config.video.mode);
     let bitrate = state.config.video.bitrate_bps;
+
+    // Desktop / virtual displays inject at the OS level; emulators consume
+    // input in-process and get no OS injector.
+    let injector = match descriptor.kind() {
+        SourceKind::Display | SourceKind::VirtualDisplay => {
+            let inj = gsa_input::platform_injector();
+            if inj.is_none() {
+                tracing::warn!(peer, "no input injector (accessibility permission?)");
+            }
+            inj
+        }
+        _ => None,
+    };
 
     let handle = pipeline::start(source, encoder, conn.clone(), mode, bitrate)?;
     let id = state.allocate_session();
@@ -208,8 +247,23 @@ fn start_session(
             frames_sent: handle.frames_sent.clone(),
         },
     );
-    tracing::info!(peer, session = id, ?mode, bitrate, "session started");
-    Ok((id, handle, mode, bitrate))
+    tracing::info!(
+        peer,
+        session = id,
+        ?mode,
+        bitrate,
+        injecting = injector.is_some(),
+        "session started"
+    );
+    Ok(StartedSession {
+        session: ActiveSession {
+            id,
+            pipeline: handle,
+            injector,
+        },
+        mode,
+        bitrate,
+    })
 }
 
 fn hostname() -> String {

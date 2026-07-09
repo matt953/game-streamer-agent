@@ -17,6 +17,7 @@ use crate::decoder::make_decoder;
 
 #[derive(Debug)]
 enum AppEvent {
+    Ready(gsa_client_core::InputSender),
     Frame(Box<DecodedFrame>),
     StreamEnded(String),
 }
@@ -57,6 +58,10 @@ fn network_loop(
             };
             client.start_session(SourceId(source.id.0), None).await?;
 
+            if let Some(sender) = client.take_input_sender() {
+                let _ = proxy.send_event(AppEvent::Ready(sender));
+            }
+
             let mut decoder = make_decoder(force_sw)?;
             let mut frames = 0u64;
             while let Some(out) = client.recv_frame(decoder.as_mut()).await? {
@@ -94,6 +99,9 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     latest: Option<Box<DecodedFrame>>,
+    input: Option<gsa_client_core::InputSender>,
+    /// Presented content rect (letterboxed), for normalizing cursor coords.
+    content_rect: Option<(f32, f32, f32, f32)>,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -117,6 +125,7 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
+            AppEvent::Ready(sender) => self.input = Some(sender),
             AppEvent::Frame(frame) => {
                 self.latest = Some(frame);
                 if let Some(w) = &self.window {
@@ -139,10 +148,48 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let (Some(gpu), Some(frame)) = (&mut self.gpu, &self.latest)
-                    && let Err(e) = gpu.render(frame)
-                {
-                    tracing::warn!(error = %e, "render failed");
+                if let (Some(gpu), Some(frame)) = (&mut self.gpu, &self.latest) {
+                    self.content_rect = Some(gpu.content_rect(frame));
+                    if let Err(e) = gpu.render(frame) {
+                        tracing::warn!(error = %e, "render failed");
+                    }
+                }
+            }
+            // Input capture → agent (spec 07 client side).
+            WindowEvent::KeyboardInput {
+                event: key,
+                is_synthetic: false,
+                ..
+            } => {
+                if let (Some(input), Some(ev)) = (
+                    &self.input,
+                    crate::input_capture::key_event(key.physical_key, key.state),
+                ) {
+                    input.send(vec![ev]);
+                }
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                if let (Some(input), Some(ev)) = (
+                    &self.input,
+                    crate::input_capture::mouse_button(button, state),
+                ) {
+                    input.send(vec![ev]);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(input) = &self.input {
+                    input.send(vec![crate::input_capture::mouse_wheel(delta)]);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let (Some(input), Some((rx, ry, rw, rh))) = (&self.input, self.content_rect) {
+                    // Map window pixel coords into [0,1] over the presented
+                    // content rect (ignore the letterbox margins).
+                    let nx = (position.x as f32 - rx) / rw;
+                    let ny = (position.y as f32 - ry) / rh;
+                    if (0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny) {
+                        input.send(vec![crate::input_capture::mouse_move_abs(nx, ny)]);
+                    }
                 }
             }
             _ => {}
@@ -340,6 +387,16 @@ impl Gpu {
             height,
             order,
         });
+    }
+
+    /// The presented (letterboxed) content rectangle in surface pixels:
+    /// `(x, y, width, height)` — for mapping cursor coords back to [0,1].
+    fn content_rect(&self, frame: &DecodedFrame) -> (f32, f32, f32, f32) {
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        let (fw, fh) = (frame.width as f32, frame.height as f32);
+        let scale = (sw / fw).min(sh / fh);
+        let (vw, vh) = (fw * scale, fh * scale);
+        ((sw - vw) / 2.0, (sh - vh) / 2.0, vw, vh)
     }
 
     fn render(&mut self, frame: &DecodedFrame) -> Result<()> {

@@ -14,6 +14,7 @@ gsa-protocol = { workspace = true }
 gsa-capture-api = { workspace = true }
 gsa-encode-api = { workspace = true }
 gsa-transport = { workspace = true }
+gsa-input = { workspace = true }
 quinn = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
