@@ -116,9 +116,15 @@ impl ClientPairing {
 
     /// Round 2: derive the key from the agent's message; produce the confirm.
     pub fn confirm(self, resp: &PairResponse) -> Result<(ClientConfirmed, PairConfirm)> {
+        let spake = match resp {
+            PairResponse::Spake { spake } => spake,
+            PairResponse::Rejected { reason } => {
+                return Err(Error::Session(format!("pairing rejected: {reason}")));
+            }
+        };
         let key = self
             .spake
-            .finish(&resp.spake)
+            .finish(spake)
             .map_err(|e| Error::Session(format!("pairing key exchange failed: {e:?}")))?;
         let m = mac(&key, MAC_CLIENT, &self.my_pin, &self.name, self.scope);
         let confirm = PairConfirm {
@@ -173,7 +179,7 @@ impl AgentPairing {
         let key = spake
             .finish(&hello.spake)
             .map_err(|e| Error::Session(format!("pairing key exchange failed: {e:?}")))?;
-        Ok((Self { key }, PairResponse { spake: msg }))
+        Ok((Self { key }, PairResponse::Spake { spake: msg }))
     }
 
     /// Round 2: verify the client's confirm (proves it knew the code + binds its

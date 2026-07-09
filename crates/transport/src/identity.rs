@@ -1,10 +1,9 @@
-//! Ed25519 self-signed identity (persisted from M2) + the M0 dev-trust
-//! verifier.
+//! Ed25519 self-signed identity (persisted) + the anonymous cert verifier.
 //!
-//! ⚠ `DevTrustVerifier` accepts any certificate and merely logs its
-//! fingerprint (trust-on-first-use, development only). Pairing-derived
-//! pinned verification replaces it at M2 (spec 06); this type is the seam
-//! where the pinned verifier slots in.
+//! `DevTrustVerifier` accepts any agent certificate and logs its fingerprint.
+//! It is used where the agent's pin isn't known yet: during **pairing** (where
+//! SPAKE2 does the authentication) and in **dev-open** mode. Streaming uses
+//! `PinnedServerVerifier` instead (spec 06).
 
 use std::path::Path;
 
@@ -102,7 +101,7 @@ pub fn fingerprint(cert: &CertificateDer<'_>) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Dev-only verifier: accept + log. See module docs.
+/// Anonymous verifier for pairing / dev-open: accept + log. See module docs.
 #[derive(Debug)]
 pub struct DevTrustVerifier {
     supported: rustls::crypto::WebPkiSupportedAlgorithms,
@@ -134,7 +133,7 @@ impl rustls::client::danger::ServerCertVerifier for DevTrustVerifier {
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         tracing::info!(
             fingerprint = fingerprint(end_entity),
-            "DEV TRUST: accepting unverified agent certificate (M0 only)"
+            "accepting agent cert unverified — pairing (SPAKE2 authenticates) or dev-open"
         );
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }

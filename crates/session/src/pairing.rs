@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use gsa_core::{Error, Result};
 use gsa_protocol::grant::Scope;
-use gsa_protocol::pairing::{PairConfirm, PairHello, PairResult};
+use gsa_protocol::pairing::{PairConfirm, PairHello, PairResponse, PairResult};
 use gsa_transport::{AgentPairing, PeerStore, generate_code, recv_msg, send_msg};
 
 use crate::state::AgentState;
@@ -168,10 +168,12 @@ async fn pair_inner(
 
     let hello: PairHello = recv_msg(&mut recv).await?;
     let Some((code, authorized)) = pairing.armed() else {
+        // Round 1: reject in the message the client is waiting for, so it
+        // reports a clear reason rather than a mis-decoded reply.
         send_msg(
             &mut send,
-            &PairResult::Rejected {
-                reason: "no pairing in progress".into(),
+            &PairResponse::Rejected {
+                reason: "no pairing in progress (expired or not armed)".into(),
             },
         )
         .await?;

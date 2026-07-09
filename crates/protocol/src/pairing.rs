@@ -13,11 +13,16 @@ pub struct PairHello {
     pub spake: Vec<u8>,
 }
 
-/// Agent → client: the agent's SPAKE2 message (round 1). After this both sides
-/// hold the shared key.
+/// Agent → client (round 1): the agent's SPAKE2 message, or a rejection if no
+/// pairing window is open. Carrying the rejection here — rather than as a
+/// `PairResult` the client isn't yet reading — lets the client surface a clear
+/// reason instead of a mis-decoded-message error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairResponse {
-    pub spake: Vec<u8>,
+pub enum PairResponse {
+    /// The agent's SPAKE2 message; after this both sides hold the shared key.
+    Spake { spake: Vec<u8> },
+    /// No pairing in progress (window expired or never armed).
+    Rejected { reason: String },
 }
 
 /// Client → agent: the client's pin + requested scope, authenticated by `mac`
