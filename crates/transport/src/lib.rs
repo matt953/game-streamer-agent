@@ -12,14 +12,60 @@ mod stream;
 pub use identity::{Identity, fingerprint};
 pub use stream::{recv_msg, send_msg};
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gsa_core::{Error, Result};
 use quinn::crypto::rustls::QuicClientConfig;
+use quinn::{EndpointConfig, TransportConfig};
+use socket2::{Domain, Protocol, Socket, Type};
 
 /// ALPN for our protocol; version-gated at the TLS layer.
 pub const ALPN: &[u8] = b"gsa/0";
+
+/// UDP/datagram buffer target (bytes): large enough to absorb one frame's
+/// datagram burst without dropping, small enough to bound queuing latency.
+/// The OS clamps the socket buffer to its own max.
+const SOCKET_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// A non-blocking UDP socket bound to `addr` with enlarged buffers (quinn
+/// requires non-blocking).
+fn tuned_socket(addr: SocketAddr) -> Result<UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| Error::Transport(format!("socket: {e}")))?;
+    // Best-effort: a smaller buffer still helps, so don't fail if the OS says no.
+    let _ = sock.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
+    let _ = sock.set_send_buffer_size(SOCKET_BUFFER_BYTES);
+    tracing::debug!(
+        requested = SOCKET_BUFFER_BYTES,
+        recv = sock.recv_buffer_size().unwrap_or(0),
+        send = sock.send_buffer_size().unwrap_or(0),
+        "udp socket buffers (OS may clamp)"
+    );
+    sock.bind(&addr.into())
+        .map_err(|e| Error::Transport(format!("bind {addr}: {e}")))?;
+    let sock: UdpSocket = sock.into();
+    sock.set_nonblocking(true)
+        .map_err(|e| Error::Transport(format!("set_nonblocking: {e}")))?;
+    Ok(sock)
+}
+
+/// Shared transport tuning for both ends.
+fn transport_config() -> TransportConfig {
+    let mut tc = TransportConfig::default();
+    tc.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("valid"),
+    ));
+    // Match the OS buffer so quinn isn't the ceiling on bursty drains.
+    tc.datagram_receive_buffer_size(Some(SOCKET_BUFFER_BYTES));
+    tc
+}
 
 /// Build a listening endpoint from an identity. Returns the endpoint;
 /// its local address carries the OS-assigned port when `addr` used :0.
@@ -38,14 +84,17 @@ pub fn server_endpoint(addr: SocketAddr, identity: &Identity) -> Result<quinn::E
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|e| Error::Transport(format!("quic server config: {e}")))?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
-    Arc::get_mut(&mut server_config.transport)
-        .expect("fresh config")
-        .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).expect("valid"),
-        ));
+    server_config.transport = Arc::new(transport_config());
 
-    quinn::Endpoint::server(server_config, addr)
-        .map_err(|e| Error::Transport(format!("bind {addr}: {e}")))
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| Error::Transport("no async runtime".into()))?;
+    quinn::Endpoint::new(
+        EndpointConfig::default(),
+        Some(server_config),
+        tuned_socket(addr)?,
+        runtime,
+    )
+    .map_err(|e| Error::Transport(format!("server endpoint {addr}: {e}")))
 }
 
 /// Connect to an agent with the dev-TOFU verifier. Returns the endpoint
@@ -62,15 +111,23 @@ pub async fn client_connect(addr: SocketAddr) -> Result<(quinn::Endpoint, quinn:
 
     let quic = QuicClientConfig::try_from(tls)
         .map_err(|e| Error::Transport(format!("quic client config: {e}")))?;
-    let client_config = quinn::ClientConfig::new(Arc::new(quic));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic));
+    client_config.transport_config(Arc::new(transport_config()));
 
     let bind: SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0".parse().expect("literal")
     } else {
         "[::]:0".parse().expect("literal")
     };
-    let mut endpoint =
-        quinn::Endpoint::client(bind).map_err(|e| Error::Transport(format!("client bind: {e}")))?;
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| Error::Transport("no async runtime".into()))?;
+    let mut endpoint = quinn::Endpoint::new(
+        EndpointConfig::default(),
+        None,
+        tuned_socket(bind)?,
+        runtime,
+    )
+    .map_err(|e| Error::Transport(format!("client bind: {e}")))?;
     endpoint.set_default_client_config(client_config);
 
     let connecting = endpoint
@@ -117,7 +174,10 @@ mod tests {
         let hello = C2A::Hello(Hello {
             proto: gsa_protocol::PROTO_VERSION,
             client_name: "loopback".into(),
-            decode_caps: DecodeCaps { codecs: vec![] },
+            decode_caps: DecodeCaps {
+                codecs: vec![],
+                max_h264_profile: gsa_core::media::H264Profile::ConstrainedBaseline,
+            },
         });
         send_msg(&mut send, &hello).await.unwrap();
         let back: C2A = recv_msg(&mut recv).await.unwrap();
