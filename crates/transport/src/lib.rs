@@ -7,11 +7,13 @@
 //! (spec 06) — the verifier type is the seam.
 
 mod identity;
+mod pairing;
 mod peers;
 mod pinned;
 mod stream;
 
 pub use identity::{Identity, fingerprint};
+pub use pairing::{AgentPairing, ClientConfirmed, ClientPairing, generate_code};
 pub use peers::{Peer, PeerStore};
 pub use pinned::{PinnedClientVerifier, PinnedServerVerifier};
 pub use stream::{recv_msg, send_msg};

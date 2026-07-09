@@ -8,6 +8,7 @@ pub mod control;
 pub mod datagram;
 pub mod grant;
 pub mod input;
+pub mod pairing;
 
 pub use control::{A2C, C2A};
 pub use datagram::{AudioDatagramHeader, DatagramType, VideoDatagramHeader};
