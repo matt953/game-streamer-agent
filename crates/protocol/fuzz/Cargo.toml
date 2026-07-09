@@ -26,6 +26,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "audio_datagram_parse"
+path = "fuzz_targets/audio_datagram_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_decode"
+path = "fuzz_targets/pairing_decode.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace: fuzz binaries are nightly-only and must not join
 # the main workspace's builds.
 [workspace]

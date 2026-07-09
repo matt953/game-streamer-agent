@@ -97,5 +97,9 @@ jobs:
       # would otherwise default the fuzz target to musl (no std/ASan there).
       - name: fuzz datagram parser
         run: cargo +nightly fuzz run datagram_parse --fuzz-dir crates/protocol/fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=60
+      - name: fuzz audio datagram parser
+        run: cargo +nightly fuzz run audio_datagram_parse --fuzz-dir crates/protocol/fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=60
       - name: fuzz control decode
         run: cargo +nightly fuzz run control_decode --fuzz-dir crates/protocol/fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=60
+      - name: fuzz pairing decode
+        run: cargo +nightly fuzz run pairing_decode --fuzz-dir crates/protocol/fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=60
