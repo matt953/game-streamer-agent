@@ -3,10 +3,12 @@
 //! peers behind it. This crate has **zero platform code** and compiles on
 //! every OS; platform crates implement the traits.
 
+mod audio;
 mod frame;
 mod sink;
 mod source;
 
+pub use audio::{AudioFrame, AudioReceiver, AudioSink, audio_channel};
 pub use frame::{CpuFrame, GpuFrame, GpuHandle, PlatformFrame, Rect};
 pub use sink::{FrameReceiver, FrameSink, frame_channel};
 pub use source::{RenderSource, SourceConfig, SourceDescriptor, VirtualDisplay};

@@ -38,6 +38,13 @@ pub trait RenderSource: Send {
     /// the backend uses. Must be non-blocking (spawn internally).
     fn start(&mut self, cfg: SourceConfig, sink: FrameSink) -> Result<()>;
 
+    /// Take the source's audio receiver, if it captures audio (spec 07).
+    /// Called once after `start`; `None` means the source is video-only (test
+    /// pattern) or produces audio in-process (emulator). Default: no audio.
+    fn audio(&mut self) -> Option<crate::AudioReceiver> {
+        None
+    }
+
     /// Route an input event. `Consumed` events must never reach the OS.
     fn handle_input(&mut self, event: InputEvent) -> InputDisposition;
 
