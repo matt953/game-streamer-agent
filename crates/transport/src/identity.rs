@@ -1,37 +1,97 @@
-//! Per-run self-signed identity + the M0 dev-trust verifier.
+//! Ed25519 self-signed identity (persisted from M2) + the M0 dev-trust
+//! verifier.
 //!
 //! ⚠ `DevTrustVerifier` accepts any certificate and merely logs its
 //! fingerprint (trust-on-first-use, development only). Pairing-derived
 //! pinned verification replaces it at M2 (spec 06); this type is the seam
 //! where the pinned verifier slots in.
 
+use std::path::Path;
+
 use gsa_core::{Error, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
-/// A TLS identity: self-signed certificate + private key.
+/// A TLS identity: Ed25519 self-signed certificate + private key. The cert's
+/// SHA-256 fingerprint is the pin exchanged during pairing (spec 06).
 #[derive(Debug)]
 pub struct Identity {
     pub cert_der: CertificateDer<'static>,
     pub key_der: PrivateKeyDer<'static>,
 }
 
+/// Fresh Ed25519 self-signed cert + PKCS#8 key, as DER byte vectors.
+fn fresh_ed25519() -> Result<(Vec<u8>, Vec<u8>)> {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .map_err(|e| Error::Transport(format!("generate key: {e}")))?;
+    let cert = rcgen::CertificateParams::new(vec!["gsa-agent".to_string()])
+        .map_err(|e| Error::Transport(format!("cert params: {e}")))?
+        .self_signed(&key)
+        .map_err(|e| Error::Transport(format!("self-sign: {e}")))?;
+    Ok((cert.der().to_vec(), key.serialize_der()))
+}
+
 impl Identity {
-    /// Generate a fresh self-signed identity (per-run at M0; persisted in
-    /// the OS keystore from M2).
+    /// Generate a fresh in-memory Ed25519 identity (ephemeral; tests and
+    /// clients that don't persist).
     pub fn generate() -> Result<Self> {
-        let cert = rcgen::generate_simple_self_signed(vec!["gsa-agent".into()])
-            .map_err(|e| Error::Transport(format!("generate identity: {e}")))?;
-        let cert_der = cert.cert.der().clone();
-        let key_der =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        Ok(Self { cert_der, key_der })
+        let (cert, key) = fresh_ed25519()?;
+        Ok(Self {
+            cert_der: CertificateDer::from(cert),
+            key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        })
+    }
+
+    /// Load the persisted identity from `dir`, or generate and persist a fresh
+    /// one. Idempotent across runs → a stable pin (spec 06). The private key is
+    /// written owner-only.
+    pub fn load_or_generate(dir: &Path) -> Result<Self> {
+        let cert_path = dir.join("identity.crt.der");
+        let key_path = dir.join("identity.key.der");
+        if let (Ok(cert), Ok(key)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+            return Ok(Self {
+                cert_der: CertificateDer::from(cert),
+                key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+            });
+        }
+        let (cert, key) = fresh_ed25519()?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Error::Transport(format!("create {}: {e}", dir.display())))?;
+        write_private(&key_path, &key)?;
+        std::fs::write(&cert_path, &cert)
+            .map_err(|e| Error::Transport(format!("write cert: {e}")))?;
+        Ok(Self {
+            cert_der: CertificateDer::from(cert),
+            key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        })
     }
 
     /// SHA-256 fingerprint of the certificate (the peer-store pin format).
     #[must_use]
     pub fn fingerprint(&self) -> String {
         fingerprint(&self.cert_der)
+    }
+}
+
+/// Write `bytes` to `path` owner-only (0600 on unix).
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| Error::Transport(format!("open key file: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| Error::Transport(format!("write key: {e}")))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes).map_err(|e| Error::Transport(format!("write key: {e}")))
     }
 }
 
@@ -99,5 +159,33 @@ impl rustls::client::danger::ServerCertVerifier for DevTrustVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.supported.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_identity_is_stable() {
+        let dir = std::env::temp_dir().join(format!("gsa-id-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = Identity::load_or_generate(&dir).unwrap();
+        let b = Identity::load_or_generate(&dir).unwrap();
+        assert_eq!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "reload yields the same pin"
+        );
+        assert_eq!(a.fingerprint().len(), 64, "sha-256 hex");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_identities_are_distinct() {
+        assert_ne!(
+            Identity::generate().unwrap().fingerprint(),
+            Identity::generate().unwrap().fingerprint()
+        );
     }
 }

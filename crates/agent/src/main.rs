@@ -200,7 +200,8 @@ async fn run(
 ) -> Result<()> {
     let cfg = load_config(config, listen, control_socket, bitrate_mbps)?;
 
-    let identity = gsa_transport::Identity::generate().context("generate identity")?;
+    let identity = gsa_transport::Identity::load_or_generate(&gsa_core::config::data_dir())
+        .context("load identity")?;
     let endpoint = gsa_transport::server_endpoint(cfg.listen, &identity).context("bind QUIC")?;
     let local_addr = endpoint.local_addr().context("local addr")?;
 

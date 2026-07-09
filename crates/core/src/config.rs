@@ -68,6 +68,33 @@ pub fn default_control_socket() -> PathBuf {
     }
 }
 
+/// Platform data directory for persistent agent state (identity, peer store).
+/// `~/Library/Application Support/gsa` (macOS), `%APPDATA%\gsa` (Windows),
+/// `$XDG_DATA_HOME`/`~/.local/share/gsa` (Linux).
+#[must_use]
+pub fn data_dir() -> PathBuf {
+    data_base_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("gsa")
+}
+
+#[cfg(target_os = "macos")]
+fn data_base_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+}
+
+#[cfg(target_os = "windows")]
+fn data_base_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(PathBuf::from)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn data_base_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
