@@ -148,6 +148,49 @@ pub fn chunk_video_frame(
     Ok(out)
 }
 
+/// Parsed header of an audio datagram. One Opus frame per datagram (frames are
+/// small enough to never need chunking); loss is concealed by Opus PLC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioDatagramHeader {
+    /// Monotonic sequence number; wraps. Gaps signal loss for PLC.
+    pub seq: u16,
+    /// Agent-clock capture timestamp, truncated (`time::wire_ts`).
+    pub ts_us: u32,
+}
+
+pub const AUDIO_HEADER_LEN: usize = 1 + 2 + 4;
+
+impl AudioDatagramHeader {
+    /// Serialize the header followed by the Opus payload into a fresh buffer.
+    #[must_use]
+    pub fn encode_with_payload(&self, opus: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AUDIO_HEADER_LEN + opus.len());
+        out.push(DatagramType::Audio.to_wire());
+        out.extend_from_slice(&self.seq.to_be_bytes());
+        out.extend_from_slice(&self.ts_us.to_be_bytes());
+        out.extend_from_slice(opus);
+        out
+    }
+
+    /// Parse an audio datagram; returns the header and a borrowed Opus payload.
+    /// Zero-alloc; safe on attacker-controlled bytes (fuzzed).
+    pub fn parse(datagram: &[u8]) -> Result<(Self, &[u8]), ProtocolError> {
+        if datagram.len() < AUDIO_HEADER_LEN {
+            return Err(ProtocolError::TooShort {
+                got: datagram.len(),
+                need: AUDIO_HEADER_LEN,
+            });
+        }
+        let ty = DatagramType::from_wire(datagram[0])?;
+        if ty != DatagramType::Audio {
+            return Err(ProtocolError::UnknownDatagramType(datagram[0]));
+        }
+        let seq = u16::from_be_bytes(datagram[1..3].try_into().expect("sized"));
+        let ts_us = u32::from_be_bytes(datagram[3..7].try_into().expect("sized"));
+        Ok((Self { seq, ts_us }, &datagram[AUDIO_HEADER_LEN..]))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +247,26 @@ mod tests {
         let (h, body) = VideoDatagramHeader::parse(&chunks[0]).unwrap();
         assert_eq!(h.chunk_count, 1);
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn audio_header_round_trip() {
+        let h = AudioDatagramHeader {
+            seq: 0xbeef,
+            ts_us: 987_654,
+        };
+        let opus = b"\x01\x02\x03 opus frame";
+        let wire = h.encode_with_payload(opus);
+        let (parsed, body) = AudioDatagramHeader::parse(&wire).unwrap();
+        assert_eq!(parsed, h);
+        assert_eq!(body, opus);
+    }
+
+    #[test]
+    fn audio_parse_rejects_short_and_wrong_type() {
+        assert!(AudioDatagramHeader::parse(&[2, 0]).is_err());
+        // A video datagram must not parse as audio.
+        let video = hdr().encode_with_payload(b"x");
+        assert!(AudioDatagramHeader::parse(&video).is_err());
     }
 }

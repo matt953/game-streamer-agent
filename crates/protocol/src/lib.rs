@@ -10,7 +10,7 @@ pub mod grant;
 pub mod input;
 
 pub use control::{A2C, C2A};
-pub use datagram::{DatagramType, VideoDatagramHeader};
+pub use datagram::{AudioDatagramHeader, DatagramType, VideoDatagramHeader};
 
 use gsa_core::error::ProtocolError;
 use serde::Serialize;
