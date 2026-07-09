@@ -8,10 +8,12 @@
 
 mod identity;
 mod peers;
+mod pinned;
 mod stream;
 
 pub use identity::{Identity, fingerprint};
 pub use peers::{Peer, PeerStore};
+pub use pinned::{PinnedClientVerifier, PinnedServerVerifier};
 pub use stream::{recv_msg, send_msg};
 
 use std::net::{SocketAddr, UdpSocket};
