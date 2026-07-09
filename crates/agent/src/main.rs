@@ -63,6 +63,15 @@ fn main() -> Result<()> {
     }
 }
 
+/// Best-effort primary LAN IPv4: opens a UDP socket and asks the OS which
+/// local address it would route from (no packets sent). `None` with no
+/// default route.
+fn primary_lan_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     tracing_subscriber::fmt()
@@ -123,6 +132,21 @@ async fn run(
         version = env!("CARGO_PKG_VERSION"),
         "gsa agent running"
     );
+
+    // When bound to all interfaces, surface a concrete LAN address so a
+    // client on another machine knows where to connect.
+    if local_addr.ip().is_unspecified() {
+        match primary_lan_ip() {
+            Some(ip) => tracing::info!(
+                "reachable on this LAN at {ip}:{} (e.g. `gsa-client-dev --connect {ip}:{}`)",
+                local_addr.port(),
+                local_addr.port()
+            ),
+            None => tracing::info!("bound to all interfaces on port {}", local_addr.port()),
+        }
+    } else if local_addr.ip().is_loopback() {
+        tracing::info!("listening on loopback only — pass `--listen 0.0.0.0:PORT` for LAN access");
+    }
 
     let admin_state = state.clone();
     let admin_socket = socket_path.clone();
