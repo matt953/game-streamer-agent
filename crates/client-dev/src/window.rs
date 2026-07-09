@@ -150,6 +150,7 @@ impl ApplicationHandler<AppEvent> for App {
                 )
                 .expect("create window"),
         );
+        window.set_cursor_visible(false);
         let gpu = Gpu::new(window.clone()).expect("init wgpu");
         self.window = Some(window);
         self.gpu = Some(gpu);
