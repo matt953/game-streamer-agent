@@ -21,6 +21,11 @@ objc2-core-foundation = { workspace = true, features = ["CFCGTypes"] }
 windows = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 vigem-client = "0.1.4"
 
+# XInput is the interface a game reads a controller through, so it is the only
+# honest oracle for "did the virtual pad really appear/disappear".
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_UI_Input_XboxController"] }
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"

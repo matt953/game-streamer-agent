@@ -31,6 +31,11 @@ pub trait VirtualGamepad: Send + std::fmt::Debug {
     /// Apply full controller state for `input.seat`, plugging the virtual pad
     /// on first use for that seat. Best-effort, like [`Injector::inject`].
     fn set_state(&mut self, input: &GamepadInput);
+
+    /// Unplug `seat`'s virtual pad; the client's controller went away. A seat
+    /// that was never plugged is a no-op. The next `set_state` for that seat
+    /// plugs a fresh one.
+    fn remove_seat(&mut self, seat: u8);
 }
 
 /// Create the platform injector, or `None` where unsupported / permission is

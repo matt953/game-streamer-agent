@@ -84,6 +84,20 @@ impl VirtualGamepad for VigemGamepad {
         };
         update(seat, target, &report);
     }
+
+    /// `Xbox360Wired`'s `Drop` already unplugs, so removing it from the map
+    /// would be enough. We unplug explicitly anyway: a failure to detach is
+    /// exactly the symptom this exists to fix — a phantom pad the game still
+    /// sees — and `Drop` would swallow it.
+    fn remove_seat(&mut self, seat: u8) {
+        let Some(mut target) = self.seats.remove(&seat) else {
+            return;
+        };
+        match target.unplug() {
+            Ok(()) => tracing::info!(seat, "virtual Xbox 360 pad unplugged"),
+            Err(e) => tracing::warn!(seat, error = ?e, "could not unplug the virtual pad"),
+        }
+    }
 }
 
 /// Submit a report, riding out the driver's post-plug-in readiness window.
@@ -167,5 +181,79 @@ mod tests {
         let r = report(&input(0, axes));
         assert_eq!((r.thumb_lx, r.thumb_ly), (-32768, 32767));
         assert_eq!((r.thumb_rx, r.thumb_ry), (100, -100));
+    }
+
+    /// Button pattern we look for. Arbitrary, but unlikely to be held down on
+    /// a real controller plugged into the same machine while this runs.
+    const MARKER: u32 = gamepad::A | gamepad::DPAD_LEFT;
+
+    const SLOTS: u32 = 4;
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+    const SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// `Some(buttons)` if XInput sees a controller in `slot`.
+    fn slot_buttons(slot: u32) -> Option<u32> {
+        use ::windows::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
+        let mut state = XINPUT_STATE::default();
+        // SAFETY: `state` is a valid out-param; the call only writes it.
+        let status = unsafe { XInputGetState(slot, &raw mut state) };
+        (status == 0).then(|| u32::from(state.Gamepad.wButtons.0))
+    }
+
+    /// Poll until `ready`, or give up. XInput enumeration lags a plug/unplug
+    /// by a few milliseconds, so neither edge is observable synchronously.
+    fn settle(mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + SETTLE;
+        while std::time::Instant::now() < deadline {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(SETTLE_STEP);
+        }
+        false
+    }
+
+    /// The whole point of `remove_seat`: a game must stop seeing the pad.
+    ///
+    /// XInput is what a game reads, so it is the only oracle that proves it.
+    /// Skipped where ViGEmBus isn't installed — the same thing `WinInjector`
+    /// does at runtime, and what lets this pass on CI.
+    #[test]
+    fn a_removed_seat_disappears_from_xinput() {
+        let Ok(mut pad) = VigemGamepad::connect() else {
+            eprintln!("ViGEmBus not installed; skipping");
+            return;
+        };
+        pad.set_state(&input(MARKER, [0; 8]));
+        assert!(
+            settle(|| (0..SLOTS).any(|s| slot_buttons(s) == Some(MARKER))),
+            "XInput never saw the virtual pad"
+        );
+        let slot = (0..SLOTS)
+            .find(|&s| slot_buttons(s) == Some(MARKER))
+            .expect("a slot matched a moment ago");
+
+        pad.remove_seat(0);
+        assert!(
+            settle(|| slot_buttons(slot) != Some(MARKER)),
+            "slot {slot} still reports the virtual pad after remove_seat"
+        );
+        // And the seat re-plugs, so a reconnecting controller works.
+        pad.set_state(&input(MARKER, [0; 8]));
+        assert!(
+            settle(|| (0..SLOTS).any(|s| slot_buttons(s) == Some(MARKER))),
+            "the seat did not re-plug"
+        );
+        pad.remove_seat(0);
+    }
+
+    #[test]
+    fn removing_a_seat_that_was_never_plugged_is_a_no_op() {
+        let Ok(mut pad) = VigemGamepad::connect() else {
+            eprintln!("ViGEmBus not installed; skipping");
+            return;
+        };
+        pad.remove_seat(3);
+        assert!(pad.seats.is_empty());
     }
 }

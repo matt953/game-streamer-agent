@@ -158,6 +158,14 @@ impl crate::Injector for WinInjector {
             InputEvent::MouseButton { button, down, .. } => self.mouse_button(*button, *down),
             InputEvent::MouseWheel { dx, dy, .. } => self.wheel(*dx, *dy),
             InputEvent::Gamepad(input) => self.gamepad(input),
+            // Only ever unplug a pad we plugged: an unused seat, or a host
+            // with no ViGEmBus, must not connect to the driver just to learn
+            // there is nothing to remove.
+            InputEvent::GamepadDisconnect { seat, .. } => {
+                if let Some(pad) = &mut self.gamepad {
+                    pad.remove_seat(*seat);
+                }
+            }
             // GamepadMotion has no XInput equivalent; touch/pen on the
             // Windows desktop are out of scope.
             _ => (),
