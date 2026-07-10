@@ -63,7 +63,20 @@ impl GamepadCapture {
         // gamepads() can be empty until the first drain (macOS populates it
         // lazily), so announce on first sight here rather than at construction.
         let Some((_, pad)) = self.gilrs.gamepads().next() else {
-            self.announced = false; // re-announce if a pad reconnects
+            // Pad gone: log it once and release everything on the host so a held
+            // button doesn't stick. The host virtual pad stays *plugged* until
+            // GamepadDisconnect propagation lands (spec 07 announce model).
+            if self.announced {
+                tracing::info!("gamepad disconnected");
+                self.announced = false;
+                self.last = None;
+                return Some(GamepadInput {
+                    seat: SEAT,
+                    buttons: 0,
+                    axes: [0; 8],
+                    ts_us: now_us(),
+                });
+            }
             return None;
         };
         let buttons = buttons(&pad);
