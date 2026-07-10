@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use gsa_client_core::{Client, DecodedFrame, PixelOrder, ServerAuth, VideoDecoder};
+use gsa_client_core::{Client, DecodedFrame, PixelOrder, ServerAuth, SourceKind, VideoDecoder};
 use gsa_core::id::SourceId;
 use gsa_core::media::H264Profile;
 use tokio::sync::Notify;
@@ -135,12 +135,12 @@ pub struct GsaSession {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Connect anonymously to the agent at `url` (host:port), start its first
-/// source, and stream media to `callbacks` until [`gsa_session_stop`]. Blocks
-/// until the session is streaming (or fails).
+/// Connect anonymously to the agent at `url` (host:port), start the source
+/// `source_id` (from [`gsa_list_sources`]), and stream media to `callbacks`
+/// until [`gsa_session_stop`]. Blocks until the session is streaming (or fails).
 ///
 /// Returns an owned session handle, or NULL on failure (bad url, runtime init,
-/// connect, no sources, or start-session). Call `gsa_session_stop` to release.
+/// connect, or start-session). Call `gsa_session_stop` to release.
 ///
 /// # Safety
 /// `url` must be a valid NUL-terminated C string for the duration of the call.
@@ -149,6 +149,7 @@ pub struct GsaSession {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gsa_session_start(
     url: *const c_char,
+    source_id: u32,
     callbacks: GsaCallbacks,
 ) -> *mut GsaSession {
     if url.is_null() {
@@ -175,7 +176,7 @@ pub unsafe extern "C" fn gsa_session_start(
             let _ = ready_tx.send(false);
             return;
         };
-        rt.block_on(session_loop(addr, cbs, thread_stop, ready_tx));
+        rt.block_on(session_loop(addr, source_id, cbs, thread_stop, ready_tx));
     });
 
     match ready_rx.recv() {
@@ -208,11 +209,98 @@ pub unsafe extern "C" fn gsa_session_stop(session: *mut GsaSession) {
     }
 }
 
-/// The session body: connect, take audio, start the first source, then pump
-/// encoded video to `on_video` and PCM to `on_audio` until `stop` fires or the
+/// Kind of a source, as reported to [`gsa_list_sources`]. Values are stable
+/// across the ABI; `Unknown` covers future variants. Non-`TestPattern` display
+/// sources carry loopback audio.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GsaSourceKind {
+    Display = 0,
+    VirtualDisplay = 1,
+    Emulator = 2,
+    TestPattern = 3,
+    Unknown = 255,
+}
+
+impl From<SourceKind> for GsaSourceKind {
+    fn from(kind: SourceKind) -> Self {
+        match kind {
+            SourceKind::Display => Self::Display,
+            SourceKind::VirtualDisplay => Self::VirtualDisplay,
+            SourceKind::Emulator => Self::Emulator,
+            SourceKind::TestPattern => Self::TestPattern,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Connect anonymously to the agent at `url` (host:port), enumerate its capture
+/// sources, and invoke `on_source(ctx, id, kind, name)` once per source (the
+/// `name` C string is valid only for that call). Then disconnect.
+///
+/// Returns the source count (>= 0), or a negative error: `-1` bad url,
+/// `-2` runtime init, `-3` connect, `-4` list request. Blocks — call off the
+/// UI thread. The chosen `id` is passed to [`gsa_session_start`].
+///
+/// # Safety
+/// `url` must be a valid NUL-terminated C string for the duration of the call.
+/// `ctx` must remain valid until this function returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_list_sources(
+    url: *const c_char,
+    on_source: Option<
+        unsafe extern "C" fn(ctx: *mut c_void, id: u32, kind: GsaSourceKind, name: *const c_char),
+    >,
+    ctx: *mut c_void,
+) -> i32 {
+    if url.is_null() {
+        return -1;
+    }
+    // SAFETY: caller contract requires a valid NUL-terminated string.
+    let Ok(url) = (unsafe { CStr::from_ptr(url) }).to_str() else {
+        return -1;
+    };
+    let Ok(addr) = url.parse::<std::net::SocketAddr>() else {
+        return -1;
+    };
+    let Ok(rt) = tokio::runtime::Runtime::new() else {
+        return -2;
+    };
+
+    rt.block_on(async move {
+        let mut client =
+            match Client::connect(addr, "gsa-app", H264Profile::High, ServerAuth::Open).await {
+                Ok(c) => c,
+                Err(_) => return -3,
+            };
+        let sources = match client.list_sources().await {
+            Ok(s) => s,
+            Err(_) => {
+                client.close().await;
+                return -4;
+            }
+        };
+        if let Some(cb) = on_source {
+            for source in &sources {
+                // Interior NUL can't occur in a source name; skip if it somehow does.
+                let Ok(name) = std::ffi::CString::new(source.name.as_str()) else {
+                    continue;
+                };
+                // SAFETY: `name` outlives the call; `ctx` valid per contract.
+                unsafe { cb(ctx, source.id.0, source.kind.into(), name.as_ptr()) };
+            }
+        }
+        client.close().await;
+        sources.len() as i32
+    })
+}
+
+/// The session body: connect, take audio, start `source_id`, then pump encoded
+/// video to `on_video` and PCM to `on_audio` until `stop` fires or the
 /// connection closes. Reports readiness through `ready_tx`.
 async fn session_loop(
     addr: std::net::SocketAddr,
+    source_id: u32,
     cbs: SendCallbacks,
     stop: Arc<Notify>,
     ready_tx: std::sync::mpsc::Sender<bool>,
@@ -234,15 +322,7 @@ async fn session_loop(
             return;
         }
     };
-    let sources = match client.list_sources().await {
-        Ok(s) if !s.is_empty() => s,
-        _ => {
-            let _ = ready_tx.send(false);
-            return;
-        }
-    };
-    let source_id: SourceId = sources[0].id;
-    if client.start_session(source_id, None).await.is_err() {
+    if client.start_session(SourceId(source_id), None).await.is_err() {
         let _ = ready_tx.send(false);
         return;
     }

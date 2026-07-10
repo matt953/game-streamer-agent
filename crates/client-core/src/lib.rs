@@ -10,6 +10,7 @@ mod reassembly;
 mod stats;
 
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
+pub use gsa_protocol::control::{SourceInfo, SourceKind};
 pub use gsa_protocol::input::{InputEvent, MouseButton, MouseMove};
 pub use reassembly::Reassembler;
 pub use stats::{ClockSync, LatencyStats, StatsSummary};
@@ -18,9 +19,7 @@ use gsa_core::media::VideoMode;
 use gsa_core::time::MediaClock;
 use gsa_core::{Error, Result};
 use gsa_protocol::PROTO_VERSION;
-use gsa_protocol::control::{
-    A2C, C2A, DecodeCaps, Hello, SessionParams, SessionRequest, SourceInfo,
-};
+use gsa_protocol::control::{A2C, C2A, DecodeCaps, Hello, SessionParams, SessionRequest};
 use gsa_protocol::datagram::VideoDatagramHeader;
 use gsa_protocol::grant::Scope;
 use gsa_protocol::pairing::{PairResponse, PairResult};
