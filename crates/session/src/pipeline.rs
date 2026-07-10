@@ -21,6 +21,18 @@ const DEFAULT_MAX_DATAGRAM: usize = 1200;
 /// a dropped or failed frame, so it's generous.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Video pacing (spec 04): spread a frame's datagrams over a few ms so a large
+/// frame doesn't burst ~60 packets into the network at once — the measured
+/// cause of the p99 tail once hardware encode made the encoder cheap. Paced as
+/// a leaky bucket at a multiple of the encode bitrate; a first cut until the M3
+/// congestion controller supplies a real send-rate estimate.
+const PACING_GAIN: f64 = 8.0;
+/// Never hold one frame's send back beyond this — bounds added latency on a
+/// big IDR (the rest bursts once the budget is spent).
+const PACING_CAP: Duration = Duration::from_millis(3);
+/// Frames of at most this many datagrams don't burst; send them immediately.
+const PACING_MIN_DATAGRAMS: usize = 8;
+
 pub struct PipelineHandle {
     stop: Arc<AtomicBool>,
     source: Box<dyn RenderSource>,
@@ -132,8 +144,6 @@ pub fn start(
         .map_err(|e| Error::Session(format!("spawn encode thread: {e}")))?;
 
     let frames_ctr = frames_sent.clone();
-    // TODO(M3): real pacer — spread chunks over 1-3 ms instead of bursting
-    // (spec 04). At M0/loopback bursting is fine.
     tokio::spawn(async move {
         let mut logged = 0u64;
         while let Some(chunk) = chunk_rx.recv().await {
@@ -153,7 +163,24 @@ pub fn start(
                     continue;
                 }
             };
+            // Pace big frames; small ones (static desktop) go out immediately.
+            let pace_bytes_per_sec = (datagrams.len() > PACING_MIN_DATAGRAMS && bitrate_bps > 0)
+                .then(|| f64::from(bitrate_bps) / 8.0 * PACING_GAIN);
+            let frame_start = std::time::Instant::now();
+            let mut deadline = frame_start;
             for d in datagrams {
+                if let Some(rate) = pace_bytes_per_sec {
+                    let now = std::time::Instant::now();
+                    if deadline > now && now.duration_since(frame_start) < PACING_CAP {
+                        // tokio's timer floor is ~1 ms, so only sleep once the
+                        // schedule slack is worth it; sub-ms slack accumulates.
+                        let wait = (deadline - now).min(PACING_CAP);
+                        if wait >= Duration::from_millis(1) {
+                            tokio::time::sleep(wait).await;
+                        }
+                    }
+                    deadline += Duration::from_secs_f64(d.len() as f64 / rate);
+                }
                 if let Err(e) = conn.send_datagram(bytes::Bytes::from(d)) {
                     match e {
                         quinn::SendDatagramError::ConnectionLost(_) => {
