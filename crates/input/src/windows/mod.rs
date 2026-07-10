@@ -5,6 +5,9 @@
 //!
 //! Keys go in as scancodes rather than virtual keys because games read the
 //! keyboard through raw input, which only ever sees a scancode.
+//!
+//! Gamepads have no `SendInput` equivalent and go through a kernel driver
+//! instead — see [`vigem`], reached only through [`VirtualGamepad`].
 
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
@@ -16,9 +19,12 @@ use ::windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
-use gsa_protocol::input::{InputEvent, MouseButton, MouseMove};
+use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
 
+use crate::VirtualGamepad;
 use crate::keymap::hid_to_scancode;
+
+mod vigem;
 
 /// One wheel notch, as `mouseData` counts them.
 const WHEEL_DELTA: f32 = 120.0;
@@ -28,13 +34,44 @@ const ABSOLUTE_MAX: f32 = 65535.0;
 
 #[derive(Debug)]
 pub struct WinInjector {
-    _private: (),
+    /// Connected on the first gamepad event, so hosts that never see one
+    /// never touch the driver.
+    gamepad: Option<Box<dyn VirtualGamepad>>,
+    /// Set once the driver has proven absent, so the warning stays a warning
+    /// rather than one line per event at 250 Hz.
+    gamepad_unavailable: bool,
 }
 
 impl WinInjector {
     #[must_use]
     pub fn new() -> Self {
-        Self { _private: () }
+        Self {
+            gamepad: None,
+            gamepad_unavailable: false,
+        }
+    }
+
+    fn gamepad(&mut self, input: &GamepadInput) {
+        if self.gamepad.is_none() {
+            if self.gamepad_unavailable {
+                return;
+            }
+            match vigem::VigemGamepad::connect() {
+                Ok(pad) => self.gamepad = Some(Box::new(pad)),
+                Err(e) => {
+                    self.gamepad_unavailable = true;
+                    tracing::warn!(
+                        error = ?e,
+                        "no controller support: install ViGEmBus \
+                         (https://github.com/nefarius/ViGEmBus/releases)"
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(pad) = &mut self.gamepad {
+            pad.set_state(input);
+        }
     }
 
     /// Post one synthesized event. `SendInput` rejects the whole batch when
@@ -120,8 +157,9 @@ impl crate::Injector for WinInjector {
             InputEvent::MouseMove(m) => self.mouse_move(*m),
             InputEvent::MouseButton { button, down, .. } => self.mouse_button(*button, *down),
             InputEvent::MouseWheel { dx, dy, .. } => self.wheel(*dx, *dy),
-            // Gamepad injection needs a virtual pad driver (ViGEmBus, M4);
-            // touch/pen on the Windows desktop are out of scope.
+            InputEvent::Gamepad(input) => self.gamepad(input),
+            // GamepadMotion has no XInput equivalent; touch/pen on the
+            // Windows desktop are out of scope.
             _ => (),
         }
     }

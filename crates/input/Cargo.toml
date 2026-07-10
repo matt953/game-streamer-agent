@@ -19,6 +19,7 @@ objc2-core-foundation = { workspace = true, features = ["CFCGTypes"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+vigem-client = "0.1.4"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

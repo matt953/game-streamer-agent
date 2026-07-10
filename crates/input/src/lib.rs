@@ -2,7 +2,7 @@
 //! sources that inject at the OS level (desktop / virtual display); emulator
 //! sources consume input in-process and never reach this crate.
 
-use gsa_protocol::input::InputEvent;
+use gsa_protocol::input::{GamepadInput, InputEvent};
 
 mod keymap;
 
@@ -18,6 +18,19 @@ pub trait Injector: Send {
     /// Inject one event. Best-effort — logs and continues on failure so a
     /// single bad event never wedges the input stream.
     fn inject(&mut self, event: &InputEvent);
+}
+
+/// Presents virtual gamepad "seats" to the OS.
+///
+/// A seam separate from [`Injector`] because a virtual pad is a different kind
+/// of object on every OS: Windows needs a kernel driver (ViGEmBus today, a
+/// self-signed fork or our own driver later — roadmap OQ-7.2), Linux has
+/// `uinput`, macOS has CoreHID. Keeping it behind this trait confines that
+/// swap to one file.
+pub trait VirtualGamepad: Send + std::fmt::Debug {
+    /// Apply full controller state for `input.seat`, plugging the virtual pad
+    /// on first use for that seat. Best-effort, like [`Injector::inject`].
+    fn set_state(&mut self, input: &GamepadInput);
 }
 
 /// Create the platform injector, or `None` where unsupported / permission is
