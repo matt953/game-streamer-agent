@@ -2,7 +2,7 @@
 //! stats report. This is the e2e/CI entry point (spec 13 Tier 1) and the
 //! source of the latency ledger.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use gsa_client_core::Client;
 use gsa_core::id::SourceId;
 use serde::Serialize;
@@ -29,7 +29,7 @@ pub async fn run(
     addr: std::net::SocketAddr,
     frames: u32,
     json: bool,
-    source_id: Option<u32>,
+    source: Option<String>,
     force_sw: bool,
     auth: crate::pairing::Auth,
 ) -> Result<()> {
@@ -42,16 +42,8 @@ pub async fn run(
     .await?;
 
     let sources = client.list_sources().await?;
-    for s in &sources {
-        tracing::info!(id = s.id.0, name = s.name, kind = ?s.kind, "available source");
-    }
-    let source = match source_id {
-        Some(id) => sources
-            .iter()
-            .find(|s| s.id.0 == id)
-            .with_context(|| format!("agent has no source {id}"))?,
-        None => sources.first().context("agent offers no sources")?,
-    };
+    tracing::info!("available sources:\n{}", crate::source_list(&sources));
+    let source = crate::pick_source(&sources, source.as_deref())?;
     tracing::info!(source = source.name, "starting session");
     // Marker verification only means something for the synthetic pattern.
     let check_markers = source.kind == gsa_protocol::control::SourceKind::TestPattern;

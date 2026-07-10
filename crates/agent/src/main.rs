@@ -483,8 +483,10 @@ async fn sources_cmd(json: bool, control_socket: Option<PathBuf>) -> Result<()> 
             } else if sources.is_empty() {
                 println!("no sources");
             } else {
-                for s in &sources {
-                    println!("  {} [{:?}] {}", s.id.0, s.kind, s.name);
+                // 1-based index is the client's `--source` selector; the raw
+                // id is an internal detail, not shown.
+                for (i, s) in sources.iter().enumerate() {
+                    println!("  {} — {} [{:?}]", i + 1, s.name, s.kind);
                 }
             }
             Ok(())

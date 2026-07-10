@@ -31,7 +31,7 @@ enum AppEvent {
 
 pub fn run(
     addr: std::net::SocketAddr,
-    source_id: Option<u32>,
+    source: Option<String>,
     force_sw: bool,
     auth: crate::pairing::Auth,
 ) -> Result<()> {
@@ -40,7 +40,7 @@ pub fn run(
 
     std::thread::Builder::new()
         .name("gsa-client-net".into())
-        .spawn(move || network_loop(addr, source_id, force_sw, auth, &proxy))?;
+        .spawn(move || network_loop(addr, source, force_sw, auth, &proxy))?;
 
     let mut app = App::default();
     event_loop.run_app(&mut app)?;
@@ -49,7 +49,7 @@ pub fn run(
 
 fn network_loop(
     addr: std::net::SocketAddr,
-    source_id: Option<u32>,
+    source: Option<String>,
     force_sw: bool,
     auth: crate::pairing::Auth,
     proxy: &EventLoopProxy<AppEvent>,
@@ -74,13 +74,8 @@ fn network_loop(
             )
             .await?;
             let sources = client.list_sources().await?;
-            let source = match source_id {
-                Some(id) => sources
-                    .iter()
-                    .find(|s| s.id.0 == id)
-                    .with_context(|| format!("agent has no source {id}"))?,
-                None => sources.first().context("agent offers no sources")?,
-            };
+            tracing::info!("available sources:\n{}", crate::source_list(&sources));
+            let source = crate::pick_source(&sources, source.as_deref())?;
             client.start_session(SourceId(source.id.0), None).await?;
 
             if let Some(sender) = client.take_input_sender() {

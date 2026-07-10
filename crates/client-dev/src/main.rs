@@ -14,6 +14,7 @@ mod window;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use gsa_protocol::control::SourceInfo;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gsa-client-dev", version, about = "Debug streaming client")]
@@ -30,9 +31,10 @@ struct Cli {
     /// Emit machine-readable JSON (headless mode).
     #[arg(long)]
     json: bool,
-    /// Source id to stream (default: the agent's first source).
+    /// Source to stream: a 1-based index from the source list, or a name
+    /// substring (e.g. `2` or `"Display 1"`). Default: the first source.
     #[arg(long)]
-    source: Option<u32>,
+    source: Option<String>,
     /// Force the software (openh264) decoder instead of platform hardware.
     #[arg(long)]
     sw_decode: bool,
@@ -78,4 +80,36 @@ fn main() -> Result<()> {
     } else {
         window::run(cli.connect, cli.source, cli.sw_decode, auth)
     }
+}
+
+/// Resolve a `--source` selector against the agent's source list. Accepts a
+/// 1-based index or a case-insensitive name substring; `None` picks the first.
+/// The raw wire id is deliberately not a selector — it's an internal detail.
+pub(crate) fn pick_source<'a>(
+    sources: &'a [SourceInfo],
+    selector: Option<&str>,
+) -> Result<&'a SourceInfo> {
+    let Some(sel) = selector else {
+        return sources.first().context("agent offers no sources");
+    };
+    if let Ok(n) = sel.parse::<usize>()
+        && (1..=sources.len()).contains(&n)
+    {
+        return Ok(&sources[n - 1]);
+    }
+    let needle = sel.to_lowercase();
+    sources
+        .iter()
+        .find(|s| s.name.to_lowercase().contains(&needle))
+        .with_context(|| format!("no source matches {sel:?}.\n{}", source_list(sources)))
+}
+
+/// Human-readable numbered source list for logs and error messages.
+pub(crate) fn source_list(sources: &[SourceInfo]) -> String {
+    sources
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("  {} — {} [{:?}]", i + 1, s.name, s.kind))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
