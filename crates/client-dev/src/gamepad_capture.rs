@@ -4,7 +4,7 @@
 //! Dev-client only: real clients read their own controllers. This exists so
 //! the maintainer can drive the Windows host's virtual pad from a Mac.
 
-use gilrs::{Axis, Button, Gilrs};
+use gilrs::{Axis, Button, Gilrs, GilrsBuilder};
 use gsa_protocol::input::{GamepadInput, gamepad};
 
 /// Sticks below this fraction of full deflection read as centred. Small on
@@ -32,7 +32,11 @@ impl GamepadCapture {
     /// `None` if the platform has no usable gamepad subsystem — the client
     /// then simply streams without controller support.
     pub fn new() -> Option<Self> {
-        match Gilrs::new() {
+        // gilrs's default filters impose a deadzone of their own — measured at
+        // ~23% of travel on XInput — which compresses every mid-range stick and
+        // trigger reading before we ever see it. The host is a game, not a UI:
+        // it wants the raw curve, with only [`STICK_DEADZONE`] to kill jitter.
+        match GilrsBuilder::new().with_default_filters(false).build() {
             Ok(gilrs) => {
                 for (_, pad) in gilrs.gamepads() {
                     tracing::info!(name = pad.name(), "gamepad connected");
