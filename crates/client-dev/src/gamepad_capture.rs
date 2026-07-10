@@ -20,6 +20,8 @@ pub struct GamepadCapture {
     gilrs: Gilrs,
     /// Last state sent, so we only speak when something changed.
     last: Option<(u32, [i16; 8])>,
+    /// Whether the active pad's name has been logged (reset on disconnect).
+    announced: bool,
 }
 
 impl std::fmt::Debug for GamepadCapture {
@@ -37,12 +39,11 @@ impl GamepadCapture {
         // trigger reading before we ever see it. The host is a game, not a UI:
         // it wants the raw curve, with only [`STICK_DEADZONE`] to kill jitter.
         match GilrsBuilder::new().with_default_filters(false).build() {
-            Ok(gilrs) => {
-                for (_, pad) in gilrs.gamepads() {
-                    tracing::info!(name = pad.name(), "gamepad connected");
-                }
-                Some(Self { gilrs, last: None })
-            }
+            Ok(gilrs) => Some(Self {
+                gilrs,
+                last: None,
+                announced: false,
+            }),
             Err(e) => {
                 tracing::warn!(error = %e, "no gamepad support on this client");
                 None
@@ -59,9 +60,19 @@ impl GamepadCapture {
         // The gamepad state gilrs exposes only advances as events are drained.
         while self.gilrs.next_event().is_some() {}
 
-        let (_, pad) = self.gilrs.gamepads().next()?;
+        // gamepads() can be empty until the first drain (macOS populates it
+        // lazily), so announce on first sight here rather than at construction.
+        let Some((_, pad)) = self.gilrs.gamepads().next() else {
+            self.announced = false; // re-announce if a pad reconnects
+            return None;
+        };
         let buttons = buttons(&pad);
         let axes = axes(&pad);
+        let announce = (!self.announced).then(|| pad.name().to_string());
+        if let Some(name) = announce {
+            tracing::info!(name, "gamepad connected");
+            self.announced = true;
+        }
         if self.last == Some((buttons, axes)) {
             return None;
         }
