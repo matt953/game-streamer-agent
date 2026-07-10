@@ -9,6 +9,9 @@ mod keymap;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(windows)]
+mod windows;
+
 /// Injects remote input into the host OS. `Send` so the session can own it
 /// across async tasks; calls are serial.
 pub trait Injector: Send {
@@ -25,7 +28,11 @@ pub fn platform_injector() -> Option<Box<dyn Injector>> {
     {
         macos::CgInjector::new().map(|i| Box::new(i) as Box<dyn Injector>)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        Some(Box::new(windows::WinInjector::new()))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         None // per-OS injection backends land at M4/M5 (spec 07)
     }
@@ -35,13 +42,21 @@ pub fn platform_injector() -> Option<Box<dyn Injector>> {
 /// platform has a checkable grant, `None` where injection isn't implemented.
 /// On macOS this is the Accessibility TCC grant — without it `CGEventPost`
 /// silently no-ops, so this is the only reliable readiness signal.
+///
+/// Windows needs no grant for `SendInput`, so this is unconditionally true;
+/// the analogous trap there — UIPI swallowing injection into elevated
+/// windows — depends on which window has focus and can't be checked upfront.
 #[must_use]
 pub fn injection_authorized() -> Option<bool> {
     #[cfg(target_os = "macos")]
     {
         Some(macos::accessibility_authorized())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        Some(true)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         None
     }

@@ -17,6 +17,9 @@ tracing = { workspace = true }
 objc2-core-graphics = { workspace = true, features = ["CGEvent", "CGEventTypes", "CGEventSource", "CGDirectDisplay", "CGRemoteOperation"] }
 objc2-core-foundation = { workspace = true, features = ["CFCGTypes"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
