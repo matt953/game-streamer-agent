@@ -164,9 +164,9 @@ impl ApplicationHandler<AppEvent> for App {
     /// the next frame or keystroke, and a gamepad generates neither.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let (Some(gamepad), Some(input)) = (&mut self.gamepad, &self.input)
-            && let Some(state) = gamepad.poll()
+            && let Some(event) = gamepad.poll()
         {
-            input.send(vec![gsa_protocol::input::InputEvent::Gamepad(state)]);
+            input.send(vec![event]);
         }
         event_loop.set_control_flow(ControlFlow::wait_duration(GAMEPAD_POLL));
     }

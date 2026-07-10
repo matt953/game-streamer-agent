@@ -5,7 +5,7 @@
 //! the maintainer can drive the Windows host's virtual pad from a Mac.
 
 use gilrs::{Axis, Button, Gilrs, GilrsBuilder};
-use gsa_protocol::input::{GamepadInput, gamepad};
+use gsa_protocol::input::{GamepadInput, InputEvent, gamepad};
 
 /// Sticks below this fraction of full deflection read as centred. Small on
 /// purpose: the game applies the real deadzone, and all this has to do is
@@ -51,12 +51,12 @@ impl GamepadCapture {
         }
     }
 
-    /// Drain gilrs's event queue and return a full-state snapshot when the
-    /// first connected pad has changed since the last call.
+    /// Drain gilrs's event queue and return an event when the first connected
+    /// pad has changed since the last call, or when it has gone away.
     ///
     /// Full state rather than deltas: the wire format is self-healing, so a
     /// dropped snapshot costs one poll interval rather than a stuck button.
-    pub fn poll(&mut self) -> Option<GamepadInput> {
+    pub fn poll(&mut self) -> Option<InputEvent> {
         // The gamepad state gilrs exposes only advances as events are drained.
         while self.gilrs.next_event().is_some() {}
 
@@ -65,17 +65,15 @@ impl GamepadCapture {
         // `is_connected` filters out a pad gilrs keeps listed after it drops —
         // otherwise a powered-off controller reads as still present.
         let Some((_, pad)) = self.gilrs.gamepads().find(|(_, p)| p.is_connected()) else {
-            // Pad gone: log it once and release everything on the host so a held
-            // button doesn't stick. The host virtual pad stays *plugged* until
-            // GamepadDisconnect propagation lands (spec 07 announce model).
+            // Pad gone: tell the host to unplug its virtual one. No neutral
+            // release first — unplugging releases everything, and a snapshot
+            // sent after the pad is gone would only re-plug the seat.
             if self.announced {
                 tracing::info!("gamepad disconnected");
                 self.announced = false;
                 self.last = None;
-                return Some(GamepadInput {
+                return Some(InputEvent::GamepadDisconnect {
                     seat: SEAT,
-                    buttons: 0,
-                    axes: [0; 8],
                     ts_us: now_us(),
                 });
             }
@@ -92,12 +90,12 @@ impl GamepadCapture {
             return None;
         }
         self.last = Some((buttons, axes));
-        Some(GamepadInput {
+        Some(InputEvent::Gamepad(GamepadInput {
             seat: SEAT,
             buttons,
             axes,
             ts_us: now_us(),
-        })
+        }))
     }
 }
 
