@@ -164,6 +164,22 @@ fn windows_checks(checks: &mut Vec<Check>) {
         }),
     }
 
+    // System audio. Loopback needs no grant, but a host with no render
+    // endpoint (a headless box, some RDP sessions) simply has nothing to tap;
+    // the stream stays up, silent.
+    match gsa_capture_windows::loopback_mix_format() {
+        Ok((rate, channels)) => checks.push(Check {
+            name: "system audio",
+            level: Level::Ok,
+            detail: format!("WASAPI loopback: {rate} Hz, {channels} ch"),
+        }),
+        Err(e) => checks.push(Check {
+            name: "system audio",
+            level: Level::Warn,
+            detail: format!("no loopback capture — the stream will be silent: {e}"),
+        }),
+    }
+
     // Hardware encode. Its absence is not a failure — the software encoder
     // still streams — but it is the difference between ~4 ms and ~83 ms.
     match gsa_encode_nvenc::probe() {
