@@ -138,3 +138,38 @@ pub struct ClientStats {
     pub decode_us_p50: u32,
     pub jitter_us: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{A2C, Notification};
+
+    /// postcard writes the enum variant's position as the leading byte. Pin the
+    /// appended variants so a mid-enum insertion fails here, not on the wire
+    /// (the append-only rule — see 05-protocol.md).
+    #[test]
+    fn a2c_wire_positions_are_stable() {
+        let position = |m: &A2C| crate::encode_msg(m).unwrap()[0];
+        assert_eq!(
+            position(&A2C::Pong {
+                client_ts_us: 0,
+                agent_ts_us: 0,
+            }),
+            5
+        );
+        assert_eq!(
+            position(&A2C::Notification(Notification::GamepadConnected { seat: 0 })),
+            6
+        );
+    }
+
+    #[test]
+    fn notification_round_trips() {
+        let msg = A2C::Notification(Notification::GamepadDisconnected { seat: 2 });
+        let bytes = crate::encode_msg(&msg).unwrap();
+        let back: A2C = crate::decode_msg(&bytes).unwrap();
+        assert!(matches!(
+            back,
+            A2C::Notification(Notification::GamepadDisconnected { seat: 2 })
+        ));
+    }
+}
