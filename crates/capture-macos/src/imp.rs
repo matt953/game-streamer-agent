@@ -221,11 +221,15 @@ impl StreamOutput {
             }
         }
 
+        // `capture_ts_us` names the first sample, not observation time (matches
+        // the Windows host + the AudioFrame contract): back off this buffer's
+        // duration from now.
+        let buffer_us = (frames as u64 * 1_000_000) / AUDIO_SAMPLE_RATE as u64;
         state.audio_sink.submit(AudioFrame {
             samples: pcm,
             sample_rate: AUDIO_SAMPLE_RATE as u32,
             channels: AUDIO_CHANNELS as u16,
-            capture_ts_us: state.clock.now_us(),
+            capture_ts_us: state.clock.now_us().saturating_sub(buffer_us),
         });
     }
 }
