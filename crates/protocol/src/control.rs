@@ -41,6 +41,24 @@ pub enum A2C {
     SessionEvent(SessionEvent),
     Error(ProtoErrorMsg),
     Pong { client_ts_us: u64, agent_ts_us: u64 },
+    /// A user-facing async notification (host → client), for the client to
+    /// surface however it likes (a toast, etc.). Distinct from [`SessionEvent`],
+    /// which the client's *pipeline* reacts to; this is purely informational and
+    /// is the reusable channel for such messages.
+    Notification(Notification),
+}
+
+/// User-facing notifications pushed by the agent over the control stream. Add
+/// variants here (and mirror them in the client's control-event surface) to
+/// grow the set — the transport/dispatch plumbing is shared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Notification {
+    /// The host plugged its virtual pad for `seat`: input is now live on the
+    /// host, confirmed rather than merely attempted.
+    GamepadConnected { seat: u8 },
+    /// The host unplugged `seat`'s virtual pad.
+    GamepadDisconnected { seat: u8 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

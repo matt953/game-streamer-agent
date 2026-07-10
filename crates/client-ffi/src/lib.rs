@@ -13,8 +13,8 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use gsa_client_core::{
-    Client, DecodedFrame, GamepadInput, InputEvent, InputSender, PixelOrder, ServerAuth, SourceKind,
-    VideoDecoder,
+    Client, ControlEvent, DecodedFrame, GamepadInput, InputEvent, InputSender, PixelOrder,
+    ServerAuth, SourceKind, VideoDecoder,
 };
 use gsa_core::id::SourceId;
 use gsa_core::media::H264Profile;
@@ -121,7 +121,17 @@ pub struct GsaCallbacks {
     /// × 2), not bytes.
     pub on_audio:
         Option<unsafe extern "C" fn(ctx: *mut c_void, pcm: *const i16, samples: usize)>,
+    /// A user-facing notification pushed by the host (a toast, etc.). `kind` is
+    /// a `GSA_NOTIFY_*` value; `arg` is kind-specific (the gamepad seat for the
+    /// gamepad kinds). Fires on a dedicated thread. Unknown kinds should be
+    /// ignored so new ones stay backward-compatible.
+    pub on_notification:
+        Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32, arg: u32)>,
 }
+
+/// `on_notification` kinds. Stable across the ABI; append new values.
+pub const GSA_NOTIFY_GAMEPAD_CONNECTED: u32 = 1;
+pub const GSA_NOTIFY_GAMEPAD_DISCONNECTED: u32 = 2;
 
 /// Raw `ctx` isn't `Send`; the embedder owns its thread-safety, so we carry the
 /// callback set across the receive-thread boundary explicitly.
@@ -405,6 +415,11 @@ async fn session_loop(
         let _ = ready_tx.send(SessionReady::Failed);
         return;
     }
+    // Host-pushed notifications (e.g. gamepad plugged) arrive on the control
+    // stream; handle them in the select loop below so they fire on this thread
+    // (which `gsa_session_stop` joins — no callback outlives the session).
+    let mut control_rx = client.take_control_events();
+
     // Hand the sync input sink back with the ready signal; it also routes the
     // recv loop's keyframe requests through its background writer task.
     let input = client.take_input_sender();
@@ -429,6 +444,28 @@ async fn session_loop(
     loop {
         tokio::select! {
             _ = stop.notified() => break,
+            // Agent notification (gamepad plugged, etc.): forward to the embedder.
+            event = async {
+                match &mut control_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<ControlEvent>>().await,
+                }
+            } => {
+                if let Some(event) = event {
+                    let (kind, arg) = match event {
+                        ControlEvent::GamepadConnected { seat } => {
+                            (GSA_NOTIFY_GAMEPAD_CONNECTED, seat as u32)
+                        }
+                        ControlEvent::GamepadDisconnected { seat } => {
+                            (GSA_NOTIFY_GAMEPAD_DISCONNECTED, seat as u32)
+                        }
+                    };
+                    if let Some(cb) = cbs.on_notification {
+                        // SAFETY: `ctx` valid for the session per the embedder contract.
+                        unsafe { cb(cbs.ctx, kind, arg) };
+                    }
+                }
+            }
             frame = client.recv_encoded() => match frame {
                 Ok(Some(f)) => {
                     if let Some(cb) = cbs.on_video {

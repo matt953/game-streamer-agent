@@ -51,10 +51,11 @@ impl WinInjector {
         }
     }
 
-    fn gamepad(&mut self, input: &GamepadInput) {
+    /// Returns `true` only when this snapshot newly plugged the seat's pad.
+    fn gamepad(&mut self, input: &GamepadInput) -> bool {
         if self.gamepad.is_none() {
             if self.gamepad_unavailable {
-                return;
+                return false;
             }
             match vigem::VigemGamepad::connect() {
                 Ok(pad) => self.gamepad = Some(Box::new(pad)),
@@ -65,12 +66,13 @@ impl WinInjector {
                         "no controller support: install ViGEmBus \
                          (https://github.com/nefarius/ViGEmBus/releases)"
                     );
-                    return;
+                    return false;
                 }
             }
         }
-        if let Some(pad) = &mut self.gamepad {
-            pad.set_state(input);
+        match &mut self.gamepad {
+            Some(pad) => pad.set_state(input),
+            None => false,
         }
     }
 
@@ -151,24 +153,37 @@ impl WinInjector {
 }
 
 impl crate::Injector for WinInjector {
-    fn inject(&mut self, event: &InputEvent) {
+    fn inject(&mut self, event: &InputEvent) -> Option<crate::InputFeedback> {
         match event {
-            InputEvent::Key { usage, down, .. } => self.key(*usage, *down),
-            InputEvent::MouseMove(m) => self.mouse_move(*m),
-            InputEvent::MouseButton { button, down, .. } => self.mouse_button(*button, *down),
-            InputEvent::MouseWheel { dx, dy, .. } => self.wheel(*dx, *dy),
-            InputEvent::Gamepad(input) => self.gamepad(input),
+            InputEvent::Key { usage, down, .. } => {
+                self.key(*usage, *down);
+                None
+            }
+            InputEvent::MouseMove(m) => {
+                self.mouse_move(*m);
+                None
+            }
+            InputEvent::MouseButton { button, down, .. } => {
+                self.mouse_button(*button, *down);
+                None
+            }
+            InputEvent::MouseWheel { dx, dy, .. } => {
+                self.wheel(*dx, *dy);
+                None
+            }
+            InputEvent::Gamepad(input) => self
+                .gamepad(input)
+                .then_some(crate::InputFeedback::GamepadConnected { seat: input.seat }),
             // Only ever unplug a pad we plugged: an unused seat, or a host
             // with no ViGEmBus, must not connect to the driver just to learn
             // there is nothing to remove.
             InputEvent::GamepadDisconnect { seat, .. } => {
-                if let Some(pad) = &mut self.gamepad {
-                    pad.remove_seat(*seat);
-                }
+                let removed = self.gamepad.as_mut().is_some_and(|pad| pad.remove_seat(*seat));
+                removed.then_some(crate::InputFeedback::GamepadDisconnected { seat: *seat })
             }
             // GamepadMotion has no XInput equivalent; touch/pen on the
             // Windows desktop are out of scope.
-            _ => (),
+            _ => None,
         }
     }
 }

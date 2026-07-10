@@ -4,9 +4,10 @@
 //! aspect-fit quad (GPU scaling — HiDPI handled by physical-pixel surface).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use gsa_client_core::{Client, DecodedFrame, PixelOrder};
+use gsa_client_core::{Client, ControlEvent, DecodedFrame, PixelOrder};
 use gsa_core::id::SourceId;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -26,7 +27,48 @@ const GAMEPAD_POLL: std::time::Duration = std::time::Duration::from_millis(4);
 enum AppEvent {
     Ready(gsa_client_core::InputSender),
     Frame(Box<DecodedFrame>),
+    /// Agent-pushed notification (e.g. host confirmed the virtual pad plugged).
+    Notification(ControlEvent),
     StreamEnded(String),
+}
+
+/// A bottom-of-screen toast that slides in, holds, and slides out. The
+/// client-dev take on the reusable notification surface — a colored bar
+/// (green = connected, grey = disconnected); the window title carries the text.
+struct Toast {
+    connected: bool,
+    at: Instant,
+}
+
+impl Toast {
+    const IN: f32 = 0.18;
+    const HOLD: f32 = 2.0;
+    const OUT: f32 = 0.30;
+    const TOTAL: f32 = Self::IN + Self::HOLD + Self::OUT;
+
+    /// 0 = fully hidden (below the screen), 1 = fully shown.
+    fn slide(&self) -> f32 {
+        let t = self.at.elapsed().as_secs_f32();
+        if t < Self::IN {
+            (t / Self::IN).clamp(0.0, 1.0)
+        } else if t < Self::IN + Self::HOLD {
+            1.0
+        } else {
+            (1.0 - (t - Self::IN - Self::HOLD) / Self::OUT).clamp(0.0, 1.0)
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.at.elapsed().as_secs_f32() > Self::TOTAL
+    }
+
+    fn color(&self) -> [f32; 4] {
+        if self.connected {
+            [0.16, 0.55, 0.24, 0.92]
+        } else {
+            [0.35, 0.35, 0.38, 0.92]
+        }
+    }
 }
 
 pub fn run(
@@ -94,28 +136,47 @@ fn network_loop(
                 }
             };
 
+            // Host-pushed notifications (gamepad plugged, etc.) arrive on the
+            // control stream, interleaved with frames.
+            let mut control_rx = client.take_control_events();
+
             let mut decoder = make_decoder(force_sw)?;
             let mut frames = 0u64;
-            while let Some(out) = client.recv_frame(decoder.as_mut()).await? {
-                frames += 1;
-                if frames.is_multiple_of(300) {
-                    let s = client.stats();
-                    tracing::info!(
-                        frames,
-                        recent_p50 = ?s.recent_latency_ms_p50,
-                        recent_p99 = ?s.recent_latency_ms_p99,
-                        latency_ms_p50 = ?s.latency_ms_p50,
-                        latency_ms_p99 = ?s.latency_ms_p99,
-                        decode_ms_p50 = ?s.decode_ms_p50,
-                        dropped = s.frames_dropped_incomplete,
-                        "stream stats"
-                    );
-                }
-                if proxy
-                    .send_event(AppEvent::Frame(Box::new(out.frame)))
-                    .is_err()
-                {
-                    break; // window closed
+            loop {
+                tokio::select! {
+                    frame = client.recv_frame(decoder.as_mut()) => {
+                        let Some(out) = frame? else { break };
+                        frames += 1;
+                        if frames.is_multiple_of(300) {
+                            let s = client.stats();
+                            tracing::info!(
+                                frames,
+                                recent_p50 = ?s.recent_latency_ms_p50,
+                                recent_p99 = ?s.recent_latency_ms_p99,
+                                latency_ms_p50 = ?s.latency_ms_p50,
+                                latency_ms_p99 = ?s.latency_ms_p99,
+                                decode_ms_p50 = ?s.decode_ms_p50,
+                                dropped = s.frames_dropped_incomplete,
+                                "stream stats"
+                            );
+                        }
+                        if proxy
+                            .send_event(AppEvent::Frame(Box::new(out.frame)))
+                            .is_err()
+                        {
+                            break; // window closed
+                        }
+                    }
+                    event = async {
+                        match &mut control_rx {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending::<Option<ControlEvent>>().await,
+                        }
+                    } => {
+                        if let Some(event) = event {
+                            let _ = proxy.send_event(AppEvent::Notification(event));
+                        }
+                    }
                 }
             }
             Ok(())
@@ -137,6 +198,7 @@ struct App {
     /// Presented content rect (letterboxed), for normalizing cursor coords.
     content_rect: Option<(f32, f32, f32, f32)>,
     gamepad: Option<GamepadCapture>,
+    toast: Option<Toast>,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -168,6 +230,16 @@ impl ApplicationHandler<AppEvent> for App {
         {
             input.send(vec![event]);
         }
+        // Drive the toast animation: it must keep redrawing even when no video
+        // frames arrive (an idle display source produces none).
+        if let Some(toast) = &self.toast {
+            if toast.expired() {
+                self.toast = None;
+            } else if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+
         event_loop.set_control_flow(ControlFlow::wait_duration(GAMEPAD_POLL));
     }
 
@@ -177,6 +249,25 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::Frame(frame) => {
                 self.latest = Some(frame);
                 if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            AppEvent::Notification(event) => {
+                let (connected, text) = match event {
+                    ControlEvent::GamepadConnected { seat } => {
+                        (true, format!("controller connected (seat {seat})"))
+                    }
+                    ControlEvent::GamepadDisconnected { seat } => {
+                        (false, format!("controller disconnected (seat {seat})"))
+                    }
+                };
+                tracing::info!(text, "host notification");
+                self.toast = Some(Toast {
+                    connected,
+                    at: Instant::now(),
+                });
+                if let Some(w) = &self.window {
+                    w.set_title(&format!("gsa client-dev — {text}"));
                     w.request_redraw();
                 }
             }
@@ -198,7 +289,8 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::RedrawRequested => {
                 if let (Some(gpu), Some(frame)) = (&mut self.gpu, &self.latest) {
                     self.content_rect = Some(gpu.content_rect(frame));
-                    if let Err(e) = gpu.render(frame) {
+                    let toast = self.toast.as_ref().map(|t| (t.color(), t.slide()));
+                    if let Err(e) = gpu.render(frame, toast) {
                         tracing::warn!(error = %e, "render failed");
                     }
                 }
@@ -271,6 +363,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Solid-colour quad for the notification toast. `rect` is (x0, y0, x1, y1) in
+/// clip space; `color` is premultiplied-alpha-friendly straight RGBA.
+const BAR_SHADER: &str = r#"
+struct Bar { rect: vec4<f32>, color: vec4<f32> };
+@group(0) @binding(0) var<uniform> bar: Bar;
+
+@vertex
+fn vs_bar(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var xs = array<f32, 6>(bar.rect.x, bar.rect.z, bar.rect.x, bar.rect.z, bar.rect.z, bar.rect.x);
+    var ys = array<f32, 6>(bar.rect.y, bar.rect.y, bar.rect.w, bar.rect.y, bar.rect.w, bar.rect.w);
+    return vec4<f32>(xs[i], ys[i], 0.0, 1.0);
+}
+
+@fragment
+fn fs_bar() -> @location(0) vec4<f32> {
+    return bar.color;
+}
+"#;
+
 struct Gpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -280,6 +391,9 @@ struct Gpu {
     sampler: wgpu::Sampler,
     bind_layout: wgpu::BindGroupLayout,
     texture: Option<FrameTexture>,
+    bar_pipeline: wgpu::RenderPipeline,
+    bar_uniform: wgpu::Buffer,
+    bar_bind: wgpu::BindGroup,
 }
 
 struct FrameTexture {
@@ -367,6 +481,69 @@ impl Gpu {
             ..Default::default()
         });
 
+        // Toast overlay: a solid, alpha-blended quad driven by a small uniform.
+        let bar_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bar"),
+            source: wgpu::ShaderSource::Wgsl(BAR_SHADER.into()),
+        });
+        let bar_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bar-uniform"),
+            size: 32, // vec4 rect + vec4 color
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bar_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bar"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bar_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bar"),
+            layout: &bar_bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: bar_uniform.as_entire_binding(),
+            }],
+        });
+        let bar_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bar"),
+            bind_group_layouts: &[Some(&bar_bind_layout)],
+            ..Default::default()
+        });
+        let bar_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bar"),
+            layout: Some(&bar_layout),
+            vertex: wgpu::VertexState {
+                module: &bar_shader,
+                entry_point: Some("vs_bar"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &bar_shader,
+                entry_point: Some("fs_bar"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Ok(Self {
             surface,
             device,
@@ -376,6 +553,9 @@ impl Gpu {
             sampler,
             bind_layout,
             texture: None,
+            bar_pipeline,
+            bar_uniform,
+            bar_bind,
         })
     }
 
@@ -447,8 +627,20 @@ impl Gpu {
         ((sw - vw) / 2.0, (sh - vh) / 2.0, vw, vh)
     }
 
-    fn render(&mut self, frame: &DecodedFrame) -> Result<()> {
+    fn render(&mut self, frame: &DecodedFrame, toast: Option<([f32; 4], f32)>) -> Result<()> {
         self.ensure_texture(frame.width, frame.height, frame.order);
+
+        // A toast is showing: write its quad (full width, bottom, slid by `s`).
+        if let Some((color, slide)) = toast {
+            let bar_h = 0.14;
+            let off = (1.0 - slide) * (bar_h + 0.04); // hidden below the screen
+            let rect = [-1.0f32, -1.0 - off, 1.0, -1.0 + bar_h - off];
+            let mut bytes = [0u8; 32];
+            for (i, v) in rect.iter().chain(color.iter()).enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+            }
+            self.queue.write_buffer(&self.bar_uniform, 0, &bytes);
+        }
         let FrameTexture {
             texture,
             bind,
@@ -517,6 +709,14 @@ impl Gpu {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bind, &[]);
             pass.draw(0..3, 0..1);
+
+            // Toast overlay: full-surface viewport, alpha-blended quad on top.
+            if toast.is_some() {
+                pass.set_viewport(0.0, 0.0, sw, sh, 0.0, 1.0);
+                pass.set_pipeline(&self.bar_pipeline);
+                pass.set_bind_group(0, &self.bar_bind, &[]);
+                pass.draw(0..6, 0..1);
+            }
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(output);

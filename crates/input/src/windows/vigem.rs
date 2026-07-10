@@ -76,27 +76,33 @@ impl VigemGamepad {
 }
 
 impl VirtualGamepad for VigemGamepad {
-    fn set_state(&mut self, input: &GamepadInput) {
+    fn set_state(&mut self, input: &GamepadInput) -> bool {
         let report = report(input);
         let seat = input.seat;
+        // `seat()` plugs on first use; capture that transition before it inserts.
+        let newly_plugged = !self.seats.contains_key(&seat);
         let Some(target) = self.seat(seat) else {
-            return;
+            return false; // driver refused to plug
         };
         update(seat, target, &report);
+        newly_plugged
     }
 
     /// `Xbox360Wired`'s `Drop` already unplugs, so removing it from the map
     /// would be enough. We unplug explicitly anyway: a failure to detach is
     /// exactly the symptom this exists to fix — a phantom pad the game still
     /// sees — and `Drop` would swallow it.
-    fn remove_seat(&mut self, seat: u8) {
+    fn remove_seat(&mut self, seat: u8) -> bool {
         let Some(mut target) = self.seats.remove(&seat) else {
-            return;
+            return false;
         };
         match target.unplug() {
             Ok(()) => tracing::info!(seat, "virtual Xbox 360 pad unplugged"),
             Err(e) => tracing::warn!(seat, error = ?e, "could not unplug the virtual pad"),
         }
+        // The seat is gone from our map either way (Drop unplugs on error),
+        // so the client should hear it disconnected.
+        true
     }
 }
 

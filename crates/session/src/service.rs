@@ -8,7 +8,10 @@ use gsa_core::id::SourceId;
 use gsa_core::media::VideoMode;
 use gsa_core::{Error, Result};
 use gsa_encode_api::Encoder;
-use gsa_protocol::control::{A2C, C2A, HelloAck, ProtoErrorMsg, SessionParams, SourceKind};
+use gsa_input::InputFeedback;
+use gsa_protocol::control::{
+    A2C, C2A, HelloAck, Notification, ProtoErrorMsg, SessionParams, SourceKind,
+};
 use gsa_protocol::grant::Scope;
 use gsa_protocol::{PROTO_VERSION, control};
 use gsa_transport::{recv_msg, send_msg};
@@ -201,7 +204,20 @@ async fn serve_inner(
                     && let Some(injector) = &mut a.injector
                 {
                     for event in &events {
-                        injector.inject(event);
+                        // Injection may report host state the client should hear
+                        // about (a virtual pad plugging/unplugging) — forward it
+                        // as a control-stream notification.
+                        if let Some(feedback) = injector.inject(event) {
+                            let notification = match feedback {
+                                InputFeedback::GamepadConnected { seat } => {
+                                    Notification::GamepadConnected { seat }
+                                }
+                                InputFeedback::GamepadDisconnected { seat } => {
+                                    Notification::GamepadDisconnected { seat }
+                                }
+                            };
+                            send_msg(&mut send, &A2C::Notification(notification)).await?;
+                        }
                     }
                 }
             }

@@ -12,12 +12,25 @@ mod macos;
 #[cfg(windows)]
 mod windows;
 
+/// A host-side outcome worth reporting back to the client — e.g. a virtual pad
+/// actually plugged in. The session turns these into control-stream
+/// notifications so the client can confirm state rather than assume it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFeedback {
+    /// The virtual pad for `seat` was just plugged into the host OS.
+    GamepadConnected { seat: u8 },
+    /// The virtual pad for `seat` was just unplugged.
+    GamepadDisconnected { seat: u8 },
+}
+
 /// Injects remote input into the host OS. `Send` so the session can own it
 /// across async tasks; calls are serial.
 pub trait Injector: Send {
     /// Inject one event. Best-effort — logs and continues on failure so a
-    /// single bad event never wedges the input stream.
-    fn inject(&mut self, event: &InputEvent);
+    /// single bad event never wedges the input stream. Returns
+    /// [`InputFeedback`] when the event changed host-visible state the client
+    /// should be told about (a pad plugging/unplugging); `None` otherwise.
+    fn inject(&mut self, event: &InputEvent) -> Option<InputFeedback>;
 }
 
 /// Presents virtual gamepad "seats" to the OS.
@@ -30,12 +43,13 @@ pub trait Injector: Send {
 pub trait VirtualGamepad: Send + std::fmt::Debug {
     /// Apply full controller state for `input.seat`, plugging the virtual pad
     /// on first use for that seat. Best-effort, like [`Injector::inject`].
-    fn set_state(&mut self, input: &GamepadInput);
+    /// Returns `true` only when this call *newly* plugged the seat's pad.
+    fn set_state(&mut self, input: &GamepadInput) -> bool;
 
     /// Unplug `seat`'s virtual pad; the client's controller went away. A seat
     /// that was never plugged is a no-op. The next `set_state` for that seat
-    /// plugs a fresh one.
-    fn remove_seat(&mut self, seat: u8);
+    /// plugs a fresh one. Returns `true` only when a pad was actually removed.
+    fn remove_seat(&mut self, seat: u8) -> bool;
 }
 
 /// Create the platform injector, or `None` where unsupported / permission is

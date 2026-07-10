@@ -113,7 +113,7 @@ impl CgInjector {
 }
 
 impl crate::Injector for CgInjector {
-    fn inject(&mut self, event: &InputEvent) {
+    fn inject(&mut self, event: &InputEvent) -> Option<crate::InputFeedback> {
         match event {
             InputEvent::Key { usage, down, .. } => {
                 if let Some(flag) = modifier_flag(*usage) {
@@ -125,7 +125,7 @@ impl crate::Injector for CgInjector {
                 }
                 let Some(code) = hid_to_macos(*usage) else {
                     tracing::trace!(usage, "unmapped HID key dropped");
-                    return;
+                    return None;
                 };
                 if let Some(e) = CGEvent::new_keyboard_event(Some(&self.source), code, *down) {
                     self.post(Some(&e));
@@ -138,6 +138,7 @@ impl crate::Injector for CgInjector {
             // touch/pen on macOS desktop are out of M1 scope.
             _ => {}
         }
+        None
     }
 }
 

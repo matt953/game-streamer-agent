@@ -19,7 +19,9 @@ use gsa_core::media::VideoMode;
 use gsa_core::time::MediaClock;
 use gsa_core::{Error, Result};
 use gsa_protocol::PROTO_VERSION;
-use gsa_protocol::control::{A2C, C2A, DecodeCaps, Hello, SessionParams, SessionRequest};
+use gsa_protocol::control::{
+    A2C, C2A, DecodeCaps, Hello, Notification, SessionParams, SessionRequest,
+};
 use gsa_protocol::datagram::VideoDatagramHeader;
 use gsa_protocol::grant::Scope;
 use gsa_protocol::pairing::{PairResponse, PairResult};
@@ -110,6 +112,18 @@ pub struct EncodedFrame {
     pub latency_us: Option<u32>,
 }
 
+/// A user-facing event pushed by the agent over the control stream, for the
+/// embedder to surface (a toast, etc.). Mirrors the wire [`Notification`] but is
+/// the client-core-facing type, so embedders don't depend on the protocol crate.
+/// Grow this alongside `Notification` as new notifications are added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlEvent {
+    /// The host confirmed its virtual pad for `seat` is plugged in (input live).
+    GamepadConnected { seat: u8 },
+    /// The host's virtual pad for `seat` was unplugged.
+    GamepadDisconnected { seat: u8 },
+}
+
 /// Fire-and-forget input sink, decoupled from the frame-receive loop.
 /// Sync `send` (safe to call from a UI event loop); a background task on the
 /// client's runtime writes messages to the control stream in order.
@@ -130,7 +144,8 @@ pub struct Client {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     control_send: Option<quinn::SendStream>,
-    control_recv: quinn::RecvStream,
+    /// `None` once [`Client::take_control_events`] moves it into a reader task.
+    control_recv: Option<quinn::RecvStream>,
     /// Present once the background control writer is running (windowed
     /// client); `recv_frame` sends keyframe requests through it.
     control_tx: Option<tokio::sync::mpsc::UnboundedSender<C2A>>,
@@ -211,7 +226,7 @@ impl Client {
             endpoint,
             conn,
             control_send: Some(control_send),
-            control_recv,
+            control_recv: Some(control_recv),
             control_tx: None,
             clock,
             clock_sync: ClockSync::default(),
@@ -234,7 +249,7 @@ impl Client {
         for _ in 0..rounds {
             let sent = self.clock.now_us();
             send_msg(self.ctl()?, &C2A::Ping { client_ts_us: sent }).await?;
-            match recv_msg::<A2C>(&mut self.control_recv).await? {
+            match recv_msg::<A2C>(self.ctl_recv()?).await? {
                 A2C::Pong {
                     client_ts_us,
                     agent_ts_us,
@@ -257,6 +272,51 @@ impl Client {
         self.control_send
             .as_mut()
             .ok_or_else(|| Error::Session("control stream moved to input sender".into()))
+    }
+
+    fn ctl_recv(&mut self) -> Result<&mut quinn::RecvStream> {
+        self.control_recv
+            .as_mut()
+            .ok_or_else(|| Error::Session("control stream moved to event reader".into()))
+    }
+
+    /// Move the control recv-stream into a background reader task and return a
+    /// channel of [`ControlEvent`]s (agent-pushed notifications) for the
+    /// embedder to surface. Call after `start_session`; afterwards the client
+    /// can no longer read control replies (it only receives frames). `None` if
+    /// already taken. The receiver is tokio's so callers can `select!`/`try_recv`
+    /// it on their own runtime; it closes when the connection ends.
+    pub fn take_control_events(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<ControlEvent>> {
+        let mut recv = self.control_recv.take()?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                match recv_msg::<A2C>(&mut recv).await {
+                    Ok(A2C::Notification(n)) => {
+                        let event = match n {
+                            Notification::GamepadConnected { seat } => {
+                                ControlEvent::GamepadConnected { seat }
+                            }
+                            Notification::GamepadDisconnected { seat } => {
+                                ControlEvent::GamepadDisconnected { seat }
+                            }
+                            // Unknown future notification: ignore, stay reading.
+                            _ => continue,
+                        };
+                        if tx.send(event).is_err() {
+                            break; // embedder dropped the receiver
+                        }
+                    }
+                    // Other A2C during streaming (SessionEvent, stray replies):
+                    // nothing acts on them yet, so drain and continue.
+                    Ok(_) => continue,
+                    Err(_) => break, // control stream closed → connection ending
+                }
+            }
+        });
+        Some(rx)
     }
 
     /// Move the control send-stream into a background writer task and return
@@ -292,7 +352,7 @@ impl Client {
 
     pub async fn list_sources(&mut self) -> Result<Vec<SourceInfo>> {
         send_msg(self.ctl()?, &C2A::ListSources).await?;
-        match recv_msg::<A2C>(&mut self.control_recv).await? {
+        match recv_msg::<A2C>(self.ctl_recv()?).await? {
             A2C::Sources(s) => Ok(s),
             A2C::Error(e) => Err(Error::Session(e.message)),
             other => Err(Error::Session(format!("expected sources, got {other:?}"))),
@@ -313,7 +373,7 @@ impl Client {
             }),
         )
         .await?;
-        match recv_msg::<A2C>(&mut self.control_recv).await? {
+        match recv_msg::<A2C>(self.ctl_recv()?).await? {
             A2C::SessionStarted(params) => {
                 self.session = Some(params.clone());
                 Ok(params)
