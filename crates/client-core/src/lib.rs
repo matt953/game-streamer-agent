@@ -96,6 +96,21 @@ pub struct FrameOutput {
     pub decode_us: u32,
 }
 
+/// One complete encoded H.264 access unit (Annex-B) plus metadata, for
+/// embedders that decode on the platform (VideoToolbox / MediaCodec) rather
+/// than through a [`VideoDecoder`]. An IDR carries its own SPS/PPS.
+#[derive(Debug, Clone)]
+pub struct EncodedFrame {
+    pub data: Vec<u8>,
+    pub frame_id: u32,
+    /// IDR (carries parameter sets); the embedder builds its format description.
+    pub keyframe: bool,
+    /// Agent-clock capture timestamp (wire, truncated to u32 µs).
+    pub capture_ts_us: u32,
+    /// Estimated capture→received latency (µs); decode happens app-side.
+    pub latency_us: Option<u32>,
+}
+
 /// Fire-and-forget input sink, decoupled from the frame-receive loop.
 /// Sync `send` (safe to call from a UI event loop); a background task on the
 /// client's runtime writes messages to the control stream in order.
@@ -311,12 +326,11 @@ impl Client {
         }
     }
 
-    /// Receive datagrams until the next complete frame decodes.
-    /// Returns `None` when the connection closes.
-    pub async fn recv_frame(
-        &mut self,
-        decoder: &mut dyn VideoDecoder,
-    ) -> Result<Option<FrameOutput>> {
+    /// Receive datagrams until a video frame passes the loss-recovery gate,
+    /// returning its header and reassembled access unit. Audio decodes+plays as
+    /// a side effect. `None` when the connection closes. Shared by `recv_frame`
+    /// (decode path) and `recv_encoded` (embedder passthrough path).
+    async fn next_gated_frame(&mut self) -> Result<Option<(VideoDatagramHeader, Vec<u8>)>> {
         loop {
             let datagram = match self.conn.read_datagram().await {
                 Ok(d) => d,
@@ -325,7 +339,7 @@ impl Client {
                 Err(e) => return Err(Error::Transport(format!("read datagram: {e}"))),
             };
             // Route by datagram type: audio is decoded+played as a side effect;
-            // recv_frame only returns on a completed video frame.
+            // this only returns on a completed video frame.
             match datagram
                 .first()
                 .copied()
@@ -368,11 +382,7 @@ impl Client {
                 if delta == 0 || delta > u32::MAX / 2 {
                     // Reassembler drops stale frames, so this should be
                     // unreachable; if it fires, ordering is broken upstream.
-                    tracing::warn!(
-                        last,
-                        got = header.frame_id,
-                        "OUT-OF-ORDER frame reached decode"
-                    );
+                    tracing::warn!(last, got = header.frame_id, "OUT-OF-ORDER frame gated");
                 } else if delta != 1 && !is_idr && !self.awaiting_idr {
                     tracing::debug!(
                         gap_after = last,
@@ -392,12 +402,25 @@ impl Client {
                 continue;
             }
 
-            let decode_start = self.clock.now_us();
-            let decoded = decoder.decode(&frame_data);
-            // The frame was consumed regardless of outcome; advance so the
-            // next frame isn't misread as another gap.
+            // The frame is consumed regardless of what the caller does with it;
+            // advance so the next frame isn't misread as another gap.
             self.last_frame_id = Some(header.frame_id);
-            match decoded {
+            return Ok(Some((header, frame_data)));
+        }
+    }
+
+    /// Receive datagrams until the next complete frame decodes.
+    /// Returns `None` when the connection closes.
+    pub async fn recv_frame(
+        &mut self,
+        decoder: &mut dyn VideoDecoder,
+    ) -> Result<Option<FrameOutput>> {
+        loop {
+            let Some((header, frame_data)) = self.next_gated_frame().await? else {
+                return Ok(None);
+            };
+            let decode_start = self.clock.now_us();
+            match decoder.decode(&frame_data) {
                 Ok(Some(frame)) => {
                     let now = self.clock.now_us();
                     let decode_us = (now - decode_start) as u32;
@@ -423,6 +446,27 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Receive the next complete **encoded** access unit plus metadata, for
+    /// embedders that decode on the platform (VideoToolbox / MediaCodec). Same
+    /// loss-recovery gate as `recv_frame`; audio routes as a side effect.
+    /// `None` when the connection closes.
+    pub async fn recv_encoded(&mut self) -> Result<Option<EncodedFrame>> {
+        let Some((header, frame_data)) = self.next_gated_frame().await? else {
+            return Ok(None);
+        };
+        let now = self.clock.now_us();
+        let latency_us = self.clock_sync.frame_latency_us(now, header.capture_ts_us);
+        // Decode happens app-side; record it as zero in the stats window.
+        self.stats.on_frame_decoded(latency_us, 0);
+        Ok(Some(EncodedFrame {
+            data: frame_data,
+            frame_id: header.frame_id,
+            keyframe: header.kind == gsa_core::media::FrameKind::Idr,
+            capture_ts_us: header.capture_ts_us,
+            latency_us,
+        }))
     }
 
     /// Request a healing keyframe, rate-limited so a burst of gaps/errors

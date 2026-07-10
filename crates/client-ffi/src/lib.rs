@@ -6,13 +6,16 @@
 //! types. This first function is a **spike**: prove the core links, connects,
 //! and receives from inside the app before the real callback surface lands.
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use gsa_client_core::{Client, DecodedFrame, PixelOrder, ServerAuth, VideoDecoder};
 use gsa_core::id::SourceId;
 use gsa_core::media::H264Profile;
+use tokio::sync::Notify;
 
 /// Counts complete access units without decoding — returns an empty frame so
 /// `recv_frame` hands each reassembled frame back to the loop.
@@ -83,3 +86,216 @@ pub unsafe extern "C" fn gsa_spike_connect(url: *const c_char, seconds: i32) -> 
         n
     })
 }
+
+/// Callbacks the embedder registers to receive a live session's media. Both are
+/// invoked **present-on-arrival** — decode/render happens app-side (spec 01, D9:
+/// encoded passthrough; PCM is decoded here). `ctx` is passed back verbatim.
+///
+/// Threading: `on_video` fires on the session's receive thread; `on_audio` on a
+/// separate audio thread. Both may run concurrently, so the embedder must
+/// synchronize any shared state behind `ctx`. Neither pointer's data outlives
+/// the call — copy what you need to keep. Callbacks must not call back into the
+/// session (no `gsa_session_stop` from inside a callback).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GsaCallbacks {
+    /// Opaque embedder handle, passed to every callback. Not touched by Rust.
+    pub ctx: *mut c_void,
+    /// One complete H.264 Annex-B access unit. `keyframe` marks an IDR (carries
+    /// SPS/PPS). `capture_ts_us` is the agent-clock capture time (µs, wrapping).
+    /// `latency_us` is the estimated capture→received latency (0 if unknown).
+    pub on_video: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            data: *const u8,
+            len: usize,
+            keyframe: bool,
+            capture_ts_us: u32,
+            latency_us: u32,
+        ),
+    >,
+    /// Interleaved-i16 PCM, 48 kHz stereo. `samples` counts i16 values (frames
+    /// × 2), not bytes.
+    pub on_audio:
+        Option<unsafe extern "C" fn(ctx: *mut c_void, pcm: *const i16, samples: usize)>,
+}
+
+/// Raw `ctx` isn't `Send`; the embedder owns its thread-safety, so we carry the
+/// callback set across the receive-thread boundary explicitly.
+struct SendCallbacks(GsaCallbacks);
+// SAFETY: the embedder guarantees `ctx` is safe to use from the receive/audio
+// threads (documented on `GsaCallbacks`); Rust only passes it back opaquely.
+unsafe impl Send for SendCallbacks {}
+
+/// Opaque live session handle. Owns the receive thread (which owns the tokio
+/// runtime + connection). Free exactly once with [`gsa_session_stop`].
+#[derive(Debug)]
+pub struct GsaSession {
+    stop: Arc<Notify>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Connect anonymously to the agent at `url` (host:port), start its first
+/// source, and stream media to `callbacks` until [`gsa_session_stop`]. Blocks
+/// until the session is streaming (or fails).
+///
+/// Returns an owned session handle, or NULL on failure (bad url, runtime init,
+/// connect, no sources, or start-session). Call `gsa_session_stop` to release.
+///
+/// # Safety
+/// `url` must be a valid NUL-terminated C string for the duration of the call.
+/// The function pointers and `ctx` in `callbacks` must stay valid until
+/// `gsa_session_stop` returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_start(
+    url: *const c_char,
+    callbacks: GsaCallbacks,
+) -> *mut GsaSession {
+    if url.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller contract requires a valid NUL-terminated string.
+    let Ok(url) = (unsafe { CStr::from_ptr(url) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+    let Ok(addr) = url.parse::<std::net::SocketAddr>() else {
+        return std::ptr::null_mut();
+    };
+
+    let stop = Arc::new(Notify::new());
+    let cbs = SendCallbacks(callbacks);
+    let thread_stop = stop.clone();
+    // Signals whether the session reached the streaming state before we hand a
+    // handle back; keeps failures synchronous rather than a silently-dead thread.
+    let (ready_tx, ready_rx) = channel::<bool>();
+
+    let thread = std::thread::spawn(move || {
+        let cbs = cbs; // move the whole callback set onto this thread
+        let Ok(rt) = tokio::runtime::Runtime::new() else {
+            let _ = ready_tx.send(false);
+            return;
+        };
+        rt.block_on(session_loop(addr, cbs, thread_stop, ready_tx));
+    });
+
+    match ready_rx.recv() {
+        Ok(true) => Box::into_raw(Box::new(GsaSession {
+            stop,
+            thread: Some(thread),
+        })),
+        _ => {
+            let _ = thread.join();
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Stop a session started by [`gsa_session_start`], join its threads, and free
+/// the handle. After this returns, no further callbacks fire. NULL is a no-op.
+///
+/// # Safety
+/// `session` must be a handle from `gsa_session_start` not already stopped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_stop(session: *mut GsaSession) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract guarantees a live, once-only handle.
+    let mut session = unsafe { Box::from_raw(session) };
+    session.stop.notify_one();
+    if let Some(t) = session.thread.take() {
+        let _ = t.join();
+    }
+}
+
+/// The session body: connect, take audio, start the first source, then pump
+/// encoded video to `on_video` and PCM to `on_audio` until `stop` fires or the
+/// connection closes. Reports readiness through `ready_tx`.
+async fn session_loop(
+    addr: std::net::SocketAddr,
+    cbs: SendCallbacks,
+    stop: Arc<Notify>,
+    ready_tx: std::sync::mpsc::Sender<bool>,
+) {
+    let cbs = cbs.0;
+    let mut client =
+        match Client::connect(addr, "gsa-app", H264Profile::High, ServerAuth::Open).await {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = ready_tx.send(false);
+                return;
+            }
+        };
+    // Enable audio decode before the first recv so no datagrams are dropped.
+    let audio_rx = match client.take_audio_output() {
+        Ok(rx) => rx,
+        Err(_) => {
+            let _ = ready_tx.send(false);
+            return;
+        }
+    };
+    let sources = match client.list_sources().await {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            let _ = ready_tx.send(false);
+            return;
+        }
+    };
+    let source_id: SourceId = sources[0].id;
+    if client.start_session(source_id, None).await.is_err() {
+        let _ = ready_tx.send(false);
+        return;
+    }
+    let _ = ready_tx.send(true);
+
+    // Audio drains on its own thread: PCM must flow steadily even while the
+    // receive loop is parked awaiting the next video frame. The channel closes
+    // when `client` (holding the Sender) drops, ending this thread.
+    let audio_ctx = SendPtr(cbs.ctx);
+    let on_audio = cbs.on_audio;
+    let audio_thread = std::thread::spawn(move || {
+        let audio_ctx = audio_ctx;
+        while let Ok(pcm) = audio_rx.recv() {
+            if let Some(cb) = on_audio {
+                // SAFETY: pointer+len describe this owned buffer for the call;
+                // the embedder copies what it keeps.
+                unsafe { cb(audio_ctx.0, pcm.as_ptr(), pcm.len()) };
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            _ = stop.notified() => break,
+            frame = client.recv_encoded() => match frame {
+                Ok(Some(f)) => {
+                    if let Some(cb) = cbs.on_video {
+                        // SAFETY: pointer+len describe f.data for the call only.
+                        unsafe {
+                            cb(
+                                cbs.ctx,
+                                f.data.as_ptr(),
+                                f.data.len(),
+                                f.keyframe,
+                                f.capture_ts_us,
+                                f.latency_us.unwrap_or(0),
+                            )
+                        };
+                    }
+                }
+                _ => break, // closed or errored
+            },
+        }
+    }
+
+    // `close` consumes the client, dropping the audio Sender and so closing the
+    // channel; the drain thread then ends. Wait for it.
+    client.close().await;
+    let _ = audio_thread.join();
+}
+
+/// Carries a raw `ctx` onto the audio thread. Same embedder contract as
+/// [`SendCallbacks`].
+struct SendPtr(*mut c_void);
+// SAFETY: see `GsaCallbacks` threading contract.
+unsafe impl Send for SendPtr {}
