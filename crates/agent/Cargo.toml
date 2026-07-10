@@ -37,6 +37,7 @@ gsa-encode-videotoolbox = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gsa-capture-windows = { workspace = true }
+gsa-encode-nvenc = { workspace = true }
 
 [lints]
 workspace = true

@@ -61,6 +61,28 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>> {
     Ok(out)
 }
 
+/// A device on a specific adapter, without a context.
+///
+/// Exposed for hardware encoders, which must probe NVENC on the GPU they will
+/// actually encode from before capture commits to it.
+pub fn create_device_on(luid: i64) -> Result<ID3D11Device> {
+    Ok(create_device(Some(luid))?.0)
+}
+
+/// Which adapter a device was created on.
+pub fn device_adapter_luid(device: &ID3D11Device) -> Result<i64> {
+    let dxgi = device
+        .cast::<IDXGIDevice>()
+        .map_err(|e| Error::Capture(format!("device is not a DXGI device: {e}")))?;
+    // SAFETY: `dxgi` is live; GetAdapter returns a live adapter.
+    let adapter = unsafe { dxgi.GetAdapter() }
+        .map_err(|e| Error::Capture(format!("IDXGIDevice::GetAdapter: {e}")))?;
+    // SAFETY: `adapter` is live; GetDesc only writes the descriptor.
+    let desc = unsafe { adapter.GetDesc() }
+        .map_err(|e| Error::Capture(format!("IDXGIAdapter::GetDesc: {e}")))?;
+    Ok(flatten_luid(desc.AdapterLuid))
+}
+
 /// A BGRA-capable hardware D3D11 device and its immediate context.
 ///
 /// `luid` pins the adapter; `None` takes DXGI's default. Capture works on any

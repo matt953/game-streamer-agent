@@ -15,7 +15,7 @@ mod frame;
 #[cfg(windows)]
 pub use capture::{CaptureOutput, DesktopCapture};
 #[cfg(windows)]
-pub use device::{AdapterInfo, list_adapters};
+pub use device::{AdapterInfo, create_device_on, device_adapter_luid, list_adapters};
 #[cfg(windows)]
 pub use display::{DisplayInfo, list_displays};
 #[cfg(windows)]

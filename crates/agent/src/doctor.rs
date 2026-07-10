@@ -163,6 +163,21 @@ fn windows_checks(checks: &mut Vec<Check>) {
             detail: format!("enumeration failed: {e}"),
         }),
     }
+
+    // Hardware encode. Its absence is not a failure — the software encoder
+    // still streams — but it is the difference between ~4 ms and ~83 ms.
+    match gsa_encode_nvenc::probe() {
+        Some(_) => checks.push(Check {
+            name: "hardware encode",
+            level: Level::Ok,
+            detail: "NVENC available (zero-copy from the capture texture)".into(),
+        }),
+        None => checks.push(Check {
+            name: "hardware encode",
+            level: Level::Warn,
+            detail: "no NVENC — falling back to the software encoder, which is much slower".into(),
+        }),
+    }
 }
 
 fn print_human(checks: &[Check], failed: bool) {

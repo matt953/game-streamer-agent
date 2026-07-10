@@ -23,7 +23,10 @@ pub struct D3D11Frame {
 }
 
 impl D3D11Frame {
-    pub(crate) fn new(texture: ID3D11Texture2D, device: ID3D11Device) -> Self {
+    /// Wrap a texture the caller owns. Public so an encoder can build one from
+    /// a synthetic texture in its own tests, without a live capture.
+    #[must_use]
+    pub fn new(texture: ID3D11Texture2D, device: ID3D11Device) -> Self {
         Self { texture, device }
     }
 

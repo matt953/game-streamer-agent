@@ -1,8 +1,8 @@
 //! Source and encoder factories. Everywhere: the TestPattern source +
 //! software encoder (GPU-free, CI-friendly). On macOS additionally: real
 //! displays via ScreenCaptureKit paired with the VideoToolbox hardware
-//! encoder (spec 02/03). On Windows: displays via Windows Graphics Capture,
-//! still on the software encoder until the M4 hardware backend lands.
+//! encoder (spec 02/03). On Windows: Windows Graphics Capture, paired with
+//! NVENC when the host has one and the software encoder when it does not.
 
 use gsa_capture_api::{RenderSource, SourceDescriptor};
 use gsa_core::id::SourceId;
@@ -16,6 +16,29 @@ use gsa_sources::TestPattern;
 /// SourceId reserved for the synthetic test pattern; real displays use their
 /// platform display id.
 const TEST_PATTERN_ID: SourceId = SourceId(0);
+
+/// Whether this host can hardware-encode, decided once and shared.
+///
+/// The source and the encoder **must** agree: NVENC consumes GPU textures and
+/// the software encoder consumes CPU frames, so a split decision would pair a
+/// source with an encoder that cannot read it. One cached probe, two readers.
+#[cfg(target_os = "windows")]
+fn nvenc() -> Option<gsa_encode_nvenc::Support> {
+    static SUPPORT: std::sync::OnceLock<Option<gsa_encode_nvenc::Support>> =
+        std::sync::OnceLock::new();
+    *SUPPORT.get_or_init(gsa_encode_nvenc::probe)
+}
+
+/// Where Windows capture should put its pixels, given [`nvenc`].
+#[cfg(target_os = "windows")]
+fn windows_capture_output() -> gsa_capture_windows::CaptureOutput {
+    match nvenc() {
+        Some(support) => gsa_capture_windows::CaptureOutput::GpuTexture {
+            adapter_luid: Some(support.adapter_luid),
+        },
+        None => gsa_capture_windows::CaptureOutput::CpuReadback,
+    }
+}
 
 pub struct Sources {
     clock: MediaClock,
@@ -49,7 +72,7 @@ impl Sources {
             id,
             display,
             self.clock.clone(),
-            gsa_capture_windows::CaptureOutput::CpuReadback,
+            windows_capture_output(),
         )))
     }
 
@@ -85,7 +108,7 @@ impl Sources {
                         SourceId(d.id),
                         d,
                         self.clock.clone(),
-                        gsa_capture_windows::CaptureOutput::CpuReadback,
+                        windows_capture_output(),
                     )
                     .descriptor()
                 })
@@ -140,11 +163,18 @@ impl EncoderFactory for Encoders {
             SourceKind::Display | SourceKind::VirtualDisplay => Ok(Box::new(
                 gsa_encode_videotoolbox::VideoToolboxEncoder::new(self.clock.clone()),
             )),
-            // Windows Graphics Capture reads back BGRA8 CPU frames, so the
-            // software encoder takes them as-is until NVENC/MF lands (M4).
+            // NVENC where the host has it, software where it does not. Gated
+            // on the same cached probe the source uses, so the frame format
+            // the source emits always matches this encoder's `input_formats`.
             #[cfg(target_os = "windows")]
             SourceKind::Display | SourceKind::VirtualDisplay => {
-                Ok(Box::new(gsa_encode_sw::SwEncoder::new(self.clock.clone())))
+                if nvenc().is_some() {
+                    Ok(Box::new(gsa_encode_nvenc::NvencEncoder::new(
+                        self.clock.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(gsa_encode_sw::SwEncoder::new(self.clock.clone())))
+                }
             }
             other => Err(Error::Encode(format!(
                 "no encoder for source kind {other:?}"
