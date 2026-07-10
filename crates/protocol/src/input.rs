@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 /// One input event, client-timestamped (client clock, µs) for latency
 /// telemetry.
+///
+/// Postcard encodes a variant by its *position*, so new variants append. An
+/// insertion would silently renumber every variant after it, and a client one
+/// commit behind the host would land its mouse clicks on some other arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum InputEvent {
@@ -38,6 +42,14 @@ pub enum InputEvent {
     },
     Touch(TouchEvent),
     Pen(PenEvent),
+    /// The client's controller for `seat` went away — unplug the host's
+    /// virtual pad, so a game sees a real removal rather than a pad frozen at
+    /// neutral. Rides the reliable input stream; there is no `Connected`
+    /// counterpart, because the first [`InputEvent::Gamepad`] plugs the seat.
+    GamepadDisconnect {
+        seat: u8,
+        ts_us: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -163,6 +175,44 @@ pub enum InputDisposition {
 #[cfg(test)]
 mod tests {
     use super::gamepad::{self, Axis};
+    use super::{GamepadInput, InputEvent};
+
+    /// Postcard writes the variant's position as the first byte. Pin the ones
+    /// that exist so an insertion fails here rather than on someone's desk.
+    #[test]
+    fn wire_positions_are_stable() {
+        let position = |event: &InputEvent| crate::encode_msg(event).unwrap()[0];
+        let pad = GamepadInput {
+            seat: 0,
+            buttons: 0,
+            axes: [0; 8],
+            ts_us: 0,
+        };
+        assert_eq!(
+            position(&InputEvent::Key {
+                usage: 0,
+                down: true,
+                ts_us: 0
+            }),
+            0
+        );
+        assert_eq!(position(&InputEvent::Gamepad(pad)), 4);
+        assert_eq!(
+            position(&InputEvent::GamepadDisconnect { seat: 0, ts_us: 0 }),
+            8
+        );
+    }
+
+    #[test]
+    fn gamepad_disconnect_round_trips() {
+        let bytes =
+            crate::encode_msg(&InputEvent::GamepadDisconnect { seat: 3, ts_us: 99 }).unwrap();
+        let back: InputEvent = crate::decode_msg(&bytes).unwrap();
+        assert!(matches!(
+            back,
+            InputEvent::GamepadDisconnect { seat: 3, ts_us: 99 }
+        ));
+    }
 
     /// The masks are XInput's `wButtons` verbatim; drift here silently
     /// remaps every button on the Windows host.
