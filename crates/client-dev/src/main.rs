@@ -6,6 +6,7 @@ mod audio_playback;
 mod decoder;
 #[cfg(target_os = "macos")]
 mod decoder_vt;
+mod gamepad_capture;
 mod headless;
 mod input_capture;
 mod pairing;

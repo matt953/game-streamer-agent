@@ -10,10 +10,17 @@ use gsa_client_core::{Client, DecodedFrame, PixelOrder};
 use gsa_core::id::SourceId;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 use crate::decoder::make_decoder;
+use crate::gamepad_capture::GamepadCapture;
+
+/// Gamepad poll period. Controllers are read on the event-loop thread — gilrs
+/// wants the thread with the platform run loop — so the loop wakes on a timer
+/// rather than only when a frame or a key arrives. 250 Hz keeps stick motion
+/// well under the frame interval without spinning.
+const GAMEPAD_POLL: std::time::Duration = std::time::Duration::from_millis(4);
 
 #[derive(Debug)]
 enum AppEvent {
@@ -134,6 +141,7 @@ struct App {
     input: Option<gsa_client_core::InputSender>,
     /// Presented content rect (letterboxed), for normalizing cursor coords.
     content_rect: Option<(f32, f32, f32, f32)>,
+    gamepad: Option<GamepadCapture>,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -154,6 +162,18 @@ impl ApplicationHandler<AppEvent> for App {
         let gpu = Gpu::new(window.clone()).expect("init wgpu");
         self.window = Some(window);
         self.gpu = Some(gpu);
+        self.gamepad = GamepadCapture::new();
+    }
+
+    /// Poll the controller between events. Winit would otherwise sleep until
+    /// the next frame or keystroke, and a gamepad generates neither.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let (Some(gamepad), Some(input)) = (&mut self.gamepad, &self.input)
+            && let Some(state) = gamepad.poll()
+        {
+            input.send(vec![gsa_protocol::input::InputEvent::Gamepad(state)]);
+        }
+        event_loop.set_control_flow(ControlFlow::wait_duration(GAMEPAD_POLL));
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {

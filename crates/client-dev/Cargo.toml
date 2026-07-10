@@ -28,6 +28,7 @@ winit = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 cpal = "0.15"
+gilrs = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = { workspace = true, features = ["CFNumber", "CFDictionary", "CFString"] }
