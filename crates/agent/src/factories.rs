@@ -49,6 +49,7 @@ impl Sources {
             id,
             display,
             self.clock.clone(),
+            gsa_capture_windows::CaptureOutput::CpuReadback,
         )))
     }
 
@@ -80,8 +81,13 @@ impl Sources {
             Ok(displays) => displays
                 .into_iter()
                 .map(|d| {
-                    gsa_capture_windows::DesktopCapture::new(SourceId(d.id), d, self.clock.clone())
-                        .descriptor()
+                    gsa_capture_windows::DesktopCapture::new(
+                        SourceId(d.id),
+                        d,
+                        self.clock.clone(),
+                        gsa_capture_windows::CaptureOutput::CpuReadback,
+                    )
+                    .descriptor()
                 })
                 .collect(),
             Err(e) => {
