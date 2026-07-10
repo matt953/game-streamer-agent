@@ -4,6 +4,8 @@
 //! workspace still builds on macOS/Linux CI.
 
 #[cfg(windows)]
+mod audio;
+#[cfg(windows)]
 mod capture;
 #[cfg(windows)]
 mod device;
@@ -27,4 +29,12 @@ pub use frame::D3D11Frame;
 #[must_use]
 pub fn capture_supported() -> bool {
     windows::Graphics::Capture::GraphicsCaptureSession::IsSupported().unwrap_or(false)
+}
+
+/// The mix format `(sample_rate, channels)` of the endpoint system audio is
+/// captured from, proven by opening a loopback stream. Reported by
+/// `gsa doctor`.
+#[cfg(windows)]
+pub fn loopback_mix_format() -> gsa_core::Result<(u32, u16)> {
+    audio::probe()
 }

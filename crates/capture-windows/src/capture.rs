@@ -26,8 +26,8 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 use windows::core::{IInspectable, Interface};
 
 use gsa_capture_api::{
-    CpuFrame, FrameSink, GpuFrame, GpuHandle, PlatformFrame, RenderSource, SourceConfig,
-    SourceDescriptor,
+    AudioReceiver, CpuFrame, FrameSink, GpuFrame, GpuHandle, PlatformFrame, RenderSource,
+    SourceConfig, SourceDescriptor, audio_channel,
 };
 use gsa_core::media::{PixelFormat, VideoMode};
 use gsa_core::time::MediaClock;
@@ -35,6 +35,7 @@ use gsa_core::{Error, Result};
 use gsa_protocol::control::{SourceInfo, SourceKind};
 use gsa_protocol::input::{InputDisposition, InputEvent};
 
+use crate::audio::AudioCapture;
 use crate::device::{create_device, ensure_mta, winrt_device};
 use crate::display::{DisplayInfo, find_monitor};
 use crate::frame::D3D11Frame;
@@ -73,17 +74,22 @@ pub struct DesktopCapture {
     clock: MediaClock,
     output: CaptureOutput,
     running: Option<Running>,
+    /// Audio receiver, populated in `start`, taken by the session via `audio()`.
+    audio_rx: Option<AudioReceiver>,
 }
 
-/// Live capture state. Every field is a WinRT (agile) object, so this — and
-/// therefore `DesktopCapture` — is `Send` without an unsafe assertion. The
-/// D3D11 objects, which are not agile, live in [`D3dState`] instead.
+/// Live capture state. The WinRT objects are agile, and the audio handle is a
+/// plain flag plus a thread, so this — and therefore `DesktopCapture` — is
+/// `Send` without an unsafe assertion. The D3D11 objects, which are not agile,
+/// live in [`D3dState`] instead.
 #[derive(Debug)]
 struct Running {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     frame_arrived: i64,
     sink: FrameSink,
+    /// System audio, when the host has an endpoint we can capture.
+    audio: Option<AudioCapture>,
 }
 
 impl DesktopCapture {
@@ -100,6 +106,27 @@ impl DesktopCapture {
             clock,
             output,
             running: None,
+            audio_rx: None,
+        }
+    }
+
+    /// Begin loopback capture of the host's system audio, stashing the
+    /// receiver for `audio()`.
+    ///
+    /// Audio is independent of the video path — it works the same under either
+    /// [`CaptureOutput`] — and a host with no audio endpoint should still
+    /// stream, so a failure here is a warning rather than an error.
+    fn start_audio(&mut self) -> Option<AudioCapture> {
+        let (sink, rx) = audio_channel();
+        match crate::audio::start(sink, self.clock.clone()) {
+            Ok(capture) => {
+                self.audio_rx = Some(rx);
+                Some(capture)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no system audio; streaming video only");
+                None
+            }
         }
     }
 }
@@ -212,11 +239,13 @@ impl RenderSource for DesktopCapture {
             .StartCapture()
             .map_err(|e| Error::Capture(format!("StartCapture: {e}")))?;
 
+        let audio = self.start_audio();
         self.running = Some(Running {
             pool,
             session,
             frame_arrived,
             sink,
+            audio,
         });
         tracing::info!(
             display = self.display.name,
@@ -226,6 +255,10 @@ impl RenderSource for DesktopCapture {
             "Windows Graphics Capture started"
         );
         Ok(())
+    }
+
+    fn audio(&mut self) -> Option<AudioReceiver> {
+        self.audio_rx.take()
     }
 
     fn handle_input(&mut self, _event: InputEvent) -> InputDisposition {
@@ -241,12 +274,16 @@ impl RenderSource for DesktopCapture {
     }
 
     fn stop(&mut self) -> Result<()> {
-        if let Some(running) = self.running.take() {
+        if let Some(mut running) = self.running.take() {
+            if let Some(audio) = &mut running.audio {
+                audio.stop();
+            }
             let _ = running.pool.RemoveFrameArrived(running.frame_arrived);
             let _ = running.session.Close();
             let _ = running.pool.Close();
             running.sink.close();
         }
+        self.audio_rx = None;
         Ok(())
     }
 }
