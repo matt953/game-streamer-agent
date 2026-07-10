@@ -178,7 +178,10 @@ impl crate::Injector for WinInjector {
             // with no ViGEmBus, must not connect to the driver just to learn
             // there is nothing to remove.
             InputEvent::GamepadDisconnect { seat, .. } => {
-                let removed = self.gamepad.as_mut().is_some_and(|pad| pad.remove_seat(*seat));
+                let removed = self
+                    .gamepad
+                    .as_mut()
+                    .is_some_and(|pad| pad.remove_seat(*seat));
                 removed.then_some(crate::InputFeedback::GamepadDisconnected { seat: *seat })
             }
             // GamepadMotion has no XInput equivalent; touch/pen on the

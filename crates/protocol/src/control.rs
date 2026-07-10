@@ -40,7 +40,10 @@ pub enum A2C {
     SessionStarted(SessionParams),
     SessionEvent(SessionEvent),
     Error(ProtoErrorMsg),
-    Pong { client_ts_us: u64, agent_ts_us: u64 },
+    Pong {
+        client_ts_us: u64,
+        agent_ts_us: u64,
+    },
     /// A user-facing async notification (host → client), for the client to
     /// surface however it likes (a toast, etc.). Distinct from [`SessionEvent`],
     /// which the client's *pipeline* reacts to; this is purely informational and
@@ -157,7 +160,9 @@ mod tests {
             5
         );
         assert_eq!(
-            position(&A2C::Notification(Notification::GamepadConnected { seat: 0 })),
+            position(&A2C::Notification(Notification::GamepadConnected {
+                seat: 0
+            })),
             6
         );
     }

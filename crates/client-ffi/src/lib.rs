@@ -119,14 +119,12 @@ pub struct GsaCallbacks {
     >,
     /// Interleaved-i16 PCM, 48 kHz stereo. `samples` counts i16 values (frames
     /// × 2), not bytes.
-    pub on_audio:
-        Option<unsafe extern "C" fn(ctx: *mut c_void, pcm: *const i16, samples: usize)>,
+    pub on_audio: Option<unsafe extern "C" fn(ctx: *mut c_void, pcm: *const i16, samples: usize)>,
     /// A user-facing notification pushed by the host (a toast, etc.). `kind` is
     /// a `GSA_NOTIFY_*` value; `arg` is kind-specific (the gamepad seat for the
     /// gamepad kinds). Fires on a dedicated thread. Unknown kinds should be
     /// ignored so new ones stay backward-compatible.
-    pub on_notification:
-        Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32, arg: u32)>,
+    pub on_notification: Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32, arg: u32)>,
 }
 
 /// `on_notification` kinds. Stable across the ABI; append new values.
@@ -438,7 +436,11 @@ async fn session_loop(
             return;
         }
     };
-    if client.start_session(SourceId(source_id), None).await.is_err() {
+    if client
+        .start_session(SourceId(source_id), None)
+        .await
+        .is_err()
+    {
         let _ = ready_tx.send(SessionReady::Failed);
         return;
     }

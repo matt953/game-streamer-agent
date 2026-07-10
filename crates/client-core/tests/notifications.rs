@@ -24,7 +24,9 @@ async fn gamepad_connected_notification_reaches_the_client() {
         .take_control_events()
         .expect("control events available");
 
-    agent.push(A2C::Notification(Notification::GamepadConnected { seat: 1 }));
+    agent.push(A2C::Notification(Notification::GamepadConnected {
+        seat: 1,
+    }));
 
     let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
         .await
@@ -46,13 +48,18 @@ async fn gamepad_disconnected_notification_reaches_the_client() {
         .take_control_events()
         .expect("control events available");
 
-    agent.push(A2C::Notification(Notification::GamepadDisconnected { seat: 0 }));
+    agent.push(A2C::Notification(Notification::GamepadDisconnected {
+        seat: 0,
+    }));
 
     let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
         .await
         .expect("notification within timeout")
         .expect("channel stayed open");
-    assert!(matches!(event, ControlEvent::GamepadDisconnected { seat: 0 }));
+    assert!(matches!(
+        event,
+        ControlEvent::GamepadDisconnected { seat: 0 }
+    ));
 
     client.close().await;
 }
