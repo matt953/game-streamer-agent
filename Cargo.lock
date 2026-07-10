@@ -1183,6 +1183,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gsa-client-ffi"
+version = "0.1.0"
+dependencies = [
+ "gsa-client-core",
+ "gsa-core",
+ "tokio",
+]
+
+[[package]]
 name = "gsa-core"
 version = "0.1.0"
 dependencies = [

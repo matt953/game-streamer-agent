@@ -1,0 +1,28 @@
+[package]
+name = "gsa-client-ffi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "C ABI (+ future JNI) wrapper embedding gsa-client-core into the mobile host apps"
+
+[lib]
+# rlib so the app's `shared` crate can depend on it; staticlib so it can also be
+# linked standalone.
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+gsa-client-core = { workspace = true }
+gsa-core = { workspace = true }
+tokio = { workspace = true }
+
+# FFI crate: opts out of the workspace-wide `unsafe_code = "forbid"`. Every
+# unsafe block carries a SAFETY comment (undocumented_unsafe_blocks = deny).
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

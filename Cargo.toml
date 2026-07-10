@@ -11,6 +11,7 @@ members = [
     "crates/encode-sw",
     "crates/session",
     "crates/client-core",
+    "crates/client-ffi",
     "crates/client-dev",
     "crates/capture-macos",
     "crates/capture-windows",
@@ -38,6 +39,7 @@ gsa-sources = { path = "crates/sources" }
 gsa-encode-sw = { path = "crates/encode-sw" }
 gsa-session = { path = "crates/session" }
 gsa-client-core = { path = "crates/client-core" }
+gsa-client-ffi = { path = "crates/client-ffi" }
 gsa-capture-macos = { path = "crates/capture-macos" }
 gsa-capture-windows = { path = "crates/capture-windows" }
 gsa-encode-nvenc = { path = "crates/encode-nvenc" }
