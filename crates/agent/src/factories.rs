@@ -1,7 +1,8 @@
 //! Source and encoder factories. Everywhere: the TestPattern source +
 //! software encoder (GPU-free, CI-friendly). On macOS additionally: real
 //! displays via ScreenCaptureKit paired with the VideoToolbox hardware
-//! encoder (spec 02/03).
+//! encoder (spec 02/03). On Windows: displays via Windows Graphics Capture,
+//! still on the software encoder until the M4 hardware backend lands.
 
 use gsa_capture_api::{RenderSource, SourceDescriptor};
 use gsa_core::id::SourceId;
@@ -38,7 +39,20 @@ impl Sources {
         )))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    fn create_display(&self, id: SourceId) -> Result<Box<dyn RenderSource>> {
+        let display = gsa_capture_windows::list_displays()?
+            .into_iter()
+            .find(|d| d.id == id.0)
+            .ok_or_else(|| Error::Session(format!("unknown display {id:?}")))?;
+        Ok(Box::new(gsa_capture_windows::DesktopCapture::new(
+            id,
+            display,
+            self.clock.clone(),
+        )))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn create_display(&self, id: SourceId) -> Result<Box<dyn RenderSource>> {
         Err(Error::Session(format!("unknown source {id:?}")))
     }
@@ -60,7 +74,24 @@ impl Sources {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    fn display_descriptors(&self) -> Vec<SourceDescriptor> {
+        match gsa_capture_windows::list_displays() {
+            Ok(displays) => displays
+                .into_iter()
+                .map(|d| {
+                    gsa_capture_windows::DesktopCapture::new(SourceId(d.id), d, self.clock.clone())
+                        .descriptor()
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "display enumeration failed");
+                Vec::new()
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn display_descriptors(&self) -> Vec<SourceDescriptor> {
         Vec::new() // platform capture backends land at M4/M5
     }
@@ -103,6 +134,12 @@ impl EncoderFactory for Encoders {
             SourceKind::Display | SourceKind::VirtualDisplay => Ok(Box::new(
                 gsa_encode_videotoolbox::VideoToolboxEncoder::new(self.clock.clone()),
             )),
+            // Windows Graphics Capture reads back BGRA8 CPU frames, so the
+            // software encoder takes them as-is until NVENC/MF lands (M4).
+            #[cfg(target_os = "windows")]
+            SourceKind::Display | SourceKind::VirtualDisplay => {
+                Ok(Box::new(gsa_encode_sw::SwEncoder::new(self.clock.clone())))
+            }
             other => Err(Error::Encode(format!(
                 "no encoder for source kind {other:?}"
             ))),

@@ -4,9 +4,9 @@
 
 use serde::Serialize;
 
-// `Ok` is only constructed by the macOS checks; on other platforms host
+// `Ok` is only constructed by the macOS/Windows checks; elsewhere host
 // support isn't implemented yet, so allow the variant to be unused there.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Level {
@@ -46,7 +46,14 @@ fn collect() -> Vec<Check> {
     checks
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn collect() -> Vec<Check> {
+    let mut checks = Vec::new();
+    windows_checks(&mut checks);
+    checks
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn collect() -> Vec<Check> {
     vec![Check {
         name: "host capture",
@@ -93,6 +100,53 @@ fn macos_checks(checks: &mut Vec<Check>) {
 
     // Display enumeration — confirms the capture backend actually works.
     match gsa_capture_macos::list_displays() {
+        Ok(displays) if !displays.is_empty() => checks.push(Check {
+            name: "display capture",
+            level: Level::Ok,
+            detail: format!("{} display(s) available", displays.len()),
+        }),
+        Ok(_) => checks.push(Check {
+            name: "display capture",
+            level: Level::Warn,
+            detail: "no displays enumerated".into(),
+        }),
+        Err(e) => checks.push(Check {
+            name: "display capture",
+            level: Level::Fail,
+            detail: format!("enumeration failed: {e}"),
+        }),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_checks(checks: &mut Vec<Check>) {
+    // Windows Graphics Capture — the capture API itself, present since 1903.
+    if gsa_capture_windows::capture_supported() {
+        checks.push(Check {
+            name: "graphics capture",
+            level: Level::Ok,
+            detail: "supported".into(),
+        });
+    } else {
+        checks.push(Check {
+            name: "graphics capture",
+            level: Level::Fail,
+            detail: "Windows.Graphics.Capture unavailable — needs Windows 10 1903 or later".into(),
+        });
+    }
+
+    // SendInput needs no grant, but UIPI silently drops injection into a
+    // window owned by a higher-integrity process.
+    if gsa_input::injection_authorized() == Some(true) {
+        checks.push(Check {
+            name: "input injection",
+            level: Level::Ok,
+            detail: "SendInput available; run elevated to control elevated apps".into(),
+        });
+    }
+
+    // Display enumeration — confirms the capture backend actually works.
+    match gsa_capture_windows::list_displays() {
         Ok(displays) if !displays.is_empty() => checks.push(Check {
             name: "display capture",
             level: Level::Ok,

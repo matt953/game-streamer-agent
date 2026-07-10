@@ -1031,6 +1031,7 @@ dependencies = [
  "clap",
  "gsa-capture-api",
  "gsa-capture-macos",
+ "gsa-capture-windows",
  "gsa-core",
  "gsa-encode-api",
  "gsa-encode-sw",
