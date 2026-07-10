@@ -155,7 +155,12 @@ pub fn start(
             };
             for d in datagrams {
                 if let Err(e) = conn.send_datagram(bytes::Bytes::from(d)) {
-                    tracing::info!(error = %e, "datagram send failed; sender exiting");
+                    match e {
+                        quinn::SendDatagramError::ConnectionLost(_) => {
+                            tracing::info!("client disconnected; stopping video sender")
+                        }
+                        other => tracing::warn!(error = %other, "video sender stopped on error"),
+                    }
                     return;
                 }
             }
