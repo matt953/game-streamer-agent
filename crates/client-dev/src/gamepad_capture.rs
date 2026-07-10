@@ -62,7 +62,9 @@ impl GamepadCapture {
 
         // gamepads() can be empty until the first drain (macOS populates it
         // lazily), so announce on first sight here rather than at construction.
-        let Some((_, pad)) = self.gilrs.gamepads().next() else {
+        // `is_connected` filters out a pad gilrs keeps listed after it drops —
+        // otherwise a powered-off controller reads as still present.
+        let Some((_, pad)) = self.gilrs.gamepads().find(|(_, p)| p.is_connected()) else {
             // Pad gone: log it once and release everything on the host so a held
             // button doesn't stick. The host virtual pad stays *plugged* until
             // GamepadDisconnect propagation lands (spec 07 announce model).
