@@ -18,6 +18,10 @@ gsa-client-core = { workspace = true }
 gsa-core = { workspace = true }
 tokio = { workspace = true }
 
+# Apple only: raise the streaming threads' QoS (pthread_set_qos_class_self_np).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
 # FFI crate: opts out of the workspace-wide `unsafe_code = "forbid"`. Every
 # unsafe block carries a SAFETY comment (undocumented_unsafe_blocks = deny).
 [lints.rust]

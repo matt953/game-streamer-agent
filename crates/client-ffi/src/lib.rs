@@ -196,9 +196,20 @@ pub unsafe extern "C" fn gsa_session_start(
 
     let thread = std::thread::spawn(move || {
         let cbs = cbs; // move the whole callback set onto this thread
-        let Ok(rt) = tokio::runtime::Runtime::new() else {
-            let _ = ready_tx.send(SessionReady::Failed);
-            return;
+        // This thread drives the receive loop and the `on_video` hand-off; its
+        // tokio workers carry the network I/O. Boost all of them so the OS
+        // schedules the real-time path promptly under contention.
+        boost_thread_qos();
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .on_thread_start(boost_thread_qos)
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(_) => {
+                let _ = ready_tx.send(SessionReady::Failed);
+                return;
+            }
         };
         rt.block_on(session_loop(addr, source_id, cbs, thread_stop, ready_tx));
     });
@@ -297,6 +308,22 @@ fn now_us() -> u64 {
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
 }
+
+/// Raise the calling thread to `USER_INITIATED` QoS on Apple platforms, so the
+/// OS schedules the real-time receive/decode/audio path promptly under
+/// contention (`USER_INTERACTIVE` is reserved for UI). These threads block on
+/// I/O rather than spin, so this only affects *when* they wake, not fairness.
+/// No-op on other platforms (Android/desktop use their own mechanisms).
+#[cfg(target_vendor = "apple")]
+fn boost_thread_qos() {
+    // SAFETY: sets only the calling thread's QoS class; always safe to call.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn boost_thread_qos() {}
 
 /// Kind of a source, as reported to [`gsa_list_sources`]. Values are stable
 /// across the ABI; `Unknown` covers future variants. Non-`TestPattern` display
@@ -431,6 +458,7 @@ async fn session_loop(
     let audio_ctx = SendPtr(cbs.ctx);
     let on_audio = cbs.on_audio;
     let audio_thread = std::thread::spawn(move || {
+        boost_thread_qos(); // audio must not be starved by background work
         let audio_ctx = audio_ctx;
         while let Ok(pcm) = audio_rx.recv() {
             if let Some(cb) = on_audio {
