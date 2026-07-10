@@ -22,8 +22,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+      # libudev: gilrs reaches controllers through udev on Linux, and its
+      # -sys crate's build script hard-fails without the pkg-config file.
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       # rust-toolchain.toml pins the version; bare `cargo build` on a fresh
       # runner IS the fresh-clone invariant (spec 01).
       - uses: dtolnay/rust-toolchain@stable
@@ -48,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.93"
@@ -69,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.93"
