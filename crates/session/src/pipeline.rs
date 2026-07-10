@@ -83,7 +83,10 @@ pub fn start(
     // If the source captures audio, run the audio pipeline beside the video one.
     let audio = match source.audio() {
         Some(rx) => Some(crate::audio_pipeline::start(rx, conn.clone())?),
-        None => None,
+        None => {
+            tracing::info!("source captures no audio; video only");
+            None
+        }
     };
 
     let stop = Arc::new(AtomicBool::new(false));

@@ -14,6 +14,11 @@ use gsa_protocol::datagram::AudioDatagramHeader;
 /// Opus target bitrate for stereo game audio (spec 07: 96–160 kbps).
 const AUDIO_BITRATE_BPS: u32 = 128_000;
 
+/// Packets between heartbeat logs — one second of 5 ms frames. A silent stream
+/// looks identical to a working one from the outside, so the heartbeat is the
+/// only way to tell "no sound is playing" from "audio never reached the wire".
+const HEARTBEAT_PACKETS: u16 = 1000 / gsa_audio::FRAME_MS as u16;
+
 /// Accumulates variable-size capture buffers and emits exact 5 ms Opus frames
 /// (`FRAME_INTERLEAVED` interleaved samples). Carries the capture timestamp of
 /// the most recent input for wire stamping.
@@ -99,6 +104,9 @@ pub fn start(rx: AudioReceiver, conn: quinn::Connection) -> gsa_core::Result<Aud
                             if tx.send(hdr.encode_with_payload(&opus)).is_err() {
                                 return; // sender task gone (connection closed)
                             }
+                            if seq.is_multiple_of(HEARTBEAT_PACKETS) {
+                                tracing::debug!(seq, bytes = opus.len(), "audio flowing");
+                            }
                         }
                         Err(e) => tracing::warn!(error = %e, "opus encode failed"),
                     }
@@ -106,6 +114,7 @@ pub fn start(rx: AudioReceiver, conn: quinn::Connection) -> gsa_core::Result<Aud
             }
         })
         .map_err(|e| gsa_core::Error::Session(format!("spawn audio thread: {e}")))?;
+    tracing::info!(bitrate = AUDIO_BITRATE_BPS, "audio pipeline started");
 
     tokio::spawn(async move {
         while let Some(datagram) = packet_rx.recv().await {
