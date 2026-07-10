@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use gsa_client_core::{Client, DecodedFrame, PixelOrder, ServerAuth, SourceKind, VideoDecoder};
+use gsa_client_core::{
+    Client, DecodedFrame, GamepadInput, InputEvent, InputSender, PixelOrder, ServerAuth, SourceKind,
+    VideoDecoder,
+};
 use gsa_core::id::SourceId;
 use gsa_core::media::H264Profile;
 use tokio::sync::Notify;
@@ -133,6 +136,16 @@ unsafe impl Send for SendCallbacks {}
 pub struct GsaSession {
     stop: Arc<Notify>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Sync input sink (input events → reliable control stream). Present once
+    /// the session is streaming; `None` if input couldn't be enabled.
+    input: Option<InputSender>,
+}
+
+/// Handed back from `session_loop` once it knows the outcome: whether the
+/// session reached the streaming state, and its input sink if so.
+enum SessionReady {
+    Failed,
+    Streaming(Option<InputSender>),
 }
 
 /// Connect anonymously to the agent at `url` (host:port), start the source
@@ -166,23 +179,25 @@ pub unsafe extern "C" fn gsa_session_start(
     let stop = Arc::new(Notify::new());
     let cbs = SendCallbacks(callbacks);
     let thread_stop = stop.clone();
-    // Signals whether the session reached the streaming state before we hand a
-    // handle back; keeps failures synchronous rather than a silently-dead thread.
-    let (ready_tx, ready_rx) = channel::<bool>();
+    // Signals whether the session reached the streaming state (and its input
+    // sink) before we hand a handle back; keeps failures synchronous rather
+    // than a silently-dead thread.
+    let (ready_tx, ready_rx) = channel::<SessionReady>();
 
     let thread = std::thread::spawn(move || {
         let cbs = cbs; // move the whole callback set onto this thread
         let Ok(rt) = tokio::runtime::Runtime::new() else {
-            let _ = ready_tx.send(false);
+            let _ = ready_tx.send(SessionReady::Failed);
             return;
         };
         rt.block_on(session_loop(addr, source_id, cbs, thread_stop, ready_tx));
     });
 
     match ready_rx.recv() {
-        Ok(true) => Box::into_raw(Box::new(GsaSession {
+        Ok(SessionReady::Streaming(input)) => Box::into_raw(Box::new(GsaSession {
             stop,
             thread: Some(thread),
+            input,
         })),
         _ => {
             let _ = thread.join();
@@ -207,6 +222,70 @@ pub unsafe extern "C" fn gsa_session_stop(session: *mut GsaSession) {
     if let Some(t) = session.thread.take() {
         let _ = t.join();
     }
+}
+
+/// Send a full gamepad state snapshot for `seat`. Fire-and-forget; the first
+/// snapshot plugs the host's virtual pad (spec 07). `buttons` is XInput's
+/// `wButtons` layout in the low 16 bits; sticks are full-range i16 with +Y up,
+/// triggers are `0..=i16::MAX`. Cheap + thread-safe — call from the input
+/// thread on every change.
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`] (not yet stopped).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_send_gamepad(
+    session: *mut GsaSession,
+    seat: u8,
+    buttons: u32,
+    lx: i16,
+    ly: i16,
+    rx: i16,
+    ry: i16,
+    lt: i16,
+    rt: i16,
+) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract guarantees a live handle; `input` is set at
+    // creation and never mutated, so a shared read is sound.
+    let session = unsafe { &*session };
+    if let Some(input) = &session.input {
+        input.send(vec![InputEvent::Gamepad(GamepadInput {
+            seat,
+            buttons,
+            axes: [lx, ly, rx, ry, lt, rt, 0, 0],
+            ts_us: now_us(),
+        })]);
+    }
+}
+
+/// Tell the host the controller for `seat` went away — unplug its virtual pad
+/// rather than leave it frozen at neutral (spec 07).
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`] (not yet stopped).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_send_gamepad_disconnect(session: *mut GsaSession, seat: u8) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: see `gsa_send_gamepad`.
+    let session = unsafe { &*session };
+    if let Some(input) = &session.input {
+        input.send(vec![InputEvent::GamepadDisconnect {
+            seat,
+            ts_us: now_us(),
+        }]);
+    }
+}
+
+fn now_us() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 /// Kind of a source, as reported to [`gsa_list_sources`]. Values are stable
@@ -303,14 +382,14 @@ async fn session_loop(
     source_id: u32,
     cbs: SendCallbacks,
     stop: Arc<Notify>,
-    ready_tx: std::sync::mpsc::Sender<bool>,
+    ready_tx: std::sync::mpsc::Sender<SessionReady>,
 ) {
     let cbs = cbs.0;
     let mut client =
         match Client::connect(addr, "gsa-app", H264Profile::High, ServerAuth::Open).await {
             Ok(c) => c,
             Err(_) => {
-                let _ = ready_tx.send(false);
+                let _ = ready_tx.send(SessionReady::Failed);
                 return;
             }
         };
@@ -318,15 +397,18 @@ async fn session_loop(
     let audio_rx = match client.take_audio_output() {
         Ok(rx) => rx,
         Err(_) => {
-            let _ = ready_tx.send(false);
+            let _ = ready_tx.send(SessionReady::Failed);
             return;
         }
     };
     if client.start_session(SourceId(source_id), None).await.is_err() {
-        let _ = ready_tx.send(false);
+        let _ = ready_tx.send(SessionReady::Failed);
         return;
     }
-    let _ = ready_tx.send(true);
+    // Hand the sync input sink back with the ready signal; it also routes the
+    // recv loop's keyframe requests through its background writer task.
+    let input = client.take_input_sender();
+    let _ = ready_tx.send(SessionReady::Streaming(input));
 
     // Audio drains on its own thread: PCM must flow steadily even while the
     // receive loop is parked awaiting the next video frame. The channel closes

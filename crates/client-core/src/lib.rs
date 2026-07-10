@@ -11,7 +11,7 @@ mod stats;
 
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
-pub use gsa_protocol::input::{InputEvent, MouseButton, MouseMove};
+pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
 pub use reassembly::Reassembler;
 pub use stats::{ClockSync, LatencyStats, StatsSummary};
 
