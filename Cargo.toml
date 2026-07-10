@@ -13,6 +13,7 @@ members = [
     "crates/client-core",
     "crates/client-dev",
     "crates/capture-macos",
+    "crates/capture-windows",
     "crates/encode-videotoolbox",
     "crates/input",
     "crates/agent",
@@ -37,6 +38,7 @@ gsa-encode-sw = { path = "crates/encode-sw" }
 gsa-session = { path = "crates/session" }
 gsa-client-core = { path = "crates/client-core" }
 gsa-capture-macos = { path = "crates/capture-macos" }
+gsa-capture-windows = { path = "crates/capture-windows" }
 gsa-encode-videotoolbox = { path = "crates/encode-videotoolbox" }
 gsa-input = { path = "crates/input" }
 
@@ -72,6 +74,9 @@ objc2-video-toolbox = "0.3"
 objc2-io-surface = "0.3"
 dispatch2 = "0.3"
 block2 = "0.6"
+
+# Win32/WinRT FFI (Windows backends only)
+windows = "0.62"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
