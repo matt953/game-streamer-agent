@@ -1074,6 +1074,7 @@ dependencies = [
  "gsa-capture-windows",
  "gsa-core",
  "gsa-encode-api",
+ "gsa-encode-nvenc",
  "gsa-encode-sw",
  "gsa-encode-videotoolbox",
  "gsa-input",
@@ -1196,6 +1197,21 @@ dependencies = [
  "bytes",
  "gsa-capture-api",
  "gsa-core",
+]
+
+[[package]]
+name = "gsa-encode-nvenc"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "gsa-capture-api",
+ "gsa-capture-windows",
+ "gsa-core",
+ "gsa-encode-api",
+ "libloading",
+ "openh264",
+ "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]

@@ -1,0 +1,39 @@
+[package]
+name = "gsa-encode-nvenc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "AGPL-3.0-only"
+description = "NVENC hardware H.264 encoder for game-streamer-agent"
+
+[dependencies]
+gsa-core = { workspace = true }
+gsa-capture-api = { workspace = true }
+gsa-encode-api = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+# The NVENC runtime is loaded from the driver at run time, so there is no SDK
+# to install and nothing to link. `capture-windows` supplies the D3D11 frame
+# handle we downcast; on Linux that seam becomes a CUDA buffer and the rest of
+# this crate is unchanged.
+[target.'cfg(windows)'.dependencies]
+gsa-capture-windows = { workspace = true }
+libloading = "0.8"
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common"] }
+
+# FFI crate: opts out of the workspace-wide `unsafe_code = "forbid"` by
+# declaring its own lint table. Unsafe is permitted but every block must
+# carry a // SAFETY comment (undocumented_unsafe_blocks = deny).
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+# The round-trip test decodes our own NVENC output with the reference decoder.
+[target.'cfg(windows)'.dev-dependencies]
+openh264 = { workspace = true }
