@@ -73,6 +73,12 @@ fn transport_config() -> TransportConfig {
     ));
     // Match the OS buffer so quinn isn't the ceiling on bursty drains.
     tc.datagram_receive_buffer_size(Some(SOCKET_BUFFER_BYTES));
+    // Pin the UDP payload to the QUIC baseline (1200 B) and disable Path-MTU
+    // discovery — discovery overshoots on reduced-MTU paths (VPN/5G) and the
+    // oversized datagrams get dropped. (TODO: make this a knob / re-enable
+    // discovery once we handle the back-off correctly across platforms.)
+    tc.initial_mtu(1200);
+    tc.mtu_discovery_config(None);
     tc
 }
 
