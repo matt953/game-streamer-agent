@@ -1,7 +1,7 @@
-//! VideoToolbox hardware H.264 encoder (spec 03). Consumes the
+//! VideoToolbox hardware H.264/HEVC encoder (spec 03). Consumes the
 //! IOSurface-backed CVPixelBuffer captured upstream with no color
-//! conversion, and emits Annex-B bitstream (SPS/PPS inlined on IDR) ready
-//! for the datagram path.
+//! conversion, and emits Annex-B bitstream (parameter sets inlined on IDR)
+//! ready for the datagram path.
 
 use std::ffi::{c_char, c_void};
 use std::ptr::{self, NonNull};
@@ -21,7 +21,8 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
     kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
     kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel, kVTProfileLevel_H264_High_AutoLevel,
-    kVTProfileLevel_H264_Main_AutoLevel, kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
+    kVTProfileLevel_H264_Main_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
+    kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
 };
 
 use gsa_capture_api::GpuFrame;
@@ -34,6 +35,8 @@ use gsa_encode_api::{EncodeConfig, EncodedChunk, Encoder, EncoderCaps, FrameDire
 
 /// H.264 codec FourCC ('avc1').
 const CODEC_H264: CMVideoCodecType = u32::from_be_bytes(*b"avc1");
+/// HEVC codec FourCC ('hvc1').
+const CODEC_HEVC: CMVideoCodecType = u32::from_be_bytes(*b"hvc1");
 /// CFNumber type for a 32-bit signed int (kCFNumberSInt32Type).
 const CF_NUMBER_SINT32: CFNumberType = CFNumberType(3);
 /// CFNumber type for a 64-bit float (kCFNumberFloat64Type).
@@ -45,6 +48,9 @@ pub struct VideoToolboxEncoder {
     clock: MediaClock,
     session: Option<CFRetained<VTCompressionSession>>,
     mode: VideoMode,
+    /// The codec the open session emits; picks the Annex-B parsing rules the
+    /// output handler applies (H.264 vs HEVC NAL layout + parameter sets).
+    codec: Codec,
     /// Assigned in the output handler when a chunk is *emitted* — so frames
     /// VideoToolbox drops/skips leave no hole in the numbering (a hole would
     /// trip the client's loss recovery). Shared with the handler closures.
@@ -80,6 +86,7 @@ impl VideoToolboxEncoder {
                 height: 0,
                 fps: 0,
             },
+            codec: Codec::H264,
             next_frame_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             force_idr: true,
             tx,
@@ -91,8 +98,9 @@ impl VideoToolboxEncoder {
 impl Encoder for VideoToolboxEncoder {
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
-            name: "videotoolbox-h264",
-            codecs: vec![Codec::H264],
+            name: "videotoolbox",
+            // HEVC first: preferred where the client can decode it.
+            codecs: vec![Codec::Hevc, Codec::H264],
             input_formats: vec![PixelFormat::Nv12],
             max_width: 7680,
             max_height: 4320,
@@ -104,12 +112,15 @@ impl Encoder for VideoToolboxEncoder {
     }
 
     fn open(&mut self, cfg: EncodeConfig) -> Result<()> {
-        if cfg.codec != Codec::H264 {
-            return Err(Error::Encode(format!(
-                "VideoToolbox M1 does H264 only, got {:?}",
-                cfg.codec
-            )));
-        }
+        let codec_type = match cfg.codec {
+            Codec::H264 => CODEC_H264,
+            Codec::Hevc => CODEC_HEVC,
+            other => {
+                return Err(Error::Encode(format!(
+                    "VideoToolbox does H264 and HEVC, got {other:?}"
+                )));
+            }
+        };
         // Dedicated low-latency rate control (macOS 11.3+): trims the
         // encoder's pipeline latency vs plain real-time mode (spec 03).
         let spec = single_bool_dict(
@@ -126,7 +137,7 @@ impl Encoder for VideoToolboxEncoder {
                 None,
                 cfg.mode.width as i32,
                 cfg.mode.height as i32,
-                CODEC_H264,
+                codec_type,
                 Some(&spec),
                 None,
                 None,
@@ -153,14 +164,18 @@ impl Encoder for VideoToolboxEncoder {
                 kVTCompressionPropertyKey_ProfileLevel,
             )
         };
-        // Profile negotiated per client (spec 03). SAFETY: `&'static` constants.
+        // H.264 profile is negotiated per client (spec 03); HEVC uses Main (the
+        // `h264_profile` field doesn't apply). SAFETY: `&'static` constants.
         let profile_value = unsafe {
-            match cfg.h264_profile {
-                H264Profile::ConstrainedBaseline => {
-                    kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel
-                }
-                H264Profile::Main => kVTProfileLevel_H264_Main_AutoLevel,
-                H264Profile::High => kVTProfileLevel_H264_High_AutoLevel,
+            match cfg.codec {
+                Codec::Hevc => kVTProfileLevel_HEVC_Main_AutoLevel,
+                _ => match cfg.h264_profile {
+                    H264Profile::ConstrainedBaseline => {
+                        kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel
+                    }
+                    H264Profile::Main => kVTProfileLevel_H264_Main_AutoLevel,
+                    H264Profile::High => kVTProfileLevel_H264_High_AutoLevel,
+                },
             }
         };
         set_bool(&session, real_time, true)?;
@@ -177,6 +192,7 @@ impl Encoder for VideoToolboxEncoder {
 
         self.session = Some(session);
         self.mode = cfg.mode;
+        self.codec = cfg.codec;
         self.next_frame_id
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.force_idr = true;
@@ -220,6 +236,7 @@ impl Encoder for VideoToolboxEncoder {
         let tx = self.tx.clone();
         let clock = self.clock.clone();
         let frame_ids = self.next_frame_id.clone();
+        let codec = self.codec;
         let handler = RcBlock::new(
             move |status: i32, _flags: VTEncodeInfoFlags, sample: *mut CMSampleBuffer| {
                 if status != 0 || sample.is_null() {
@@ -230,7 +247,7 @@ impl Encoder for VideoToolboxEncoder {
                 // Keyframe status is read from the bitstream (IDR NAL), not
                 // the directive — VideoToolbox also emits keyframes on its
                 // own periodic interval.
-                if let Some((kind, data)) = sample_to_annex_b(sample) {
+                if let Some((kind, data)) = sample_to_annex_b(sample, codec) {
                     // Only consume a frame id for frames actually emitted;
                     // no-reordering means handlers fire in submit order.
                     let frame_id =
@@ -406,14 +423,24 @@ fn single_bool_dict(key: &CFString, value: bool) -> Result<CFRetained<CFDictiona
     Ok(dict)
 }
 
-/// Convert a compressed CMSampleBuffer (AVCC length-prefixed) to Annex-B,
-/// detecting keyframes from the bitstream (an IDR-slice NAL) and inlining
-/// SPS/PPS from the format description when it's a keyframe. Returns the
-/// detected [`FrameKind`] and the Annex-B bytes.
-fn sample_to_annex_b(sample: &CMSampleBuffer) -> Option<(FrameKind, Vec<u8>)> {
+/// Convert a compressed CMSampleBuffer (length-prefixed) to Annex-B, detecting
+/// keyframes from the bitstream (an IDR-slice NAL) and inlining the parameter
+/// sets from the format description when it's a keyframe. `codec` selects the
+/// NAL layout: H.264 (type in `nal[0] & 0x1f`; SPS+PPS) or HEVC (type in
+/// `(nal[0] >> 1) & 0x3f`; VPS+SPS+PPS). Returns the detected [`FrameKind`] and
+/// the Annex-B bytes.
+fn sample_to_annex_b(sample: &CMSampleBuffer, codec: Codec) -> Option<(FrameKind, Vec<u8>)> {
     const START_CODE: [u8; 4] = [0, 0, 0, 1];
-    /// H.264 NAL unit type for an IDR-picture slice.
-    const NAL_IDR_SLICE: u8 = 5;
+
+    // Does this NAL start an IDR access unit? H.264: slice type 5. HEVC:
+    // IDR_W_RADL (19) or IDR_N_LP (20).
+    let is_idr_nal = |nal: &[u8]| -> bool {
+        let Some(&b) = nal.first() else { return false };
+        match codec {
+            Codec::Hevc => matches!((b >> 1) & 0x3f, 19 | 20),
+            _ => b & 0x1f == 5,
+        }
+    };
 
     // SAFETY: compressed samples carry a data buffer.
     let block = unsafe { sample.data_buffer() }?;
@@ -425,7 +452,7 @@ fn sample_to_annex_b(sample: &CMSampleBuffer) -> Option<(FrameKind, Vec<u8>)> {
     if status != 0 || data_ptr.is_null() {
         return None;
     }
-    // SAFETY: data_ptr..total_len is the contiguous AVCC payload.
+    // SAFETY: data_ptr..total_len is the contiguous length-prefixed payload.
     let data = unsafe { std::slice::from_raw_parts(data_ptr.cast::<u8>(), total_len) };
 
     // Walk 4-byte-length-prefixed NAL units → Annex-B start codes, noting
@@ -440,7 +467,7 @@ fn sample_to_annex_b(sample: &CMSampleBuffer) -> Option<(FrameKind, Vec<u8>)> {
             break;
         }
         let nal = &data[i..i + nal_len];
-        if nal.first().map(|b| b & 0x1f) == Some(NAL_IDR_SLICE) {
+        if is_idr_nal(nal) {
             is_keyframe = true;
         }
         slices.extend_from_slice(&START_CODE);
@@ -451,9 +478,10 @@ fn sample_to_annex_b(sample: &CMSampleBuffer) -> Option<(FrameKind, Vec<u8>)> {
         return None;
     }
 
-    // Keyframes carry SPS/PPS out-of-band (in the format description); inline
-    // them ahead of the slice so the client's decoder can resync standalone.
-    let mut out = Vec::with_capacity(slices.len() + 64);
+    // Keyframes carry parameter sets out-of-band (in the format description);
+    // inline them ahead of the slice so the client's decoder can resync
+    // standalone. H.264 has 2 (SPS, PPS); HEVC has 3 (VPS, SPS, PPS).
+    let mut out = Vec::with_capacity(slices.len() + 96);
     let fmt = if is_keyframe {
         // SAFETY: compressed samples carry a format description.
         unsafe { sample.format_description() }
@@ -461,19 +489,32 @@ fn sample_to_annex_b(sample: &CMSampleBuffer) -> Option<(FrameKind, Vec<u8>)> {
         None
     };
     if let Some(fmt) = fmt {
-        for idx in 0..2usize {
+        let ps_count = if codec == Codec::Hevc { 3 } else { 2 };
+        for idx in 0..ps_count {
             let mut ps_ptr: *const u8 = ptr::null();
             let mut ps_size: usize = 0;
             // SAFETY: valid format description; out-params are live locals.
             let status = unsafe {
-                objc2_core_media::CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                    &fmt,
-                    idx,
-                    &mut ps_ptr,
-                    &mut ps_size,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                )
+                match codec {
+                    Codec::Hevc => {
+                        objc2_core_media::CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                            &fmt,
+                            idx,
+                            &mut ps_ptr,
+                            &mut ps_size,
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                        )
+                    }
+                    _ => objc2_core_media::CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        &fmt,
+                        idx,
+                        &mut ps_ptr,
+                        &mut ps_size,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                    ),
+                }
             };
             if status != 0 || ps_ptr.is_null() || ps_size == 0 {
                 continue;
