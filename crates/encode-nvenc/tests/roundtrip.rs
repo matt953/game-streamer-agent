@@ -92,24 +92,37 @@ fn frame(device: &ID3D11Device, texture: ID3D11Texture2D, ts: u64) -> GpuFrame {
     }
 }
 
-/// Annex-B NAL unit types, in order. 7 = SPS, 8 = PPS, 5 = IDR, 1 = non-IDR.
-fn nal_types(data: &[u8]) -> Vec<u8> {
+/// Annex-B NAL unit types, in order, extracted with `header`. H.264 packs the
+/// type in the low 5 bits of the byte after the start code; HEVC uses bits 1..6
+/// of a two-byte header. Passing the extractor keeps one start-code scanner.
+fn nal_types(data: &[u8], header: fn(&[u8]) -> u8) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 4 <= data.len() {
         let four = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
         let three = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
         if four {
-            out.push(data[i + 4] & 0x1F);
+            out.push(header(&data[i + 4..]));
             i += 5;
         } else if three {
-            out.push(data[i + 3] & 0x1F);
+            out.push(header(&data[i + 3..]));
             i += 4;
         } else {
             i += 1;
         }
     }
     out
+}
+
+/// H.264: 7 = SPS, 8 = PPS, 5 = IDR, 1 = non-IDR.
+fn h264_nal(rest: &[u8]) -> u8 {
+    rest[0] & 0x1F
+}
+
+/// HEVC: type is bits 1..6 of the first header byte. 32 = VPS, 33 = SPS,
+/// 34 = PPS, 19/20 = IDR, <32 non-IDR VCL.
+fn hevc_nal(rest: &[u8]) -> u8 {
+    (rest[0] >> 1) & 0x3F
 }
 
 fn mean(
@@ -162,7 +175,7 @@ fn encodes_a_d3d11_texture_that_decodes_with_the_right_colours() {
     .expect("submit idr");
     let idr = enc.poll_bitstream().expect("poll").expect("a chunk");
     assert_eq!(idr.kind, FrameKind::Idr, "first frame must be an IDR");
-    let types = nal_types(&idr.data);
+    let types = nal_types(&idr.data, h264_nal);
     assert!(
         types.contains(&7) && types.contains(&8) && types.contains(&5),
         "IDR must carry SPS(7), PPS(8) and an IDR slice(5); got {types:?}"
@@ -206,7 +219,7 @@ fn encodes_a_d3d11_texture_that_decodes_with_the_right_colours() {
     .expect("submit p");
     let p = enc.poll_bitstream().expect("poll").expect("a chunk");
     assert_eq!(p.kind, FrameKind::P, "second frame must not be an IDR");
-    let types = nal_types(&p.data);
+    let types = nal_types(&p.data, h264_nal);
     assert!(
         !types.contains(&5),
         "infinite GOP means no unrequested IDR; got {types:?}"
@@ -222,10 +235,88 @@ fn encodes_a_d3d11_texture_that_decodes_with_the_right_colours() {
     .expect("submit forced idr");
     let forced = enc.poll_bitstream().expect("poll").expect("a chunk");
     assert_eq!(forced.kind, FrameKind::Idr);
-    let types = nal_types(&forced.data);
+    let types = nal_types(&forced.data, h264_nal);
     assert!(
         types.contains(&7) && types.contains(&8),
         "a recovering client needs SPS/PPS on every IDR; got {types:?}"
+    );
+}
+
+/// HEVC has no reference decoder here (openh264 is H.264-only), so this proves
+/// what a decoder-free test can: `initialize` accepts the HEVC path, it emits
+/// Annex-B chunks, VPS/SPS/PPS ride each IDR in-band, and the IDR vs P mapping
+/// the client gates on is intact. The BGRA→NV12 GPU path itself is codec-
+/// agnostic and already colour-verified by the H.264 test above.
+#[test]
+fn hevc_initializes_and_emits_parameter_sets_on_every_idr() {
+    let Some(support) = gsa_encode_nvenc::probe() else {
+        eprintln!("no NVENC on this machine; skipping");
+        return;
+    };
+    let device = gsa_capture_windows::create_device_on(support.adapter_luid).expect("d3d11 device");
+
+    let mode = VideoMode {
+        width: W,
+        height: H,
+        fps: 60,
+    };
+    let mut enc = NvencEncoder::new(MediaClock::new());
+    enc.open(EncodeConfig {
+        codec: Codec::Hevc,
+        mode,
+        bitrate_bps: 20_000_000,
+        // Ignored on the HEVC path (Main is forced); set to a real value.
+        h264_profile: H264Profile::High,
+    })
+    .expect("open hevc");
+
+    let pixels = bgra_halves();
+
+    // ---- frame 0: IDR carrying VPS(32) + SPS(33) + PPS(34) + an IDR slice ----
+    enc.submit(
+        &frame(&device, texture(&device, &pixels), 0),
+        FrameDirectives::default(),
+    )
+    .expect("submit idr");
+    let idr = enc.poll_bitstream().expect("poll").expect("a chunk");
+    assert_eq!(idr.kind, FrameKind::Idr, "first HEVC frame must be an IDR");
+    let types = nal_types(&idr.data, hevc_nal);
+    assert!(
+        types.contains(&32)
+            && types.contains(&33)
+            && types.contains(&34)
+            && types.iter().any(|&t| t == 19 || t == 20),
+        "HEVC IDR must carry VPS(32), SPS(33), PPS(34) and an IDR slice(19/20); got {types:?}"
+    );
+
+    // ---- frame 1: infinite GOP, so no unrequested IDR ----
+    enc.submit(
+        &frame(&device, texture(&device, &pixels), 16_666),
+        FrameDirectives::default(),
+    )
+    .expect("submit p");
+    let p = enc.poll_bitstream().expect("poll").expect("a chunk");
+    assert_eq!(p.kind, FrameKind::P, "second HEVC frame must not be an IDR");
+    let types = nal_types(&p.data, hevc_nal);
+    assert!(
+        !types.iter().any(|&t| t == 19 || t == 20),
+        "infinite GOP means no unrequested IDR; got {types:?}"
+    );
+    assert_eq!(p.frame_id, idr.frame_id.next());
+
+    // ---- a forced keyframe carries the parameter sets again ----
+    enc.force_idr();
+    enc.submit(
+        &frame(&device, texture(&device, &pixels), 33_333),
+        FrameDirectives::default(),
+    )
+    .expect("submit forced idr");
+    let forced = enc.poll_bitstream().expect("poll").expect("a chunk");
+    assert_eq!(forced.kind, FrameKind::Idr);
+    let types = nal_types(&forced.data, hevc_nal);
+    assert!(
+        types.contains(&32) && types.contains(&33) && types.contains(&34),
+        "a recovering client needs VPS/SPS/PPS on every IDR; got {types:?}"
     );
 }
 

@@ -1,5 +1,5 @@
 //! The `Encoder` implementation: a `GpuFrame` carrying a D3D11 texture in,
-//! Annex-B H.264 out, with nothing crossing the PCIe bus in between.
+//! Annex-B H.264 or HEVC out, with nothing crossing the PCIe bus in between.
 
 use bytes::Bytes;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
@@ -49,7 +49,7 @@ pub(crate) fn probe() -> Option<Support> {
     None
 }
 
-/// Hardware H.264 encoder backed by NVENC.
+/// Hardware H.264/HEVC encoder backed by NVENC.
 pub struct NvencEncoder {
     clock: MediaClock,
     config: Option<EncodeConfig>,
@@ -90,8 +90,9 @@ impl NvencEncoder {
                 .config
                 .ok_or_else(|| Error::Encode("encoder not open".into()))?;
             let mut session = Session::open(device)?;
-            session.initialize(cfg.mode, cfg.bitrate_bps, cfg.h264_profile)?;
+            session.initialize(cfg.codec, cfg.mode, cfg.bitrate_bps, cfg.h264_profile)?;
             tracing::info!(
+                codec = ?cfg.codec,
                 width = cfg.mode.width,
                 height = cfg.mode.height,
                 bitrate = cfg.bitrate_bps,
@@ -108,7 +109,8 @@ impl Encoder for NvencEncoder {
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
             name: "nvenc",
-            codecs: vec![Codec::H264],
+            // HEVC first: preferred where the client can decode it.
+            codecs: vec![Codec::Hevc, Codec::H264],
             // WGC gives us BGRA; NVENC converts to NV12 on the GPU.
             input_formats: vec![PixelFormat::Bgra8],
             max_width: MAX_WIDTH,
@@ -123,9 +125,9 @@ impl Encoder for NvencEncoder {
     }
 
     fn open(&mut self, cfg: EncodeConfig) -> Result<()> {
-        if cfg.codec != Codec::H264 {
+        if !matches!(cfg.codec, Codec::H264 | Codec::Hevc) {
             return Err(Error::Encode(format!(
-                "nvenc backend only does H264, got {:?}",
+                "nvenc backend does H264 and HEVC, got {:?}",
                 cfg.codec
             )));
         }

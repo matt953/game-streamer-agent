@@ -121,6 +121,19 @@ pub const NV_ENC_H264_PROFILE_HIGH_GUID: Guid = guid(
     [0xaf, 0x2a, 0xd5, 0x37, 0xc9, 0x2b, 0xe3, 0x10],
 );
 
+pub const NV_ENC_CODEC_HEVC_GUID: Guid = guid(
+    0x790c_dc88,
+    0x4522,
+    0x4d7b,
+    [0x94, 0x25, 0xbd, 0xa9, 0x97, 0x5f, 0x76, 0x03],
+);
+pub const NV_ENC_HEVC_PROFILE_MAIN_GUID: Guid = guid(
+    0xb514_c39a,
+    0xb55b,
+    0x40fa,
+    [0x87, 0x8f, 0xf1, 0x25, 0x3b, 0x4d, 0xfd, 0xec],
+);
+
 /// P3: the fastest preset that still uses a real motion search. P1/P2 trade
 /// too much quality for latency we already have in hand.
 pub const NV_ENC_PRESET_P3_GUID: Guid = guid(
@@ -216,10 +229,50 @@ pub struct NvEncConfigH264 {
     pub reserved2: [*mut c_void; 64],
 }
 
+/// HEVC arm of [`NvEncCodecConfig`]. The VUI block is the same 112-byte layout
+/// as H.264's, so [`NvEncConfigH264Vui`] is reused.
+///
+/// We only ever write `idrPeriod` (offset 20, fixed by the five u32 fields
+/// ahead of it); every other field is left exactly as the preset filled it.
+/// The named fields past that point are documentation transcribed from the SDK
+/// header — the driver reads them at its own offsets — and `reserved1` is sized
+/// so the arm matches H.264's 1792 bytes and leaves the union's size untouched.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NvEncConfigHevc {
+    pub level: u32,
+    pub tier: u32,
+    pub minCUSize: u32,
+    pub maxCUSize: u32,
+    pub bitfields: u32,
+    pub idrPeriod: u32,
+    pub intraRefreshPeriod: u32,
+    pub intraRefreshCnt: u32,
+    pub maxNumRefFramesInDPB: u32,
+    pub ltrNumFrames: u32,
+    pub vpsId: u32,
+    pub spsId: u32,
+    pub ppsId: u32,
+    pub sliceMode: u32,
+    pub sliceModeData: u32,
+    pub maxTemporalLayersMinus1: u32,
+    pub hevcVUIParameters: NvEncConfigH264Vui,
+    pub ltrTrustMode: u32,
+    pub ltrUsageMode: u32,
+    pub numRefL0: u32,
+    pub numRefL1: u32,
+    pub outputBitDepth: u32,
+    pub inputBitDepth: u32,
+    pub tfLevel: u32,
+    pub reserved1: [u32; 269],
+    pub reserved2: [*mut c_void; 64],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union NvEncCodecConfig {
     pub h264Config: NvEncConfigH264,
+    pub hevcConfig: NvEncConfigHevc,
     pub reserved: [u64; 224],
 }
 
@@ -499,6 +552,8 @@ const _: () = {
     assert!(size_of::<NvEncRcParams>() == 128);
     assert!(size_of::<NvEncConfigH264Vui>() == 112);
     assert!(size_of::<NvEncConfigH264>() == 1792);
+    // The HEVC arm must match, so adding it leaves the union's size unchanged.
+    assert!(size_of::<NvEncConfigHevc>() == 1792);
     assert!(size_of::<NvEncCodecConfig>() == 1792);
     assert!(size_of::<NvEncConfig>() == 3584);
     assert!(size_of::<NvEncInitializeParams>() == 1800);
@@ -515,4 +570,7 @@ const _: () = {
     // 4-aligned offset would shift every field after it.
     assert!(align_of::<NvEncConfig>() == 8);
     assert!(align_of::<NvEncPicParams>() == 8);
+    // `idrPeriod` is the only HEVC field we write; pin its offset directly so a
+    // slip in the fields ahead of it is a compile error, not silent corruption.
+    assert!(std::mem::offset_of!(NvEncConfigHevc, idrPeriod) == 20);
 };

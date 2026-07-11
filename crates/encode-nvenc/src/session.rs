@@ -10,7 +10,7 @@ use std::ptr;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::core::Interface;
 
-use gsa_core::media::{H264Profile, VideoMode};
+use gsa_core::media::{Codec, H264Profile, VideoMode};
 use gsa_core::{Error, Result};
 
 use crate::sys::{self, Nvenc};
@@ -105,20 +105,26 @@ impl Session {
         })
     }
 
-    /// Configure the encoder and allocate its output buffer.
+    /// Configure the encoder and allocate its output buffer. `profile` applies
+    /// only to H.264; HEVC uses Main.
     pub(crate) fn initialize(
         &mut self,
+        codec: Codec,
         mode: VideoMode,
         bitrate_bps: u32,
         profile: H264Profile,
     ) -> Result<()> {
-        let mut preset = self.preset_config()?;
+        let codec_guid = codec_guid(codec)?;
+        let mut preset = self.preset_config(codec_guid)?;
         let config = &mut preset.presetCfg;
 
         // Low-latency contract (spec 03): no B-frames, no automatic IDR, CBR
         // sized so one frame's worth of bits never stalls behind the VBV.
         config.version = sys::NV_ENC_CONFIG_VER;
-        config.profileGUID = profile_guid(profile);
+        config.profileGUID = match codec {
+            Codec::Hevc => sys::NV_ENC_HEVC_PROFILE_MAIN_GUID,
+            _ => profile_guid(profile),
+        };
         config.gopLength = sys::NVENC_INFINITE_GOPLENGTH;
         config.frameIntervalP = 1;
         config.rcParams.version = sys::NV_ENC_RC_PARAMS_VER;
@@ -130,20 +136,33 @@ impl Session {
         config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
         config.rcParams.lookaheadDepth = 0;
 
-        // SAFETY: the union's H.264 arm is the one the preset filled, because
-        // we asked for the H.264 preset config.
-        let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
-        h264.idrPeriod = sys::NVENC_INFINITE_GOPLENGTH;
-        // Baseline forbids CABAC; picking the wrong one silently produces a
-        // stream the client cannot decode.
-        h264.entropyCodingMode = match profile {
-            H264Profile::ConstrainedBaseline => sys::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC,
-            _ => sys::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC,
-        };
+        // Only the codec-config union arm differs; the preset filled the one
+        // matching `codec_guid`. Tier and level stay at the preset's auto
+        // defaults — the low-latency contract only needs infinite GOP here.
+        match codec {
+            Codec::Hevc => {
+                // SAFETY: the preset was fetched for the HEVC codec GUID, so
+                // the union's HEVC arm is the initialized one.
+                let hevc = unsafe { &mut config.encodeCodecConfig.hevcConfig };
+                hevc.idrPeriod = sys::NVENC_INFINITE_GOPLENGTH;
+            }
+            _ => {
+                // SAFETY: the preset was fetched for the H.264 codec GUID, so
+                // the union's H.264 arm is the initialized one.
+                let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
+                h264.idrPeriod = sys::NVENC_INFINITE_GOPLENGTH;
+                // Baseline forbids CABAC; picking the wrong one silently
+                // produces a stream the client cannot decode.
+                h264.entropyCodingMode = match profile {
+                    H264Profile::ConstrainedBaseline => sys::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC,
+                    _ => sys::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC,
+                };
+            }
+        }
 
         let mut params = sys::NvEncInitializeParams {
             version: sys::NV_ENC_INITIALIZE_PARAMS_VER,
-            encodeGUID: sys::NV_ENC_CODEC_H264_GUID,
+            encodeGUID: codec_guid,
             presetGUID: sys::NV_ENC_PRESET_P3_GUID,
             encodeWidth: mode.width,
             encodeHeight: mode.height,
@@ -187,7 +206,7 @@ impl Session {
     /// Ask the driver to fill a config for our preset + tuning, then we adjust
     /// only what the low-latency contract requires. Hand-building an
     /// `NV_ENC_CONFIG` from zero would silently diverge from driver defaults.
-    fn preset_config(&self) -> Result<Box<sys::NvEncPresetConfig>> {
+    fn preset_config(&self, codec_guid: sys::Guid) -> Result<Box<sys::NvEncPresetConfig>> {
         let get = self
             .nvenc
             .functions()
@@ -200,11 +219,12 @@ impl Session {
         let mut preset: Box<sys::NvEncPresetConfig> = unsafe { Box::new(std::mem::zeroed()) };
         preset.version = sys::NV_ENC_PRESET_CONFIG_VER;
         preset.presetCfg.version = sys::NV_ENC_CONFIG_VER;
-        // SAFETY: correctly versioned out-param on a live session.
+        // SAFETY: correctly versioned out-param on a live session; the codec
+        // GUID selects which union arm the driver fills.
         let status = unsafe {
             get(
                 self.encoder,
-                sys::NV_ENC_CODEC_H264_GUID,
+                codec_guid,
                 sys::NV_ENC_PRESET_P3_GUID,
                 sys::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 &raw mut *preset,
@@ -425,6 +445,17 @@ impl Drop for Session {
             // SAFETY: the session handle came from nvEncOpenEncodeSessionEx.
             let _ = unsafe { destroy(self.encoder) };
         }
+    }
+}
+
+/// The encode GUID for a codec, or an error for one this backend can't emit.
+/// `open` already screens the codec, so `Av1` here is a caller bug, not user
+/// input.
+fn codec_guid(codec: Codec) -> Result<sys::Guid> {
+    match codec {
+        Codec::H264 => Ok(sys::NV_ENC_CODEC_H264_GUID),
+        Codec::Hevc => Ok(sys::NV_ENC_CODEC_HEVC_GUID),
+        other => Err(Error::Encode(format!("nvenc cannot encode {other:?}"))),
     }
 }
 
