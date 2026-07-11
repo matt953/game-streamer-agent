@@ -69,11 +69,12 @@ pub fn start(
     conn: quinn::Connection,
     mode: VideoMode,
     bitrate_bps: u32,
+    codec: Codec,
     h264_profile: H264Profile,
 ) -> Result<PipelineHandle> {
     let (sink, rx) = frame_channel();
     encoder.open(EncodeConfig {
-        codec: Codec::H264,
+        codec,
         mode,
         bitrate_bps,
         h264_profile,

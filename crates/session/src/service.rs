@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gsa_capture_api::{RenderSource, SourceDescriptor};
 use gsa_core::id::SourceId;
-use gsa_core::media::VideoMode;
+use gsa_core::media::{Codec, VideoMode};
 use gsa_core::{Error, Result};
 use gsa_encode_api::Encoder;
 use gsa_input::InputFeedback;
@@ -31,6 +31,31 @@ pub trait SourceFactory: Send + Sync {
 /// encoder; the test pattern yields CPU/BGRA → software encoder.
 pub trait EncoderFactory: Send + Sync {
     fn create(&self, source_kind: SourceKind) -> Result<Box<dyn Encoder>>;
+
+    /// Codecs the agent can encode, advertised to clients in `HelloAck`
+    /// (advisory — the authoritative choice is made per-session against the
+    /// actual encoder's caps). Default: probe the display encoder's static caps
+    /// (cheap — no session init) and ensure H.264 (the software fallback).
+    fn supported_codecs(&self) -> Vec<Codec> {
+        let mut codecs = self
+            .create(SourceKind::Display)
+            .map(|e| e.caps().codecs)
+            .unwrap_or_default();
+        if !codecs.contains(&Codec::H264) {
+            codecs.push(Codec::H264);
+        }
+        codecs
+    }
+}
+
+/// Pick the codec for a session: the encoder's most-preferred (its caps order)
+/// that the client can also decode, falling back to H.264.
+fn negotiate_codec(client_decodes: &[Codec], encoder_emits: &[Codec]) -> Codec {
+    encoder_emits
+        .iter()
+        .copied()
+        .find(|c| client_decodes.contains(c))
+        .unwrap_or(Codec::H264)
 }
 
 /// Drive one client connection until it closes. The first bi stream the
@@ -68,6 +93,9 @@ async fn serve_inner(
     let mut helloed = false;
     // Client's max decodable H.264 profile (from Hello), negotiated at session start.
     let mut client_h264_profile = gsa_core::media::H264Profile::ConstrainedBaseline;
+    // Codecs the client can decode (from Hello); the session codec is picked from
+    // the intersection with the encoder's caps.
+    let mut client_decode_codecs: Vec<Codec> = vec![Codec::H264];
 
     let result = loop {
         let msg: C2A = match recv_msg(&mut recv).await {
@@ -92,10 +120,12 @@ async fn serve_inner(
                 }
                 helloed = true;
                 client_h264_profile = hello.decode_caps.max_h264_profile;
+                client_decode_codecs = hello.decode_caps.codecs.clone();
                 tracing::info!(
                     peer,
                     client = hello.client_name,
                     ?client_h264_profile,
+                    ?client_decode_codecs,
                     "hello"
                 );
                 send_msg(
@@ -103,7 +133,7 @@ async fn serve_inner(
                     &A2C::HelloAck(HelloAck {
                         proto: PROTO_VERSION,
                         agent_name: hostname(),
-                        encode_codecs: vec![gsa_core::media::Codec::H264],
+                        encode_codecs: encoders.supported_codecs(),
                     }),
                 )
                 .await?;
@@ -140,16 +170,17 @@ async fn serve_inner(
                     peer,
                     &req,
                     client_h264_profile,
+                    &client_decode_codecs,
                 ) {
                     Ok(started) => {
-                        let (mode, bitrate) = (started.mode, started.bitrate);
+                        let (mode, bitrate, codec) = (started.mode, started.bitrate, started.codec);
                         let session_id = started.session.id;
                         active = Some(started.session);
                         send_msg(
                             &mut send,
                             &A2C::SessionStarted(SessionParams {
                                 session: gsa_core::id::SessionId(session_id),
-                                codec: gsa_core::media::Codec::H264,
+                                codec,
                                 mode,
                                 bitrate_bps: bitrate,
                             }),
@@ -249,8 +280,10 @@ struct StartedSession {
     session: ActiveSession,
     mode: VideoMode,
     bitrate: u32,
+    codec: Codec,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_session(
     conn: &quinn::Connection,
     state: &Arc<AgentState>,
@@ -259,10 +292,13 @@ fn start_session(
     peer: &str,
     req: &control::SessionRequest,
     client_h264_profile: gsa_core::media::H264Profile,
+    client_decode_codecs: &[Codec],
 ) -> Result<StartedSession> {
     let source = sources.create(req.source)?;
     let descriptor = source.descriptor();
     let encoder = encoders.create(descriptor.kind())?;
+    // Codec: encoder's most-preferred that the client can decode.
+    let codec = negotiate_codec(client_decode_codecs, &encoder.caps().codecs);
     // Richest profile both sides support: encoder ceiling ∩ client decode cap.
     let h264_profile = encoder.caps().max_h264_profile.min(client_h264_profile);
     // Mode preference: client request > source native > agent config.
@@ -285,7 +321,15 @@ fn start_session(
         _ => None,
     };
 
-    let handle = pipeline::start(source, encoder, conn.clone(), mode, bitrate, h264_profile)?;
+    let handle = pipeline::start(
+        source,
+        encoder,
+        conn.clone(),
+        mode,
+        bitrate,
+        codec,
+        h264_profile,
+    )?;
     let id = state.allocate_session();
     state.register_session(
         id,
@@ -300,6 +344,7 @@ fn start_session(
         session = id,
         ?mode,
         bitrate,
+        ?codec,
         ?h264_profile,
         injecting = injector.is_some(),
         "session started"
@@ -312,6 +357,7 @@ fn start_session(
         },
         mode,
         bitrate,
+        codec,
     })
 }
 
