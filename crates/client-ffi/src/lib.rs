@@ -17,8 +17,38 @@ use gsa_client_core::{
     ServerAuth, SourceKind, VideoDecoder,
 };
 use gsa_core::id::SourceId;
-use gsa_core::media::H264Profile;
+use gsa_core::media::{Codec, H264Profile};
 use tokio::sync::Notify;
+
+/// Codec bit flags for `gsa_session_start`'s `decode_codecs` (a set the embedder
+/// can decode) and the single value `gsa_session_codec` returns (the negotiated
+/// one). H.264 must always be included in `decode_codecs` as the fallback.
+pub const GSA_CODEC_H264: u32 = 1 << 0;
+pub const GSA_CODEC_HEVC: u32 = 1 << 1;
+pub const GSA_CODEC_AV1: u32 = 1 << 2;
+
+fn codecs_from_flags(flags: u32) -> Vec<Codec> {
+    let mut codecs = Vec::new();
+    if flags & GSA_CODEC_HEVC != 0 {
+        codecs.push(Codec::Hevc);
+    }
+    if flags & GSA_CODEC_AV1 != 0 {
+        codecs.push(Codec::Av1);
+    }
+    // H.264 always present as the guaranteed fallback.
+    codecs.push(Codec::H264);
+    codecs
+}
+
+fn codec_to_flag(codec: Codec) -> u32 {
+    match codec {
+        Codec::H264 => GSA_CODEC_H264,
+        Codec::Hevc => GSA_CODEC_HEVC,
+        Codec::Av1 => GSA_CODEC_AV1,
+        // `Codec` is non_exhaustive; an unknown codec maps to no flag.
+        _ => 0,
+    }
+}
 
 /// Counts complete access units without decoding — returns an empty frame so
 /// `recv_frame` hands each reassembled frame back to the loop.
@@ -61,12 +91,18 @@ pub unsafe extern "C" fn gsa_spike_connect(url: *const c_char, seconds: i32) -> 
     };
 
     rt.block_on(async move {
-        let mut client =
-            match Client::connect(addr, "gsa-app-spike", H264Profile::High, ServerAuth::Open).await
-            {
-                Ok(c) => c,
-                Err(_) => return -3,
-            };
+        let mut client = match Client::connect(
+            addr,
+            "gsa-app-spike",
+            H264Profile::High,
+            &[Codec::H264],
+            ServerAuth::Open,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => return -3,
+        };
         let sources = match client.list_sources().await {
             Ok(s) if !s.is_empty() => s,
             _ => return -4,
@@ -147,18 +183,27 @@ pub struct GsaSession {
     /// Sync input sink (input events → reliable control stream). Present once
     /// the session is streaming; `None` if input couldn't be enabled.
     input: Option<InputSender>,
+    /// The negotiated codec (a `GSA_CODEC_*` flag), for `gsa_session_codec`.
+    codec: u32,
 }
 
 /// Handed back from `session_loop` once it knows the outcome: whether the
-/// session reached the streaming state, and its input sink if so.
+/// session reached the streaming state, plus its input sink and negotiated codec.
 enum SessionReady {
     Failed,
-    Streaming(Option<InputSender>),
+    Streaming {
+        input: Option<InputSender>,
+        codec: u32,
+    },
 }
 
 /// Connect anonymously to the agent at `url` (host:port), start the source
 /// `source_id` (from [`gsa_list_sources`]), and stream media to `callbacks`
 /// until [`gsa_session_stop`]. Blocks until the session is streaming (or fails).
+///
+/// `decode_codecs` is the OR of the `GSA_CODEC_*` flags the embedder can decode;
+/// H.264 is always included as the fallback regardless. Query the codec the
+/// agent actually chose with [`gsa_session_codec`].
 ///
 /// Returns an owned session handle, or NULL on failure (bad url, runtime init,
 /// connect, or start-session). Call `gsa_session_stop` to release.
@@ -171,6 +216,7 @@ enum SessionReady {
 pub unsafe extern "C" fn gsa_session_start(
     url: *const c_char,
     source_id: u32,
+    decode_codecs: u32,
     callbacks: GsaCallbacks,
 ) -> *mut GsaSession {
     if url.is_null() {
@@ -209,20 +255,42 @@ pub unsafe extern "C" fn gsa_session_start(
                 return;
             }
         };
-        rt.block_on(session_loop(addr, source_id, cbs, thread_stop, ready_tx));
+        rt.block_on(session_loop(
+            addr,
+            source_id,
+            codecs_from_flags(decode_codecs),
+            cbs,
+            thread_stop,
+            ready_tx,
+        ));
     });
 
     match ready_rx.recv() {
-        Ok(SessionReady::Streaming(input)) => Box::into_raw(Box::new(GsaSession {
+        Ok(SessionReady::Streaming { input, codec }) => Box::into_raw(Box::new(GsaSession {
             stop,
             thread: Some(thread),
             input,
+            codec,
         })),
         _ => {
             let _ = thread.join();
             std::ptr::null_mut()
         }
     }
+}
+
+/// The codec the session negotiated with the agent, as a single `GSA_CODEC_*`
+/// flag — the embedder configures its decoder from this. NULL returns 0.
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_codec(session: *const GsaSession) -> u32 {
+    if session.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract guarantees a live handle.
+    unsafe { &*session }.codec
 }
 
 /// Stop a session started by [`gsa_session_start`], join its threads, and free
@@ -387,11 +455,18 @@ pub unsafe extern "C" fn gsa_list_sources(
     };
 
     rt.block_on(async move {
-        let mut client =
-            match Client::connect(addr, "gsa-app", H264Profile::High, ServerAuth::Open).await {
-                Ok(c) => c,
-                Err(_) => return -3,
-            };
+        let mut client = match Client::connect(
+            addr,
+            "gsa-app",
+            H264Profile::High,
+            &[Codec::H264],
+            ServerAuth::Open,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => return -3,
+        };
         let sources = match client.list_sources().await {
             Ok(s) => s,
             Err(_) => {
@@ -420,19 +495,27 @@ pub unsafe extern "C" fn gsa_list_sources(
 async fn session_loop(
     addr: std::net::SocketAddr,
     source_id: u32,
+    decode_codecs: Vec<Codec>,
     cbs: SendCallbacks,
     stop: Arc<Notify>,
     ready_tx: std::sync::mpsc::Sender<SessionReady>,
 ) {
     let cbs = cbs.0;
-    let mut client =
-        match Client::connect(addr, "gsa-app", H264Profile::High, ServerAuth::Open).await {
-            Ok(c) => c,
-            Err(_) => {
-                let _ = ready_tx.send(SessionReady::Failed);
-                return;
-            }
-        };
+    let mut client = match Client::connect(
+        addr,
+        "gsa-app",
+        H264Profile::High,
+        &decode_codecs,
+        ServerAuth::Open,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = ready_tx.send(SessionReady::Failed);
+            return;
+        }
+    };
     // Enable audio decode before the first recv so no datagrams are dropped.
     let audio_rx = match client.take_audio_output() {
         Ok(rx) => rx,
@@ -457,7 +540,10 @@ async fn session_loop(
     // Hand the sync input sink back with the ready signal; it also routes the
     // recv loop's keyframe requests through its background writer task.
     let input = client.take_input_sender();
-    let _ = ready_tx.send(SessionReady::Streaming(input));
+    let codec = client
+        .negotiated_codec()
+        .map_or(GSA_CODEC_H264, codec_to_flag);
+    let _ = ready_tx.send(SessionReady::Streaming { input, codec });
 
     // Audio drains on its own thread: PCM must flow steadily even while the
     // receive loop is parked awaiting the next video frame. The channel closes

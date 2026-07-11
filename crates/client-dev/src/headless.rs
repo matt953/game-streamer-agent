@@ -37,6 +37,7 @@ pub async fn run(
         addr,
         "client-dev-headless",
         decoder_max_profile(force_sw),
+        &[gsa_core::media::Codec::H264],
         auth.server_auth(),
     )
     .await?;

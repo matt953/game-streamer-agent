@@ -17,9 +17,15 @@ use gsa_protocol::control::{A2C, Notification};
 async fn gamepad_connected_notification_reaches_the_client() {
     let agent = MockAgent::start().await;
 
-    let mut client = Client::connect(agent.addr, "test", H264Profile::High, ServerAuth::Open)
-        .await
-        .expect("connect");
+    let mut client = Client::connect(
+        agent.addr,
+        "test",
+        H264Profile::High,
+        &[gsa_core::media::Codec::H264],
+        ServerAuth::Open,
+    )
+    .await
+    .expect("connect");
     let mut events = client
         .take_control_events()
         .expect("control events available");
@@ -41,9 +47,15 @@ async fn gamepad_connected_notification_reaches_the_client() {
 async fn gamepad_disconnected_notification_reaches_the_client() {
     let agent = MockAgent::start().await;
 
-    let mut client = Client::connect(agent.addr, "test", H264Profile::High, ServerAuth::Open)
-        .await
-        .expect("connect");
+    let mut client = Client::connect(
+        agent.addr,
+        "test",
+        H264Profile::High,
+        &[gsa_core::media::Codec::H264],
+        ServerAuth::Open,
+    )
+    .await
+    .expect("connect");
     let mut events = client
         .take_control_events()
         .expect("control events available");

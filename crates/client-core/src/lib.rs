@@ -177,11 +177,15 @@ impl std::fmt::Debug for Client {
 impl Client {
     /// Connect, exchange hellos, and estimate the agent clock offset.
     /// `max_h264_profile` is the richest profile the embedder's decoder can
-    /// handle — the host encodes at or below it (spec 03).
+    /// handle — the host encodes at or below it (spec 03). `decode_codecs` are
+    /// the codecs the embedder can actually decode (must be non-empty and
+    /// include a fallback the host is sure to support, i.e. H.264); the agent
+    /// picks the negotiated codec from these ([`Client::negotiated_codec`]).
     pub async fn connect(
         addr: std::net::SocketAddr,
         client_name: &str,
         max_h264_profile: gsa_core::media::H264Profile,
+        decode_codecs: &[gsa_core::media::Codec],
         auth: ServerAuth<'_>,
     ) -> Result<Self> {
         let (endpoint, conn) = match auth {
@@ -202,7 +206,7 @@ impl Client {
                 proto: PROTO_VERSION,
                 client_name: client_name.to_string(),
                 decode_caps: DecodeCaps {
-                    codecs: vec![gsa_core::media::Codec::H264],
+                    codecs: decode_codecs.to_vec(),
                     max_h264_profile,
                 },
             }),
@@ -383,6 +387,14 @@ impl Client {
                 "expected session start, got {other:?}"
             ))),
         }
+    }
+
+    /// The codec the agent negotiated for the active session (from
+    /// `SessionStarted`), or `None` before `start_session`. The embedder
+    /// configures its decoder from this.
+    #[must_use]
+    pub fn negotiated_codec(&self) -> Option<gsa_core::media::Codec> {
+        self.session.as_ref().map(|p| p.codec)
     }
 
     /// Receive datagrams until a video frame passes the loss-recovery gate,

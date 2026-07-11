@@ -7,7 +7,7 @@
 //!
 //! ```ignore
 //! let agent = MockAgent::start().await;
-//! let mut client = Client::connect(agent.addr, "t", H264Profile::High, ServerAuth::Open).await?;
+//! let mut client = Client::connect(agent.addr, "t", H264Profile::High, &[Codec::H264], ServerAuth::Open).await?;
 //! let mut events = client.take_control_events().unwrap();
 //! agent.push(A2C::Notification(Notification::GamepadConnected { seat: 0 }));
 //! assert!(matches!(events.recv().await, Some(ControlEvent::GamepadConnected { .. })));

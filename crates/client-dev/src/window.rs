@@ -112,6 +112,7 @@ fn network_loop(
                 addr,
                 "client-dev",
                 crate::decoder::decoder_max_profile(force_sw),
+                &[gsa_core::media::Codec::H264],
                 auth.server_auth(),
             )
             .await?;
