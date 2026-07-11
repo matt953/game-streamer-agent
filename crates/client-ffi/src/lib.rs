@@ -377,7 +377,12 @@ pub unsafe extern "C" fn gsa_list_sources(
     let Ok(addr) = url.parse::<std::net::SocketAddr>() else {
         return -1;
     };
-    let Ok(rt) = tokio::runtime::Runtime::new() else {
+    // Current-thread runtime: this one-shot connect/list/close runs entirely on
+    // the (QoS-elevated) calling thread, with no worker threads to invert on.
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
         return -2;
     };
 
