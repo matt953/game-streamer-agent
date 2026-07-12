@@ -82,6 +82,20 @@ jobs:
           name: latency-ledger-${{ matrix.os }}-${{ github.sha }}
           path: target/e2e-report.json
 
+  chaos:
+    name: abr chaos (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      # Shapes the loopback with tc/netem (2% loss, ~30ms RTT, 20mbit) and
+      # asserts the stream stays playable with ABR on (spec 04 M3 exit).
+      - run: cargo xtask ci-chaos --frames 300
+
   fuzz-smoke:
     name: fuzz smoke
     if: github.event_name == 'push'
