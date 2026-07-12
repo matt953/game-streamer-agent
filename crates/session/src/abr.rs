@@ -60,6 +60,13 @@ impl AbrController {
         self.target_bps
     }
 
+    /// The quality cap (the manual bitrate) — restored as the target when ABR
+    /// is turned off.
+    #[must_use]
+    pub fn ceiling_bps(&self) -> u32 {
+        self.ceiling_bps
+    }
+
     /// Set the quality cap (the manual bitrate); ABR never exceeds it.
     pub fn set_ceiling(&mut self, ceiling_bps: u32) {
         self.ceiling_bps = ceiling_bps;

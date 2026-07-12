@@ -302,9 +302,14 @@ async fn serve_inner(
             }
             C2A::SetAbr { enabled } => {
                 abr_enabled = enabled;
-                // Start adapting from the current bitrate when turned on.
-                if enabled && let (Some(a), Some(ctrl)) = (&active, &mut abr) {
-                    ctrl.sync_target(a.pipeline.bitrate());
+                if let (Some(a), Some(ctrl)) = (&active, &mut abr) {
+                    if enabled {
+                        // Start adapting from the current bitrate.
+                        ctrl.sync_target(a.pipeline.bitrate());
+                    } else {
+                        // Restore the manual bitrate (the ceiling) on disable.
+                        a.pipeline.set_bitrate(ctrl.ceiling_bps());
+                    }
                 }
                 tracing::info!(peer, enabled, "abr toggled by client");
             }
