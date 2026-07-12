@@ -311,6 +311,39 @@ pub unsafe extern "C" fn gsa_session_stop(session: *mut GsaSession) {
     }
 }
 
+/// Set the encode target bitrate (bps). With ABR on this is the ceiling ABR
+/// adapts below; with ABR off it's the live target. Fire-and-forget; NULL is a
+/// no-op. The agent clamps to a sane range.
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`] (not yet stopped).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_set_bitrate(session: *const GsaSession, bitrate_bps: u32) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract guarantees a live handle.
+    if let Some(input) = &unsafe { &*session }.input {
+        input.set_bitrate(bitrate_bps);
+    }
+}
+
+/// Enable/disable server-side ABR for the session. Fire-and-forget; NULL is a
+/// no-op.
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`] (not yet stopped).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_set_abr(session: *const GsaSession, enabled: bool) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract guarantees a live handle.
+    if let Some(input) = &unsafe { &*session }.input {
+        input.set_abr(enabled);
+    }
+}
+
 /// Send a full gamepad state snapshot for `seat`. Fire-and-forget; the first
 /// snapshot plugs the host's virtual pad (spec 07). `buttons` is XInput's
 /// `wButtons` layout in the low 16 bits; sticks are full-range i16 with +Y up,
