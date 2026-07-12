@@ -147,9 +147,10 @@ fn network_loop(
 
             let mut decoder = make_decoder(force_sw)?;
             let mut frames = 0u64;
-            // Latest agent-reported target/emitted bitrate (Mb/s), for the stats log.
+            // Latest agent-reported telemetry (target/emit Mb/s, ABR state), for the log.
             let mut target_mbps: Option<f64> = None;
             let mut emit_mbps: Option<f64> = None;
+            let mut abr_on: Option<bool> = None;
             loop {
                 tokio::select! {
                     frame = client.recv_frame(decoder.as_mut()) => {
@@ -164,6 +165,7 @@ fn network_loop(
                             let s = client.stats();
                             tracing::info!(
                                 frames,
+                                abr = ?abr_on,
                                 target_mbps = ?target_mbps,
                                 emit_mbps = ?emit_mbps,
                                 recv_mbps = ?s.recv_mbps,
@@ -193,10 +195,12 @@ fn network_loop(
                             if let ControlEvent::EncodeStats {
                                 target_bitrate_bps,
                                 emitted_bitrate_bps,
+                                abr_enabled,
                             } = event
                             {
                                 target_mbps = Some(f64::from(target_bitrate_bps) / 1_000_000.0);
                                 emit_mbps = Some(f64::from(emitted_bitrate_bps) / 1_000_000.0);
+                                abr_on = Some(abr_enabled);
                             }
                             let _ = proxy.send_event(AppEvent::Notification(event));
                         }

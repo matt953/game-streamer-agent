@@ -122,6 +122,7 @@ async fn serve_inner(
                     let stats = EncodeStats {
                         target_bitrate_bps: a.pipeline.bitrate(),
                         emitted_bitrate_bps: a.pipeline.emitted_bitrate_bps(),
+                        abr_enabled,
                     };
                     if let Err(e) = send_msg(&mut send, &A2C::EncodeStats(stats)).await {
                         break Err(e);

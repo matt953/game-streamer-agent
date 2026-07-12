@@ -70,6 +70,8 @@ pub struct EncodeStats {
     pub target_bitrate_bps: u32,
     /// Rolling emitted video bitrate (bits/s) over ~1 s — the encoder's output.
     pub emitted_bitrate_bps: u32,
+    /// Whether ABR is driving the bitrate, as the agent has it.
+    pub abr_enabled: bool,
 }
 
 /// User-facing notifications pushed by the agent over the control stream. Add

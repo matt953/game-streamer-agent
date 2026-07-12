@@ -126,6 +126,7 @@ pub enum ControlEvent {
     EncodeStats {
         target_bitrate_bps: u32,
         emitted_bitrate_bps: u32,
+        abr_enabled: bool,
     },
 }
 
@@ -337,6 +338,7 @@ impl Client {
                             .send(ControlEvent::EncodeStats {
                                 target_bitrate_bps: s.target_bitrate_bps,
                                 emitted_bitrate_bps: s.emitted_bitrate_bps,
+                                abr_enabled: s.abr_enabled,
                             })
                             .is_err()
                         {
