@@ -161,6 +161,17 @@ pub struct GsaCallbacks {
     /// gamepad kinds). Fires on a dedicated thread. Unknown kinds should be
     /// ignored so new ones stay backward-compatible.
     pub on_notification: Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32, arg: u32)>,
+    /// Periodic encoder/network telemetry (~1 Hz): agent target + emitted
+    /// bitrate, client received goodput (all bits/s), and the agent's ABR state.
+    pub on_stats: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            target_bps: u32,
+            emitted_bps: u32,
+            recv_bps: u32,
+            abr_enabled: bool,
+        ),
+    >,
 }
 
 /// `on_notification` kinds. Stable across the ABI; append new values.
@@ -595,10 +606,14 @@ async fn session_loop(
         }
     });
 
+    // Latest client received goodput (bps), refreshed off the frame path and
+    // reported alongside the agent's telemetry on each `EncodeStats`.
+    let mut recv_bps: u32 = 0;
+    let mut frames: u64 = 0;
     loop {
         tokio::select! {
             _ = stop.notified() => break,
-            // Agent notification (gamepad plugged, etc.): forward to the embedder.
+            // Agent notification (gamepad plugged) / telemetry: forward to the embedder.
             event = async {
                 match &mut control_rx {
                     Some(rx) => rx.recv().await,
@@ -606,20 +621,25 @@ async fn session_loop(
                 }
             } => {
                 if let Some(event) = event {
-                    let notify = match event {
+                    match event {
                         ControlEvent::GamepadConnected { seat } => {
-                            Some((GSA_NOTIFY_GAMEPAD_CONNECTED, seat as u32))
+                            fire_notification(&cbs, GSA_NOTIFY_GAMEPAD_CONNECTED, seat as u32);
                         }
                         ControlEvent::GamepadDisconnected { seat } => {
-                            Some((GSA_NOTIFY_GAMEPAD_DISCONNECTED, seat as u32))
+                            fire_notification(&cbs, GSA_NOTIFY_GAMEPAD_DISCONNECTED, seat as u32);
                         }
-                        // Encoder telemetry isn't a user notification; no mobile
-                        // surface for it yet, so drop it here.
-                        ControlEvent::EncodeStats { .. } => None,
-                    };
-                    if let (Some((kind, arg)), Some(cb)) = (notify, cbs.on_notification) {
-                        // SAFETY: `ctx` valid for the session per the embedder contract.
-                        unsafe { cb(cbs.ctx, kind, arg) };
+                        ControlEvent::EncodeStats {
+                            target_bitrate_bps,
+                            emitted_bitrate_bps,
+                            abr_enabled,
+                        } => {
+                            if let Some(cb) = cbs.on_stats {
+                                // SAFETY: `ctx` valid for the session per the contract.
+                                unsafe {
+                                    cb(cbs.ctx, target_bitrate_bps, emitted_bitrate_bps, recv_bps, abr_enabled);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -638,6 +658,12 @@ async fn session_loop(
                             )
                         };
                     }
+                    // Refresh received goodput a few times a second (stats() sorts
+                    // its windows, so don't do it every frame).
+                    frames += 1;
+                    if frames.is_multiple_of(15) {
+                        recv_bps = (client.stats().recv_mbps.unwrap_or(0.0) * 1_000_000.0) as u32;
+                    }
                 }
                 _ => break, // closed or errored
             },
@@ -648,6 +674,14 @@ async fn session_loop(
     // channel; the drain thread then ends. Wait for it.
     client.close().await;
     let _ = audio_thread.join();
+}
+
+/// Deliver a `GSA_NOTIFY_*` notification to the embedder, if it registered one.
+fn fire_notification(cbs: &GsaCallbacks, kind: u32, arg: u32) {
+    if let Some(cb) = cbs.on_notification {
+        // SAFETY: `ctx` valid for the session per the embedder contract.
+        unsafe { cb(cbs.ctx, kind, arg) };
+    }
 }
 
 /// Carries a raw `ctx` onto the audio thread. Same embedder contract as
