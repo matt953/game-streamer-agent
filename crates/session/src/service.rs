@@ -106,9 +106,14 @@ async fn serve_inner(
     // the intersection with the encoder's caps.
     let mut client_decode_codecs: Vec<Codec> = vec![Codec::H264];
 
-    // Push the emitted-bitrate telemetry to the client ~1 Hz (spec 04).
-    let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
-    stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Drive ABR from the agent's own QUIC path signals (RTT + loss) on a fast
+    // tick, so it reacts even if client feedback stalls (spec 04); telemetry
+    // rides every 4th tick (~1 Hz).
+    let mut abr_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    abr_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prev_sent_packets = 0u64;
+    let mut prev_lost_packets = 0u64;
+    let mut tick_count = 0u64;
 
     let result = loop {
         let msg: C2A = tokio::select! {
@@ -117,8 +122,28 @@ async fn serve_inner(
                 Err(_) if conn.close_reason().is_some() => break Ok(()),
                 Err(e) => break Err(e),
             },
-            _ = stats_tick.tick() => {
-                if let Some(a) = &active {
+            _ = abr_tick.tick() => {
+                tick_count += 1;
+                let path = conn.stats().path;
+                let sent_delta = path.sent_packets.saturating_sub(prev_sent_packets);
+                let lost_delta = path.lost_packets.saturating_sub(prev_lost_packets);
+                prev_sent_packets = path.sent_packets;
+                prev_lost_packets = path.lost_packets;
+                if abr_enabled
+                    && let (Some(a), Some(ctrl)) = (&active, &mut abr)
+                {
+                    let loss = if sent_delta > 0 {
+                        lost_delta as f64 / sent_delta as f64
+                    } else {
+                        0.0
+                    };
+                    let rtt_us = conn.rtt().as_micros().min(u128::from(u32::MAX)) as u32;
+                    let target = ctrl.on_sample(rtt_us, loss, state.clock.now_us());
+                    a.pipeline.set_bitrate(target);
+                }
+                if tick_count.is_multiple_of(4)
+                    && let Some(a) = &active
+                {
                     let stats = EncodeStats {
                         target_bitrate_bps: a.pipeline.bitrate(),
                         emitted_bitrate_bps: a.pipeline.emitted_bitrate_bps(),
@@ -286,10 +311,7 @@ async fn serve_inner(
             C2A::FrameAck { .. } => { /* full NACK/ref-invalidation ladder lands at M3 (spec 04) */
             }
             C2A::StatsReport(stats) => {
-                if abr_enabled && let (Some(a), Some(ctrl)) = (&active, &mut abr) {
-                    let target = ctrl.on_delay(stats.recent_delay_us, state.clock.now_us());
-                    a.pipeline.set_bitrate(target);
-                }
+                // Informational now — ABR runs off the agent's own path signals.
                 tracing::debug!(peer, ?stats, "client stats");
             }
             C2A::InputBatch(events) => {
