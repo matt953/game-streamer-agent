@@ -38,6 +38,9 @@ struct Cli {
     /// Force the software (openh264) decoder instead of platform hardware.
     #[arg(long)]
     sw_decode: bool,
+    /// Enable server-side ABR for the session (headless; used by the chaos rig).
+    #[arg(long)]
+    abr: bool,
     /// Pair with the agent instead of streaming: enter the code from `gsa pair`.
     #[arg(long)]
     pair: bool,
@@ -75,6 +78,7 @@ fn main() -> Result<()> {
             cli.json,
             cli.source,
             cli.sw_decode,
+            cli.abr,
             auth,
         ))
     } else {

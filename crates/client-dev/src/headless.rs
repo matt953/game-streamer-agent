@@ -23,6 +23,9 @@ struct Report {
     latency_ms_p95: Option<f64>,
     latency_ms_p99: Option<f64>,
     decode_ms_p50: Option<f64>,
+    /// Rolling received video goodput (Mb/s) — used by the chaos rig to check
+    /// ABR converged under a shaped link.
+    recv_mbps: Option<f64>,
 }
 
 pub async fn run(
@@ -31,6 +34,7 @@ pub async fn run(
     json: bool,
     source: Option<String>,
     force_sw: bool,
+    abr: bool,
     auth: crate::pairing::Auth,
 ) -> Result<()> {
     let mut client = Client::connect(
@@ -49,6 +53,18 @@ pub async fn run(
     // Marker verification only means something for the synthetic pattern.
     let check_markers = source.kind == gsa_protocol::control::SourceKind::TestPattern;
     let params = client.start_session(SourceId(source.id.0), None).await?;
+
+    // The chaos rig turns on server-side ABR; keep the sender alive so its
+    // background control writer stays running for the session.
+    let _input = if abr {
+        let input = client.take_input_sender();
+        if let Some(i) = &input {
+            i.set_abr(true);
+        }
+        input
+    } else {
+        None
+    };
 
     let mut decoder = make_decoder(force_sw)?;
     let mut decoded = 0u32;
@@ -96,6 +112,7 @@ pub async fn run(
         latency_ms_p95: stats.latency_ms_p95,
         latency_ms_p99: stats.latency_ms_p99,
         decode_ms_p50: stats.decode_ms_p50,
+        recv_mbps: stats.recv_mbps,
     };
 
     if json {

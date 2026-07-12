@@ -126,6 +126,11 @@ fn run_generator(mode: VideoMode, clock: MediaClock, sink: FrameSink, stop: &Ato
     let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(mode.fps));
     let mut next_deadline = Instant::now();
     let mut index: u32 = 0;
+    // High-entropy fill: incompressible content makes the encoder produce near
+    // its target, so a bandwidth cap actually congests (the normal gradient is
+    // ~80 kbps and never fills a real pipe). For manually stressing ABR on a
+    // hardware encoder — openh264 can't sustain it, so the CI rig doesn't use it.
+    let noise = std::env::var_os("GSA_TESTPATTERN_NOISE").is_some();
 
     tracing::debug!(
         width = w,
@@ -136,7 +141,11 @@ fn run_generator(mode: VideoMode, clock: MediaClock, sink: FrameSink, stop: &Ato
 
     while !stop.load(Ordering::Acquire) {
         let mut buf = vec![0u8; stride * h];
-        draw(&mut buf, w, h, stride, index);
+        if noise {
+            draw_noise(&mut buf, w, h, stride, index);
+        } else {
+            draw(&mut buf, w, h, stride, index);
+        }
         pattern::write_marker_bgra(&mut buf, stride, index);
 
         sink.submit(GpuFrame {
@@ -187,6 +196,28 @@ fn draw(buf: &mut [u8], w: usize, h: usize, stride: usize, index: u32) {
                 buf[px + 1] = 0x28;
                 buf[px + 2] = 64 + g / 3;
             }
+            buf[px + 3] = 0xff;
+        }
+    }
+}
+
+/// Per-pixel pseudo-random fill (deterministic from `index`+position) — the
+/// content barely compresses, so the encoder produces near its target bitrate.
+/// For the chaos rig only; the marker is written over it afterwards.
+fn draw_noise(buf: &mut [u8], w: usize, h: usize, stride: usize, index: u32) {
+    for y in 0..h {
+        let row = y * stride;
+        for x in 0..w {
+            let px = row + x * 4;
+            let mut v = (index as usize).wrapping_mul(2_654_435_761)
+                ^ y.wrapping_mul(40_503)
+                ^ x.wrapping_mul(2_246_822_519);
+            v ^= v >> 13;
+            v = v.wrapping_mul(0x5bd1_e995);
+            v ^= v >> 15;
+            buf[px] = v as u8;
+            buf[px + 1] = (v >> 8) as u8;
+            buf[px + 2] = (v >> 16) as u8;
             buf[px + 3] = 0xff;
         }
     }
