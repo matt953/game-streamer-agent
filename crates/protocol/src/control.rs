@@ -62,6 +62,8 @@ pub enum A2C {
 /// Agent-measured encoder telemetry (spec 04).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncodeStats {
+    /// Live target bitrate (bits/s) the encoder is aiming for.
+    pub target_bitrate_bps: u32,
     /// Rolling emitted video bitrate (bits/s) over ~1 s — the encoder's output.
     pub emitted_bitrate_bps: u32,
 }

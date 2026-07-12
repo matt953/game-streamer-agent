@@ -147,6 +147,9 @@ fn network_loop(
 
             let mut decoder = make_decoder(force_sw)?;
             let mut frames = 0u64;
+            // Latest agent-reported target/emitted bitrate (Mb/s), for the stats log.
+            let mut target_mbps: Option<f64> = None;
+            let mut emit_mbps: Option<f64> = None;
             loop {
                 tokio::select! {
                     frame = client.recv_frame(decoder.as_mut()) => {
@@ -161,6 +164,8 @@ fn network_loop(
                             let s = client.stats();
                             tracing::info!(
                                 frames,
+                                target_mbps = ?target_mbps,
+                                emit_mbps = ?emit_mbps,
                                 recv_mbps = ?s.recv_mbps,
                                 recent_p50 = ?s.recent_latency_ms_p50,
                                 recent_p99 = ?s.recent_latency_ms_p99,
@@ -185,6 +190,14 @@ fn network_loop(
                         }
                     } => {
                         if let Some(event) = event {
+                            if let ControlEvent::EncodeStats {
+                                target_bitrate_bps,
+                                emitted_bitrate_bps,
+                            } = event
+                            {
+                                target_mbps = Some(f64::from(target_bitrate_bps) / 1_000_000.0);
+                                emit_mbps = Some(f64::from(emitted_bitrate_bps) / 1_000_000.0);
+                            }
                             let _ = proxy.send_event(AppEvent::Notification(event));
                         }
                     }
@@ -306,6 +319,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // Encoder telemetry updates the HUD, not a toast.
                     ControlEvent::EncodeStats {
                         emitted_bitrate_bps,
+                        ..
                     } => {
                         self.emitted_mbps = Some(f64::from(emitted_bitrate_bps) / 1_000_000.0);
                         self.update_title();

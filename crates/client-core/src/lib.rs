@@ -122,8 +122,11 @@ pub enum ControlEvent {
     GamepadConnected { seat: u8 },
     /// The host's virtual pad for `seat` was unplugged.
     GamepadDisconnected { seat: u8 },
-    /// Periodic encoder telemetry from the agent (emitted bitrate, bits/s).
-    EncodeStats { emitted_bitrate_bps: u32 },
+    /// Periodic encoder telemetry from the agent (target + emitted bitrate, bits/s).
+    EncodeStats {
+        target_bitrate_bps: u32,
+        emitted_bitrate_bps: u32,
+    },
 }
 
 /// Fire-and-forget input sink, decoupled from the frame-receive loop.
@@ -324,6 +327,7 @@ impl Client {
                     Ok(A2C::EncodeStats(s)) => {
                         if tx
                             .send(ControlEvent::EncodeStats {
+                                target_bitrate_bps: s.target_bitrate_bps,
                                 emitted_bitrate_bps: s.emitted_bitrate_bps,
                             })
                             .is_err()

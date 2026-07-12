@@ -116,6 +116,7 @@ async fn serve_inner(
             _ = stats_tick.tick() => {
                 if let Some(a) = &active {
                     let stats = EncodeStats {
+                        target_bitrate_bps: a.pipeline.bitrate(),
                         emitted_bitrate_bps: a.pipeline.emitted_bitrate_bps(),
                     };
                     if let Err(e) = send_msg(&mut send, &A2C::EncodeStats(stats)).await {
