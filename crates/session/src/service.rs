@@ -19,6 +19,11 @@ use gsa_transport::{recv_msg, send_msg};
 use crate::pipeline;
 use crate::state::{AgentState, SessionEntry};
 
+/// Bitrate clamp band for client `SetBitrate` requests (and, later, ABR): floor
+/// keeps the picture alive on a bad link, ceiling bounds a runaway request.
+const BITRATE_MIN_BPS: u32 = 200_000; // 0.2 Mbps
+const BITRATE_MAX_BPS: u32 = 100_000_000; // 100 Mbps
+
 /// Produces sources on demand (agent wires TestPattern at M0, platform
 /// capture from M1).
 pub trait SourceFactory: Send + Sync {
@@ -220,6 +225,21 @@ async fn serve_inner(
                 if let Some(a) = &active {
                     a.pipeline.request_keyframe();
                     tracing::debug!(peer, session = a.id, "keyframe requested by client");
+                }
+            }
+            C2A::SetBitrate { bitrate_bps } => {
+                if let Some(a) = &active {
+                    // Clamp to a sane band so a bad client can't drive the
+                    // encoder to 0 or a runaway rate (spec 04). ABR uses the
+                    // same pipeline actuator server-side.
+                    let clamped = bitrate_bps.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS);
+                    a.pipeline.set_bitrate(clamped);
+                    tracing::info!(
+                        peer,
+                        session = a.id,
+                        bitrate = clamped,
+                        "bitrate set by client"
+                    );
                 }
             }
             C2A::FrameAck { .. } => { /* full NACK/ref-invalidation ladder lands at M3 (spec 04) */

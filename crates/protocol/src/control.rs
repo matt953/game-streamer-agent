@@ -25,6 +25,12 @@ pub enum C2A {
     /// its reference chain (missed/corrupt frame) and needs to resync
     /// (spec 04 loss-recovery ladder).
     RequestKeyframe,
+    /// Ask the agent to change the live encode target bitrate (bps). The manual
+    /// quality knob; the ABR controller drives the same actuator agent-side
+    /// (spec 04). The agent clamps to a sane range.
+    SetBitrate {
+        bitrate_bps: u32,
+    },
     StatsReport(ClientStats),
     Ping {
         client_ts_us: u64,

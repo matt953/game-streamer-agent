@@ -25,8 +25,11 @@ const GAMEPAD_POLL: std::time::Duration = std::time::Duration::from_millis(4);
 
 #[derive(Debug)]
 enum AppEvent {
-    Ready(gsa_client_core::InputSender),
+    /// Session is streaming: input sink + the agent's starting bitrate (bps).
+    Ready(gsa_client_core::InputSender, u32),
     Frame(Box<DecodedFrame>),
+    /// Rolling received video goodput (Mb/s), for the title HUD.
+    RecvMbps(Option<f64>),
     /// Agent-pushed notification (e.g. host confirmed the virtual pad plugged).
     Notification(ControlEvent),
     StreamEnded(String),
@@ -38,6 +41,7 @@ enum AppEvent {
 struct Toast {
     connected: bool,
     at: Instant,
+    text: String,
 }
 
 impl Toast {
@@ -119,10 +123,10 @@ fn network_loop(
             let sources = client.list_sources().await?;
             tracing::info!("available sources:\n{}", crate::source_list(&sources));
             let source = crate::pick_source(&sources, source.as_deref())?;
-            client.start_session(SourceId(source.id.0), None).await?;
+            let params = client.start_session(SourceId(source.id.0), None).await?;
 
             if let Some(sender) = client.take_input_sender() {
-                let _ = proxy.send_event(AppEvent::Ready(sender));
+                let _ = proxy.send_event(AppEvent::Ready(sender, params.bitrate_bps));
             }
 
             // Start audio playback; keep `_audio` alive for the session. Video
@@ -148,10 +152,16 @@ fn network_loop(
                     frame = client.recv_frame(decoder.as_mut()) => {
                         let Some(out) = frame? else { break };
                         frames += 1;
+                        // Push the rolling received bitrate to the HUD a few
+                        // times a second; log the full stats less often.
+                        if frames.is_multiple_of(30) {
+                            let _ = proxy.send_event(AppEvent::RecvMbps(client.stats().recv_mbps));
+                        }
                         if frames.is_multiple_of(300) {
                             let s = client.stats();
                             tracing::info!(
                                 frames,
+                                recv_mbps = ?s.recv_mbps,
                                 recent_p50 = ?s.recent_latency_ms_p50,
                                 recent_p99 = ?s.recent_latency_ms_p99,
                                 latency_ms_p50 = ?s.latency_ms_p50,
@@ -200,6 +210,30 @@ struct App {
     content_rect: Option<(f32, f32, f32, f32)>,
     gamepad: Option<GamepadCapture>,
     toast: Option<Toast>,
+    /// Client-side view of the live encode bitrate (bps), stepped by the [ / ]
+    /// dev keybinds to exercise the manual bitrate knob (spec 04 ABR actuator).
+    bitrate_bps: u32,
+    /// Rolling received video goodput (Mb/s) from client-core stats, for the HUD.
+    recv_mbps: Option<f64>,
+}
+
+impl App {
+    /// Refresh the window title with the live target bitrate (a lightweight HUD,
+    /// since there's no on-screen text renderer) plus any active toast text.
+    fn update_title(&self) {
+        let Some(w) = &self.window else { return };
+        let mbps = f64::from(self.bitrate_bps) / 1_000_000.0;
+        let mut title = format!("gsa client-dev — target {mbps:.1} Mbps");
+        if let Some(rx) = self.recv_mbps {
+            title.push_str(&format!(" · rx {rx:.1} Mbps"));
+        }
+        title.push_str("  ([ / ] to adjust)");
+        if let Some(toast) = &self.toast {
+            title.push_str(" — ");
+            title.push_str(&toast.text);
+        }
+        w.set_title(&title);
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -236,6 +270,7 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(toast) = &self.toast {
             if toast.expired() {
                 self.toast = None;
+                self.update_title();
             } else if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -246,12 +281,20 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::Ready(sender) => self.input = Some(sender),
+            AppEvent::Ready(sender, bitrate) => {
+                self.input = Some(sender);
+                self.bitrate_bps = bitrate;
+                self.update_title();
+            }
             AppEvent::Frame(frame) => {
                 self.latest = Some(frame);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
+            }
+            AppEvent::RecvMbps(mbps) => {
+                self.recv_mbps = mbps;
+                self.update_title();
             }
             AppEvent::Notification(event) => {
                 let (connected, text) = match event {
@@ -266,9 +309,10 @@ impl ApplicationHandler<AppEvent> for App {
                 self.toast = Some(Toast {
                     connected,
                     at: Instant::now(),
+                    text,
                 });
+                self.update_title();
                 if let Some(w) = &self.window {
-                    w.set_title(&format!("gsa client-dev — {text}"));
                     w.request_redraw();
                 }
             }
@@ -302,6 +346,36 @@ impl ApplicationHandler<AppEvent> for App {
                 is_synthetic: false,
                 ..
             } => {
+                use winit::keyboard::{KeyCode, PhysicalKey};
+                // Dev-only local bitrate knob ([ down / ] up, ±25%) to exercise the
+                // manual bitrate path — intercepted, not forwarded to the host.
+                // (F7/F8 are macOS media keys the OS swallows, so use brackets.)
+                if key.state == winit::event::ElementState::Pressed
+                    && matches!(
+                        key.physical_key,
+                        PhysicalKey::Code(KeyCode::BracketLeft | KeyCode::BracketRight)
+                    )
+                {
+                    if self.input.is_some() {
+                        let up = key.physical_key == PhysicalKey::Code(KeyCode::BracketRight);
+                        let stepped = if up {
+                            u64::from(self.bitrate_bps) * 5 / 4
+                        } else {
+                            u64::from(self.bitrate_bps) * 3 / 4
+                        };
+                        self.bitrate_bps = (stepped as u32).clamp(200_000, 100_000_000);
+                        if let Some(input) = &self.input {
+                            input.set_bitrate(self.bitrate_bps);
+                        }
+                        tracing::info!(
+                            bitrate_bps = self.bitrate_bps,
+                            mbps = f64::from(self.bitrate_bps) / 1_000_000.0,
+                            "bitrate knob ([ = down, ] = up)"
+                        );
+                        self.update_title();
+                    }
+                    return;
+                }
                 if let (Some(input), Some(ev)) = (
                     &self.input,
                     crate::input_capture::key_event(key.physical_key, key.state),

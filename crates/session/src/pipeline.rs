@@ -3,7 +3,7 @@
 //! async world; the tokio side only ever sees encoded chunks.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use gsa_capture_api::{RenderSource, SourceConfig, frame_channel};
@@ -43,12 +43,27 @@ pub struct PipelineHandle {
     /// Set to force the next encoded frame to be an IDR (client loss
     /// recovery, spec 04).
     force_idr: Arc<AtomicBool>,
+    /// Live encode target bitrate (bps). The encode thread applies changes via
+    /// `Encoder::update_rate` and the pacer reads it for its send-rate; this is
+    /// the actuator the manual knob and the ABR controller (spec 04) both drive.
+    bitrate: Arc<AtomicU32>,
 }
 
 impl PipelineHandle {
     /// Request a keyframe on the next frame (client couldn't decode).
     pub fn request_keyframe(&self) {
         self.force_idr.store(true, Ordering::Release);
+    }
+
+    /// Set the live encode target bitrate (bps). Takes effect on the next
+    /// encoded frame; a no-op if unchanged.
+    pub fn set_bitrate(&self, bitrate_bps: u32) {
+        self.bitrate.store(bitrate_bps, Ordering::Relaxed);
+    }
+
+    /// The current live target bitrate (bps).
+    pub fn bitrate(&self) -> u32 {
+        self.bitrate.load(Ordering::Relaxed)
     }
 }
 
@@ -93,13 +108,18 @@ pub fn start(
     let stop = Arc::new(AtomicBool::new(false));
     let frames_sent = Arc::new(AtomicU64::new(0));
     let force_idr = Arc::new(AtomicBool::new(false));
+    let bitrate = Arc::new(AtomicU32::new(bitrate_bps));
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let stop_enc = stop.clone();
     let force_idr_enc = force_idr.clone();
+    let bitrate_enc = bitrate.clone();
     let encode_thread = std::thread::Builder::new()
         .name("gsa-encode".into())
         .spawn(move || {
+            // Applied vs. target bitrate: re-arm the encoder only when the
+            // live target changes (an `update_rate` may cost one IDR, spec 03).
+            let mut applied_bitrate = bitrate_bps;
             // Encode only real captures — never re-encode a held frame to
             // synthesize a keyframe. Capture backends recycle their pooled
             // IOSurfaces after the callback, so a held handle can read back
@@ -111,6 +131,17 @@ pub fn start(
                     }
                     continue;
                 };
+                // Apply a pending bitrate change before encoding this frame.
+                let target_bitrate = bitrate_enc.load(Ordering::Relaxed);
+                if target_bitrate != applied_bitrate {
+                    match encoder.update_rate(target_bitrate) {
+                        Ok(()) => {
+                            applied_bitrate = target_bitrate;
+                            tracing::debug!(bitrate = target_bitrate, "encode bitrate updated");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "update_rate failed"),
+                    }
+                }
                 let directives = FrameDirectives {
                     idr: force_idr_enc.swap(false, Ordering::AcqRel),
                     ..Default::default()
@@ -148,6 +179,7 @@ pub fn start(
         .map_err(|e| Error::Session(format!("spawn encode thread: {e}")))?;
 
     let frames_ctr = frames_sent.clone();
+    let bitrate_pace = bitrate.clone();
     tokio::spawn(async move {
         let mut logged = 0u64;
         while let Some(chunk) = chunk_rx.recv().await {
@@ -168,8 +200,10 @@ pub fn start(
                 }
             };
             // Pace big frames; small ones (static desktop) go out immediately.
-            let pace_bytes_per_sec = (datagrams.len() > PACING_MIN_DATAGRAMS && bitrate_bps > 0)
-                .then(|| f64::from(bitrate_bps) / 8.0 * PACING_GAIN);
+            // Read the live bitrate so pacing tracks ABR / manual changes.
+            let br = bitrate_pace.load(Ordering::Relaxed);
+            let pace_bytes_per_sec = (datagrams.len() > PACING_MIN_DATAGRAMS && br > 0)
+                .then(|| f64::from(br) / 8.0 * PACING_GAIN);
             let frame_start = std::time::Instant::now();
             let mut deadline = frame_start;
             for d in datagrams {
@@ -219,6 +253,7 @@ pub fn start(
         audio,
         frames_sent,
         force_idr,
+        bitrate,
     })
 }
 

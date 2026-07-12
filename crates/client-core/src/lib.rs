@@ -138,6 +138,12 @@ impl InputSender {
             let _ = self.tx.send(C2A::InputBatch(events));
         }
     }
+
+    /// Ask the agent to change the live encode bitrate (bps). The manual quality
+    /// knob; fire-and-forget over the control stream. The agent clamps the value.
+    pub fn set_bitrate(&self, bitrate_bps: u32) {
+        let _ = self.tx.send(C2A::SetBitrate { bitrate_bps });
+    }
 }
 
 pub struct Client {
@@ -438,7 +444,8 @@ impl Client {
             let Some(frame_data) = self.reassembler.push(header, payload) else {
                 continue;
             };
-            self.stats.on_frame_complete();
+            self.stats
+                .on_frame_complete(frame_data.len(), self.clock.now_us());
 
             // Loss recovery (spec 04): on a reference-chain break (lost frame),
             // hold the last good frame and skip P-frames until a keyframe

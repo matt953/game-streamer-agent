@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 const WINDOW: usize = 3600;
 const RECENT: usize = 300;
 
+/// Sliding window for the received-goodput bitrate (spec 04 observability + an
+/// ABR input): the actual bits/s of encoded video arriving, distinct from the
+/// requested target.
+const BITRATE_WINDOW_US: u64 = 1_000_000; // ~1 s
+
 #[derive(Debug, Default)]
 pub struct ClockSync {
     /// (rtt_us, offset_us) of the best sample so far.
@@ -61,6 +66,10 @@ pub struct LatencyStats {
     // Rolling windows (last `WINDOW` samples); the counters above stay total.
     latencies_us: VecDeque<u32>,
     decode_us: VecDeque<u32>,
+    /// (client_us, au_bytes) for frames received within the last
+    /// `BITRATE_WINDOW_US`; `recv_bytes` is their running byte total.
+    recv_window: VecDeque<(u64, u64)>,
+    recv_bytes: u64,
 }
 
 fn push_capped(buf: &mut VecDeque<u32>, v: u32) {
@@ -71,8 +80,39 @@ fn push_capped(buf: &mut VecDeque<u32>, v: u32) {
 }
 
 impl LatencyStats {
-    pub fn on_frame_complete(&mut self) {
+    /// Record a reassembled access unit: `bytes` is its encoded size, `now_us`
+    /// the client-clock arrival time (feeds the rolling received bitrate).
+    pub fn on_frame_complete(&mut self, bytes: usize, now_us: u64) {
         self.frames_complete += 1;
+        let bytes = bytes as u64;
+        self.recv_window.push_back((now_us, bytes));
+        self.recv_bytes += bytes;
+        // Evict samples older than the window.
+        while let Some(&(t, b)) = self.recv_window.front() {
+            if now_us.saturating_sub(t) > BITRATE_WINDOW_US {
+                self.recv_bytes -= b;
+                self.recv_window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Rolling received video goodput (bits/s) over ~1 s — what the encoder is
+    /// actually producing *and* surviving the network. `None` until there are
+    /// ≥2 samples spanning time.
+    #[must_use]
+    fn recv_bitrate_bps(&self) -> Option<f64> {
+        let &(oldest_us, oldest_bytes) = self.recv_window.front()?;
+        let &(newest_us, _) = self.recv_window.back()?;
+        let span_us = newest_us.saturating_sub(oldest_us);
+        if span_us == 0 {
+            return None;
+        }
+        // Bytes in (oldest, newest] — drop the boundary sample so the span and
+        // the byte total cover the same interval.
+        let bytes = self.recv_bytes.saturating_sub(oldest_bytes);
+        Some(bytes as f64 * 8.0 / (span_us as f64 / 1_000_000.0))
     }
 
     pub fn on_frame_decoded(&mut self, latency_us: Option<u32>, decode_us: u32) {
@@ -98,6 +138,7 @@ impl LatencyStats {
             decode_ms_p50: percentile(&decodes, 50).map(us_to_ms),
             recent_latency_ms_p50: percentile(&recent, 50).map(us_to_ms),
             recent_latency_ms_p99: percentile(&recent, 99).map(us_to_ms),
+            recv_mbps: self.recv_bitrate_bps().map(|bps| bps / 1_000_000.0),
         }
     }
 }
@@ -123,6 +164,10 @@ pub struct StatsSummary {
     /// Same latency, over the short `RECENT` tail — a "right now" read.
     pub recent_latency_ms_p50: Option<f64>,
     pub recent_latency_ms_p99: Option<f64>,
+    /// Rolling received video goodput (Mb/s) over ~1 s — the actual bitrate the
+    /// encoder is producing and that survives the network, vs. the target.
+    #[serde(default)]
+    pub recv_mbps: Option<f64>,
 }
 
 fn us_to_ms(us: u32) -> f64 {
@@ -168,6 +213,29 @@ mod tests {
         assert_eq!(percentile(&s, 50), Some(50));
         assert_eq!(percentile(&s, 99), Some(99));
         assert_eq!(percentile(&[], 50), None);
+    }
+
+    #[test]
+    fn recv_bitrate_tracks_recent_goodput() {
+        let mut s = LatencyStats::default();
+        // 10 frames × 25 000 B, 10 ms apart: span (excl. boundary) = 90 ms,
+        // bytes in (oldest, newest] = 9×25 000 = 225 000 → 20 Mb/s.
+        for i in 0..10u64 {
+            s.on_frame_complete(25_000, i * 10_000);
+        }
+        let mbps = s.summary(0).recv_mbps.unwrap();
+        assert!((18.0..=22.0).contains(&mbps), "recv_mbps {mbps}");
+    }
+
+    #[test]
+    fn recv_bitrate_evicts_stale_samples() {
+        let mut s = LatencyStats::default();
+        s.on_frame_complete(1_000_000, 0); // old, must age out
+        s.on_frame_complete(25_000, 5_000_000); // 5 s later
+        s.on_frame_complete(25_000, 5_010_000);
+        // The 1 MB spike is >1 s old, so it doesn't inflate the rate.
+        let mbps = s.summary(0).recv_mbps.unwrap();
+        assert!(mbps < 25.0, "stale sample leaked: {mbps}");
     }
 
     #[test]
