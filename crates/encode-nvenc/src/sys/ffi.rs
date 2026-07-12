@@ -33,6 +33,7 @@ const fn struct_version(revision: u32, big: bool) -> u32 {
 
 pub const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER: u32 = struct_version(1, false);
 pub const NV_ENC_INITIALIZE_PARAMS_VER: u32 = struct_version(7, true);
+pub const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = struct_version(1, true);
 pub const NV_ENC_CONFIG_VER: u32 = struct_version(9, true);
 pub const NV_ENC_RC_PARAMS_VER: u32 = struct_version(1, false);
 pub const NV_ENC_PRESET_CONFIG_VER: u32 = struct_version(5, true);
@@ -299,6 +300,7 @@ pub struct NvEncMeHintCountsPerBlocktype {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct NvEncInitializeParams {
     pub version: u32,
     pub encodeGUID: Guid,
@@ -325,6 +327,17 @@ pub struct NvEncInitializeParams {
     pub outputStatsLevel: u32,
     pub reserved1: [u32; 284],
     pub reserved2: [*mut c_void; 64],
+}
+
+/// The init params, re-submitted to a live encoder. `bitfields` is
+/// `resetEncoder:1 | forceIDR:1 | reserved:30`: zero keeps the encoder's state
+/// and emits no keyframe, which is what a bitrate change wants.
+#[repr(C)]
+pub struct NvEncReconfigureParams {
+    pub version: u32,
+    // `NvEncInitializeParams` is 8-aligned, so repr(C) pads 4 bytes here.
+    pub reInitEncodeParams: NvEncInitializeParams,
+    pub bitfields: u32,
 }
 
 #[repr(C)]
@@ -557,6 +570,7 @@ const _: () = {
     assert!(size_of::<NvEncCodecConfig>() == 1792);
     assert!(size_of::<NvEncConfig>() == 3584);
     assert!(size_of::<NvEncInitializeParams>() == 1800);
+    assert!(size_of::<NvEncReconfigureParams>() == 1816);
     assert!(size_of::<NvEncPresetConfig>() == 5128);
     assert!(size_of::<NvEncCodecPicParams>() == 1544);
     assert!(size_of::<NvEncPicParams>() == 3360);
@@ -573,4 +587,9 @@ const _: () = {
     // `idrPeriod` is the only HEVC field we write; pin its offset directly so a
     // slip in the fields ahead of it is a compile error, not silent corruption.
     assert!(std::mem::offset_of!(NvEncConfigHevc, idrPeriod) == 20);
+    // The padding after `version` is implicit, so pin what it puts either side
+    // of it: a reconfigure that lands `bitfields` short would set `resetEncoder`
+    // from whatever `reserved2` holds, and reset the encoder on every ABR step.
+    assert!(std::mem::offset_of!(NvEncReconfigureParams, reInitEncodeParams) == 8);
+    assert!(std::mem::offset_of!(NvEncReconfigureParams, bitfields) == 1808);
 };

@@ -42,11 +42,21 @@ impl Drop for MappedTexture<'_> {
     }
 }
 
+/// What [`Session::initialize`] handed the driver, kept so a live
+/// [`Session::reconfigure`] can resubmit it with one field changed.
+struct Configured {
+    /// Boxed: `params.encodeConfig` points into it, so its address must not
+    /// move when the session does.
+    preset: Box<sys::NvEncPresetConfig>,
+    params: sys::NvEncInitializeParams,
+}
+
 /// One NVENC encode session bound to a D3D11 device.
 pub(crate) struct Session {
     nvenc: &'static Nvenc,
     encoder: *mut c_void,
     bitstream: *mut c_void,
+    configured: Option<Configured>,
     /// Retained so the device outlives the session that encodes from it.
     _device: ID3D11Device,
 }
@@ -101,6 +111,7 @@ impl Session {
             nvenc,
             encoder,
             bitstream: ptr::null_mut(),
+            configured: None,
             _device: device.clone(),
         })
     }
@@ -129,12 +140,9 @@ impl Session {
         config.frameIntervalP = 1;
         config.rcParams.version = sys::NV_ENC_RC_PARAMS_VER;
         config.rcParams.rateControlMode = sys::NV_ENC_PARAMS_RC_CBR;
-        config.rcParams.averageBitRate = bitrate_bps;
-        config.rcParams.maxBitRate = bitrate_bps;
-        let fps = mode.fps.max(1);
-        config.rcParams.vbvBufferSize = bitrate_bps / fps;
-        config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
         config.rcParams.lookaheadDepth = 0;
+        let fps = mode.fps.max(1);
+        set_bitrate(config, bitrate_bps, fps);
 
         // Only the codec-config union arm differs; the preset filled the one
         // matching `codec_guid`. Tier and level stay at the preset's auto
@@ -160,7 +168,7 @@ impl Session {
             }
         }
 
-        let mut params = sys::NvEncInitializeParams {
+        let params = sys::NvEncInitializeParams {
             version: sys::NV_ENC_INITIALIZE_PARAMS_VER,
             encodeGUID: codec_guid,
             presetGUID: sys::NV_ENC_PRESET_P3_GUID,
@@ -194,13 +202,49 @@ impl Session {
             .functions()
             .nvEncInitializeEncoder
             .ok_or_else(|| Error::Encode("driver exposes no nvEncInitializeEncoder".into()))?;
+        // Moving `preset` into the box'd-config pair does not move the config
+        // itself, so `params.encodeConfig` stays valid.
+        let mut configured = Configured { preset, params };
         // SAFETY: `params` is correctly versioned and points at a config that
-        // outlives this call.
-        let status = unsafe { init(self.encoder, &raw mut params) };
+        // outlives this call — `configured` owns it for the session's lifetime.
+        let status = unsafe { init(self.encoder, &raw mut configured.params) };
         self.check(status, "nvEncInitializeEncoder")?;
 
         self.bitstream = self.create_bitstream()?;
+        self.configured = Some(configured);
         Ok(())
+    }
+
+    /// Change the encode bitrate on the live encoder. ABR steps every few
+    /// hundred milliseconds, so this must cost neither a session teardown nor a
+    /// keyframe: `resetEncoder` and `forceIDR` stay clear, and the driver is
+    /// handed back the config it was initialized with, `rcParams` aside.
+    pub(crate) fn reconfigure(&mut self, bitrate_bps: u32) -> Result<()> {
+        let f = self
+            .nvenc
+            .functions()
+            .nvEncReconfigureEncoder
+            .ok_or_else(|| Error::Encode("driver exposes no nvEncReconfigureEncoder".into()))?;
+
+        let mut params = {
+            let configured = self
+                .configured
+                .as_mut()
+                .ok_or_else(|| Error::Encode("nvenc session not initialized".into()))?;
+            let fps = configured.params.frameRateNum;
+            set_bitrate(&mut configured.preset.presetCfg, bitrate_bps, fps);
+            sys::NvEncReconfigureParams {
+                version: sys::NV_ENC_RECONFIGURE_PARAMS_VER,
+                reInitEncodeParams: configured.params,
+                bitfields: 0,
+            }
+        };
+
+        // SAFETY: correctly versioned params whose `encodeConfig` points into
+        // the preset `self.configured` owns, so it outlives the call. `Fn2` is
+        // the untyped two-argument signature every NVENC entry point shares.
+        let status = unsafe { f(self.encoder, (&raw mut params).cast()) };
+        self.check(status, "nvEncReconfigureEncoder")
     }
 
     /// Ask the driver to fill a config for our preset + tuning, then we adjust
@@ -446,6 +490,16 @@ impl Drop for Session {
             let _ = unsafe { destroy(self.encoder) };
         }
     }
+}
+
+/// The CBR fields, sized so one frame's worth of bits never stalls behind the
+/// VBV. Shared with [`Session::reconfigure`] so a rate change moves exactly the
+/// fields `initialize` set and no others. `fps` must be non-zero.
+fn set_bitrate(config: &mut sys::NvEncConfig, bitrate_bps: u32, fps: u32) {
+    config.rcParams.averageBitRate = bitrate_bps;
+    config.rcParams.maxBitRate = bitrate_bps;
+    config.rcParams.vbvBufferSize = bitrate_bps / fps;
+    config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
 }
 
 /// The encode GUID for a codec, or an error for one this backend can't emit.

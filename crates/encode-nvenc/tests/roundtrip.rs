@@ -320,6 +320,79 @@ fn hevc_initializes_and_emits_parameter_sets_on_every_idr() {
     );
 }
 
+/// ABR moves the bitrate every few hundred milliseconds. Each step must
+/// reconfigure the live session, never reopen it: a forced keyframe is a fat
+/// frame injected exactly when ABR is trying to shed bits. The observable
+/// contract is that the frame after `update_rate` is still a P-frame, with no
+/// break in the frame ids.
+#[test]
+fn a_bitrate_change_emits_no_keyframe() {
+    let Some(support) = gsa_encode_nvenc::probe() else {
+        eprintln!("no NVENC on this machine; skipping");
+        return;
+    };
+    let device = gsa_capture_windows::create_device_on(support.adapter_luid).expect("d3d11 device");
+
+    let mode = VideoMode {
+        width: W,
+        height: H,
+        fps: 60,
+    };
+    let mut enc = NvencEncoder::new(MediaClock::new());
+    enc.open(EncodeConfig {
+        codec: Codec::H264,
+        mode,
+        bitrate_bps: 20_000_000,
+        h264_profile: H264Profile::High,
+    })
+    .expect("open");
+
+    let pixels = bgra_halves();
+    let submit = |enc: &mut NvencEncoder, ts: u64| {
+        enc.submit(
+            &frame(&device, texture(&device, &pixels), ts),
+            FrameDirectives::default(),
+        )
+        .expect("submit");
+        enc.poll_bitstream().expect("poll").expect("a chunk")
+    };
+
+    // Before the session exists there is nothing to reconfigure; the rate is
+    // stored and the session opens at it.
+    enc.update_rate(15_000_000)
+        .expect("update_rate while closed");
+
+    let idr = submit(&mut enc, 0);
+    assert_eq!(idr.kind, FrameKind::Idr, "first frame must be an IDR");
+    let p = submit(&mut enc, 16_666);
+    assert_eq!(p.kind, FrameKind::P);
+
+    // ---- the step ABR actually makes under congestion: cut the rate ----
+    enc.update_rate(3_000_000).expect("update_rate down");
+    let after = submit(&mut enc, 33_333);
+    assert_eq!(
+        after.kind,
+        FrameKind::P,
+        "a bitrate cut must not force a keyframe"
+    );
+    assert!(
+        !nal_types(&after.data, h264_nal).contains(&5),
+        "no IDR slice may appear after a bitrate change"
+    );
+    assert_eq!(
+        after.frame_id,
+        p.frame_id.next(),
+        "reconfigure must not restart the stream"
+    );
+
+    // ---- repeating a rate is a no-op, and recovering upwards also holds ----
+    enc.update_rate(3_000_000).expect("update_rate unchanged");
+    enc.update_rate(25_000_000).expect("update_rate up");
+    let recovered = submit(&mut enc, 50_000);
+    assert_eq!(recovered.kind, FrameKind::P);
+    assert_eq!(recovered.frame_id, after.frame_id.next());
+}
+
 #[test]
 fn rejects_a_cpu_frame() {
     if gsa_encode_nvenc::probe().is_none() {

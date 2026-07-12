@@ -210,11 +210,17 @@ impl Encoder for NvencEncoder {
             .config
             .as_mut()
             .ok_or_else(|| Error::Encode("encoder not open".into()))?;
+        if cfg.bitrate_bps == bitrate_bps {
+            return Ok(());
+        }
         cfg.bitrate_bps = bitrate_bps;
-        // Reopening on the next frame is a simpler contract than a live
-        // reconfigure, and costs one IDR — which spec 03 explicitly permits.
-        self.session = None;
-        self.force_idr = true;
+        // Reconfigure in place: reopening the session would cost an IDR, and
+        // ABR cuts the rate precisely when a fat frame hurts most (spec 04).
+        // With no session yet, the next `session()` opens at the new rate.
+        if let Some(session) = self.session.as_mut() {
+            session.reconfigure(bitrate_bps)?;
+            tracing::debug!(bitrate = bitrate_bps, "NVENC reconfigured");
+        }
         Ok(())
     }
 
