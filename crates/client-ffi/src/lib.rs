@@ -573,15 +573,18 @@ async fn session_loop(
                 }
             } => {
                 if let Some(event) = event {
-                    let (kind, arg) = match event {
+                    let notify = match event {
                         ControlEvent::GamepadConnected { seat } => {
-                            (GSA_NOTIFY_GAMEPAD_CONNECTED, seat as u32)
+                            Some((GSA_NOTIFY_GAMEPAD_CONNECTED, seat as u32))
                         }
                         ControlEvent::GamepadDisconnected { seat } => {
-                            (GSA_NOTIFY_GAMEPAD_DISCONNECTED, seat as u32)
+                            Some((GSA_NOTIFY_GAMEPAD_DISCONNECTED, seat as u32))
                         }
+                        // Encoder telemetry isn't a user notification; no mobile
+                        // surface for it yet, so drop it here.
+                        ControlEvent::EncodeStats { .. } => None,
                     };
-                    if let Some(cb) = cbs.on_notification {
+                    if let (Some((kind, arg)), Some(cb)) = (notify, cbs.on_notification) {
                         // SAFETY: `ctx` valid for the session per the embedder contract.
                         unsafe { cb(cbs.ctx, kind, arg) };
                     }

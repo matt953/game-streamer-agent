@@ -2,9 +2,10 @@
 //! packetize/send task (spec 01 threading model). Pixels never enter the
 //! async world; the tokio side only ever sees encoded chunks.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gsa_capture_api::{RenderSource, SourceConfig, frame_channel};
 use gsa_core::media::{Codec, H264Profile, VideoMode};
@@ -47,6 +48,9 @@ pub struct PipelineHandle {
     /// `Encoder::update_rate` and the pacer reads it for its send-rate; this is
     /// the actuator the manual knob and the ABR controller (spec 04) both drive.
     bitrate: Arc<AtomicU32>,
+    /// Rolling emitted video bitrate (bps) on the send path — actual encoder
+    /// output, pushed to the client.
+    emitted_bitrate: Arc<AtomicU32>,
 }
 
 impl PipelineHandle {
@@ -64,6 +68,12 @@ impl PipelineHandle {
     /// The current live target bitrate (bps).
     pub fn bitrate(&self) -> u32 {
         self.bitrate.load(Ordering::Relaxed)
+    }
+
+    /// The rolling emitted (actual encoder output) bitrate (bps), 0 until enough
+    /// frames have been sent to measure it.
+    pub fn emitted_bitrate_bps(&self) -> u32 {
+        self.emitted_bitrate.load(Ordering::Relaxed)
     }
 }
 
@@ -180,8 +190,13 @@ pub fn start(
 
     let frames_ctr = frames_sent.clone();
     let bitrate_pace = bitrate.clone();
+    let emitted_bitrate = Arc::new(AtomicU32::new(0));
+    let emitted_send = emitted_bitrate.clone();
     tokio::spawn(async move {
         let mut logged = 0u64;
+        // Rolling (send_time, encoded bytes) window for the emitted bitrate.
+        let mut emit_window: VecDeque<(Instant, u64)> = VecDeque::new();
+        let mut emit_bytes = 0u64;
         while let Some(chunk) = chunk_rx.recv().await {
             let max = conn.max_datagram_size().unwrap_or(DEFAULT_MAX_DATAGRAM);
             let header = VideoDatagramHeader {
@@ -230,6 +245,31 @@ pub fn start(
                 }
             }
             let sent = frames_ctr.fetch_add(1, Ordering::Relaxed) + 1;
+            // Roll the emitted-bitrate window with this frame's encoded size.
+            {
+                let now = Instant::now();
+                let n = chunk.data.len() as u64;
+                emit_window.push_back((now, n));
+                emit_bytes += n;
+                while let Some(&(t, b)) = emit_window.front() {
+                    if now.duration_since(t) > Duration::from_secs(1) {
+                        emit_bytes -= b;
+                        emit_window.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                // Bytes in (oldest, newest] over the span.
+                if let (Some(&(oldest, oldest_b)), Some(&(newest, _))) =
+                    (emit_window.front(), emit_window.back())
+                {
+                    let span = newest.duration_since(oldest).as_secs_f64();
+                    if span > 0.0 {
+                        let bps = ((emit_bytes - oldest_b) as f64 * 8.0 / span) as u32;
+                        emitted_send.store(bps, Ordering::Relaxed);
+                    }
+                }
+            }
             // Sampled latency span (spec 01: "where did the milliseconds go").
             if sent - logged >= 120 {
                 logged = sent;
@@ -254,6 +294,7 @@ pub fn start(
         frames_sent,
         force_idr,
         bitrate,
+        emitted_bitrate,
     })
 }
 

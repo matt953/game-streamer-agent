@@ -10,7 +10,7 @@ use gsa_core::{Error, Result};
 use gsa_encode_api::Encoder;
 use gsa_input::InputFeedback;
 use gsa_protocol::control::{
-    A2C, C2A, HelloAck, Notification, ProtoErrorMsg, SessionParams, SourceKind,
+    A2C, C2A, EncodeStats, HelloAck, Notification, ProtoErrorMsg, SessionParams, SourceKind,
 };
 use gsa_protocol::grant::Scope;
 use gsa_protocol::{PROTO_VERSION, control};
@@ -102,11 +102,28 @@ async fn serve_inner(
     // the intersection with the encoder's caps.
     let mut client_decode_codecs: Vec<Codec> = vec![Codec::H264];
 
+    // Push the emitted-bitrate telemetry to the client ~1 Hz (spec 04).
+    let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let result = loop {
-        let msg: C2A = match recv_msg(&mut recv).await {
-            Ok(m) => m,
-            Err(_) if conn.close_reason().is_some() => break Ok(()),
-            Err(e) => break Err(e),
+        let msg: C2A = tokio::select! {
+            r = recv_msg(&mut recv) => match r {
+                Ok(m) => m,
+                Err(_) if conn.close_reason().is_some() => break Ok(()),
+                Err(e) => break Err(e),
+            },
+            _ = stats_tick.tick() => {
+                if let Some(a) = &active {
+                    let stats = EncodeStats {
+                        emitted_bitrate_bps: a.pipeline.emitted_bitrate_bps(),
+                    };
+                    if let Err(e) = send_msg(&mut send, &A2C::EncodeStats(stats)).await {
+                        break Err(e);
+                    }
+                }
+                continue;
+            }
         };
 
         match msg {

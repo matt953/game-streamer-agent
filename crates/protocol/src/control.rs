@@ -55,6 +55,15 @@ pub enum A2C {
     /// which the client's *pipeline* reacts to; this is purely informational and
     /// is the reusable channel for such messages.
     Notification(Notification),
+    /// Periodic encoder telemetry from the agent (~1 Hz).
+    EncodeStats(EncodeStats),
+}
+
+/// Agent-measured encoder telemetry (spec 04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncodeStats {
+    /// Rolling emitted video bitrate (bits/s) over ~1 s — the encoder's output.
+    pub emitted_bitrate_bps: u32,
 }
 
 /// User-facing notifications pushed by the agent over the control stream. Add

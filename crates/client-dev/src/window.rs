@@ -215,6 +215,8 @@ struct App {
     bitrate_bps: u32,
     /// Rolling received video goodput (Mb/s) from client-core stats, for the HUD.
     recv_mbps: Option<f64>,
+    /// Agent-reported emitted bitrate (Mb/s) — the encoder's actual output.
+    emitted_mbps: Option<f64>,
 }
 
 impl App {
@@ -224,6 +226,9 @@ impl App {
         let Some(w) = &self.window else { return };
         let mbps = f64::from(self.bitrate_bps) / 1_000_000.0;
         let mut title = format!("gsa client-dev — target {mbps:.1} Mbps");
+        if let Some(emit) = self.emitted_mbps {
+            title.push_str(&format!(" · emit {emit:.1} Mbps"));
+        }
         if let Some(rx) = self.recv_mbps {
             title.push_str(&format!(" · rx {rx:.1} Mbps"));
         }
@@ -298,6 +303,14 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Notification(event) => {
                 let (connected, text) = match event {
+                    // Encoder telemetry updates the HUD, not a toast.
+                    ControlEvent::EncodeStats {
+                        emitted_bitrate_bps,
+                    } => {
+                        self.emitted_mbps = Some(f64::from(emitted_bitrate_bps) / 1_000_000.0);
+                        self.update_title();
+                        return;
+                    }
                     ControlEvent::GamepadConnected { seat } => {
                         (true, format!("controller connected (seat {seat})"))
                     }
