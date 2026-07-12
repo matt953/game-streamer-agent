@@ -149,6 +149,11 @@ impl InputSender {
     pub fn set_bitrate(&self, bitrate_bps: u32) {
         let _ = self.tx.send(C2A::SetBitrate { bitrate_bps });
     }
+
+    /// Enable/disable server-side ABR for the session.
+    pub fn set_abr(&self, enabled: bool) {
+        let _ = self.tx.send(C2A::SetAbr { enabled });
+    }
 }
 
 pub struct Client {
@@ -169,6 +174,8 @@ pub struct Client {
     last_frame_id: Option<u32>,
     /// Client-clock µs of the last keyframe request (rate limiting).
     last_keyframe_request_us: u64,
+    /// Client-clock µs of the last `StatsReport` sent (ABR signal, ~2 Hz).
+    last_stats_report_us: u64,
     /// True while the P-frame reference chain is broken (lost/undecodable
     /// frame); we skip P-frames until a keyframe resyncs the decoder (spec 04).
     awaiting_idr: bool,
@@ -250,6 +257,7 @@ impl Client {
             session: None,
             last_frame_id: None,
             last_keyframe_request_us: 0,
+            last_stats_report_us: 0,
             // Until the first keyframe, the decoder has no reference; skip any
             // P-frames that arrive ahead of it.
             awaiting_idr: true,
@@ -520,6 +528,7 @@ impl Client {
                     let decode_us = (now - decode_start) as u32;
                     let latency_us = self.clock_sync.frame_latency_us(now, header.capture_ts_us);
                     self.stats.on_frame_decoded(latency_us, decode_us);
+                    self.report_stats_if_due();
                     return Ok(Some(FrameOutput {
                         frame,
                         frame_id: header.frame_id,
@@ -554,6 +563,7 @@ impl Client {
         let latency_us = self.clock_sync.frame_latency_us(now, header.capture_ts_us);
         // Decode happens app-side; record it as zero in the stats window.
         self.stats.on_frame_decoded(latency_us, 0);
+        self.report_stats_if_due();
         Ok(Some(EncodedFrame {
             data: frame_data,
             frame_id: header.frame_id,
@@ -561,6 +571,29 @@ impl Client {
             capture_ts_us: header.capture_ts_us,
             latency_us,
         }))
+    }
+
+    /// Report client stats to the agent ~2 Hz — the ABR delay signal (spec 04).
+    /// Fire-and-forget over the control writer; a no-op until it's running.
+    fn report_stats_if_due(&mut self) {
+        const INTERVAL_US: u64 = 500_000;
+        let now = self.clock.now_us();
+        if now.saturating_sub(self.last_stats_report_us) < INTERVAL_US {
+            return;
+        }
+        let Some(tx) = &self.control_tx else { return };
+        self.last_stats_report_us = now;
+        let s = self.stats.summary(self.reassembler.frames_dropped());
+        let recent_delay_us = s.recent_latency_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32);
+        let _ = tx.send(C2A::StatsReport(gsa_protocol::control::ClientStats {
+            frames_received: s.frames_complete,
+            frames_complete: s.frames_complete,
+            frames_dropped_incomplete: s.frames_dropped_incomplete,
+            frames_decoded: s.frames_decoded,
+            decode_us_p50: s.decode_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32),
+            jitter_us: 0,
+            recent_delay_us,
+        }));
     }
 
     /// Request a healing keyframe, rate-limited so a burst of gaps/errors

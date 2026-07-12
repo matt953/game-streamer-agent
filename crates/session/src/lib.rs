@@ -2,6 +2,7 @@
 //! transport pipelines per connection, speaks the control protocol, and
 //! exposes the local admin API (`ControlService`).
 
+pub mod abr;
 pub mod admin;
 pub mod audio_pipeline;
 pub mod pairing;

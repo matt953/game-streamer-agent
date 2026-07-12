@@ -95,6 +95,10 @@ async fn serve_inner(
         .map_err(|e| Error::Transport(format!("accept control stream: {e}")))?;
 
     let mut active: Option<ActiveSession> = None;
+    // ABR (spec 04): controller lives per-session (`None` between sessions);
+    // `abr_enabled` gates whether it drives the bitrate. Off by default.
+    let mut abr: Option<crate::abr::AbrController> = None;
+    let mut abr_enabled = false;
     let mut helloed = false;
     // Client's max decodable H.264 profile (from Hello), negotiated at session start.
     let mut client_h264_profile = gsa_core::media::H264Profile::ConstrainedBaseline;
@@ -198,6 +202,11 @@ async fn serve_inner(
                     Ok(started) => {
                         let (mode, bitrate, codec) = (started.mode, started.bitrate, started.codec);
                         let session_id = started.session.id;
+                        // Seed ABR with this session's bitrate as its ceiling.
+                        abr = Some(crate::abr::AbrController::new(
+                            bitrate,
+                            state.clock.now_us(),
+                        ));
                         active = Some(started.session);
                         send_msg(
                             &mut send,
@@ -228,6 +237,7 @@ async fn serve_inner(
                     state.remove_session(a.id);
                     tracing::info!(peer, session = a.id, "session stopped by client");
                 }
+                abr = None;
             }
             C2A::Ping { client_ts_us } => {
                 send_msg(
@@ -252,6 +262,10 @@ async fn serve_inner(
                     // same pipeline actuator server-side.
                     let clamped = bitrate_bps.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS);
                     a.pipeline.set_bitrate(clamped);
+                    // The manual bitrate is ABR's ceiling.
+                    if let Some(ctrl) = &mut abr {
+                        ctrl.set_ceiling(clamped);
+                    }
                     tracing::info!(
                         peer,
                         session = a.id,
@@ -260,9 +274,21 @@ async fn serve_inner(
                     );
                 }
             }
+            C2A::SetAbr { enabled } => {
+                abr_enabled = enabled;
+                // Start adapting from the current bitrate when turned on.
+                if enabled && let (Some(a), Some(ctrl)) = (&active, &mut abr) {
+                    ctrl.sync_target(a.pipeline.bitrate());
+                }
+                tracing::info!(peer, enabled, "abr toggled by client");
+            }
             C2A::FrameAck { .. } => { /* full NACK/ref-invalidation ladder lands at M3 (spec 04) */
             }
             C2A::StatsReport(stats) => {
+                if abr_enabled && let (Some(a), Some(ctrl)) = (&active, &mut abr) {
+                    let target = ctrl.on_delay(stats.recent_delay_us, state.clock.now_us());
+                    a.pipeline.set_bitrate(target);
+                }
                 tracing::debug!(peer, ?stats, "client stats");
             }
             C2A::InputBatch(events) => {

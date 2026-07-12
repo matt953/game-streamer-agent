@@ -25,11 +25,15 @@ pub enum C2A {
     /// its reference chain (missed/corrupt frame) and needs to resync
     /// (spec 04 loss-recovery ladder).
     RequestKeyframe,
-    /// Ask the agent to change the live encode target bitrate (bps). The manual
-    /// quality knob; the ABR controller drives the same actuator agent-side
-    /// (spec 04). The agent clamps to a sane range.
+    /// Set the encode target bitrate (bps). When ABR is off this is the live
+    /// target; when ABR is on it's the ceiling ABR adapts below (spec 04). The
+    /// agent clamps to a sane range.
     SetBitrate {
         bitrate_bps: u32,
+    },
+    /// Enable/disable server-side ABR for this session (spec 04).
+    SetAbr {
+        enabled: bool,
     },
     StatsReport(ClientStats),
     Ping {
@@ -157,6 +161,8 @@ pub struct ClientStats {
     pub frames_decoded: u64,
     pub decode_us_p50: u32,
     pub jitter_us: u32,
+    /// Recent one-way delay (µs, capture→received p50) — the ABR delay signal.
+    pub recent_delay_us: u32,
 }
 
 #[cfg(test)]

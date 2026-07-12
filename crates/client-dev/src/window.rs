@@ -230,6 +230,8 @@ struct App {
     recv_mbps: Option<f64>,
     /// Agent-reported emitted bitrate (Mb/s) — the encoder's actual output.
     emitted_mbps: Option<f64>,
+    /// Whether server-side ABR is on (toggled with `\`).
+    abr_on: bool,
 }
 
 impl App {
@@ -245,7 +247,12 @@ impl App {
         if let Some(rx) = self.recv_mbps {
             title.push_str(&format!(" · rx {rx:.1} Mbps"));
         }
-        title.push_str("  ([ / ] to adjust)");
+        title.push_str(if self.abr_on {
+            " · ABR on"
+        } else {
+            " · ABR off"
+        });
+        title.push_str("  ([ / ] bitrate, \\ ABR)");
         if let Some(toast) = &self.toast {
             title.push_str(" — ");
             title.push_str(&toast.text);
@@ -399,6 +406,20 @@ impl ApplicationHandler<AppEvent> for App {
                             mbps = f64::from(self.bitrate_bps) / 1_000_000.0,
                             "bitrate knob ([ = down, ] = up)"
                         );
+                        self.update_title();
+                    }
+                    return;
+                }
+                // Toggle server-side ABR with `\` — intercepted, not sent to the host.
+                if key.state == winit::event::ElementState::Pressed
+                    && key.physical_key == PhysicalKey::Code(KeyCode::Backslash)
+                {
+                    if self.input.is_some() {
+                        self.abr_on = !self.abr_on;
+                        if let Some(input) = &self.input {
+                            input.set_abr(self.abr_on);
+                        }
+                        tracing::info!(abr_on = self.abr_on, "ABR toggled (\\)");
                         self.update_title();
                     }
                     return;
