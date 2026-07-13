@@ -73,6 +73,12 @@ fn transport_config() -> TransportConfig {
     ));
     // Match the OS buffer so quinn isn't the ceiling on bursty drains.
     tc.datagram_receive_buffer_size(Some(SOCKET_BUFFER_BYTES));
+    // Cap the datagram send queue (~60 ms at 35 Mb/s) so a sender outpacing the
+    // path sheds stale datagrams instead of queueing seconds of them.
+    tc.datagram_send_buffer_size(256 * 1024);
+    // BBR, not cubic: cubic halves its window on any loss, so random Wi-Fi/
+    // cellular loss would throttle the tunnel below the link's real capacity.
+    tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     // Pin the UDP payload to the QUIC baseline (1200 B) and disable Path-MTU
     // discovery — discovery overshoots on reduced-MTU paths (VPN/5G) and the
     // oversized datagrams get dropped. (TODO: make this a knob / re-enable

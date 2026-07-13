@@ -22,17 +22,13 @@ const DEFAULT_MAX_DATAGRAM: usize = 1200;
 /// a dropped or failed frame, so it's generous.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// Video pacing (spec 04): spread a frame's datagrams over a few ms so a large
-/// frame doesn't burst ~60 packets into the network at once — the measured
-/// cause of the p99 tail once hardware encode made the encoder cheap. Paced as
-/// a leaky bucket at a multiple of the encode bitrate; a first cut until the M3
-/// congestion controller supplies a real send-rate estimate.
-const PACING_GAIN: f64 = 8.0;
-/// Never hold one frame's send back beyond this — bounds added latency on a
-/// big IDR (the rest bursts once the budget is spent).
-const PACING_CAP: Duration = Duration::from_millis(3);
-/// Frames of at most this many datagrams don't burst; send them immediately.
-const PACING_MIN_DATAGRAMS: usize = 8;
+/// Pace the send at the live target × this gain (WebRTC's pacing factor), so an
+/// IDR drains within a few frame intervals instead of jamming the send queue.
+const PACING_GAIN: f64 = 2.5;
+/// Pacing rate floor (bytes/s): keeps startup and IDR recovery moving at a low target.
+const PACING_FLOOR_BYTES_PER_SEC: f64 = 250_000.0; // 2 Mb/s
+/// Send-queue depth (frames) past which the backlog is dropped and an IDR forced.
+const SEND_BACKLOG_CAP: usize = 4;
 
 pub struct PipelineHandle {
     stop: Arc<AtomicBool>,
@@ -44,9 +40,8 @@ pub struct PipelineHandle {
     /// Set to force the next encoded frame to be an IDR (client loss
     /// recovery, spec 04).
     force_idr: Arc<AtomicBool>,
-    /// Live encode target bitrate (bps). The encode thread applies changes via
-    /// `Encoder::update_rate` and the pacer reads it for its send-rate; this is
-    /// the actuator the manual knob and the ABR controller (spec 04) both drive.
+    /// Live encode target bitrate (bps) — the actuator the manual knob and the
+    /// ABR controller both drive; the encode thread and pacer read it.
     bitrate: Arc<AtomicU32>,
     /// Rolling emitted video bitrate (bps) on the send path — actual encoder
     /// output, pushed to the client.
@@ -189,15 +184,29 @@ pub fn start(
         .map_err(|e| Error::Session(format!("spawn encode thread: {e}")))?;
 
     let frames_ctr = frames_sent.clone();
+    let force_idr_send = force_idr.clone();
     let bitrate_pace = bitrate.clone();
     let emitted_bitrate = Arc::new(AtomicU32::new(0));
     let emitted_send = emitted_bitrate.clone();
     tokio::spawn(async move {
         let mut logged = 0u64;
+        let mut frames_dropped = 0u64;
         // Rolling (send_time, encoded bytes) window for the emitted bitrate.
         let mut emit_window: VecDeque<(Instant, u64)> = VecDeque::new();
         let mut emit_bytes = 0u64;
         while let Some(chunk) = chunk_rx.recv().await {
+            // Pacing fell behind the encoder: drop the stale backlog and force
+            // an IDR so decode resyncs from the freshest frame.
+            if chunk_rx.len() > SEND_BACKLOG_CAP {
+                let mut dropped = 1u64; // this chunk is the oldest of the pile
+                while chunk_rx.try_recv().is_ok() {
+                    dropped += 1;
+                }
+                frames_dropped += dropped;
+                force_idr_send.store(true, Ordering::Release);
+                tracing::debug!(dropped, "send backlog dropped; IDR forced");
+                continue;
+            }
             let max = conn.max_datagram_size().unwrap_or(DEFAULT_MAX_DATAGRAM);
             let header = VideoDatagramHeader {
                 session_epoch: 0,
@@ -214,26 +223,22 @@ pub fn start(
                     continue;
                 }
             };
-            // Pace big frames; small ones (static desktop) go out immediately.
-            // Read the live bitrate so pacing tracks ABR / manual changes.
-            let br = bitrate_pace.load(Ordering::Relaxed);
-            let pace_bytes_per_sec = (datagrams.len() > PACING_MIN_DATAGRAMS && br > 0)
-                .then(|| f64::from(br) / 8.0 * PACING_GAIN);
+            // Pace at the live target so ABR's bound applies to the wire too.
+            let br = f64::from(bitrate_pace.load(Ordering::Relaxed));
+            let rate = (br / 8.0 * PACING_GAIN).max(PACING_FLOOR_BYTES_PER_SEC);
             let frame_start = std::time::Instant::now();
             let mut deadline = frame_start;
             for d in datagrams {
-                if let Some(rate) = pace_bytes_per_sec {
-                    let now = std::time::Instant::now();
-                    if deadline > now && now.duration_since(frame_start) < PACING_CAP {
-                        // tokio's timer floor is ~1 ms, so only sleep once the
-                        // schedule slack is worth it; sub-ms slack accumulates.
-                        let wait = (deadline - now).min(PACING_CAP);
-                        if wait >= Duration::from_millis(1) {
-                            tokio::time::sleep(wait).await;
-                        }
+                let now = std::time::Instant::now();
+                if deadline > now {
+                    // tokio's timer floor is ~1 ms, so only sleep once the
+                    // schedule slack is worth it; sub-ms slack accumulates.
+                    let wait = deadline - now;
+                    if wait >= Duration::from_millis(1) {
+                        tokio::time::sleep(wait).await;
                     }
-                    deadline += Duration::from_secs_f64(d.len() as f64 / rate);
                 }
+                deadline += Duration::from_secs_f64(d.len() as f64 / rate);
                 if let Err(e) = conn.send_datagram(bytes::Bytes::from(d)) {
                     match e {
                         quinn::SendDatagramError::ConnectionLost(_) => {
@@ -279,6 +284,10 @@ pub fn start(
                     frames = sent,
                     encode_ms,
                     size = chunk.data.len(),
+                    pace_mbps = rate * 8.0 / 1_000_000.0,
+                    send_spread_ms = frame_start.elapsed().as_secs_f64() * 1000.0,
+                    queue = chunk_rx.len(),
+                    dropped = frames_dropped,
                     "pipeline sample"
                 );
             }
