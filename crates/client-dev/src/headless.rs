@@ -28,6 +28,7 @@ struct Report {
     recv_mbps: Option<f64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     addr: std::net::SocketAddr,
     frames: u32,
@@ -35,6 +36,7 @@ pub async fn run(
     source: Option<String>,
     force_sw: bool,
     abr: bool,
+    bitrate_bps: Option<u32>,
     auth: crate::pairing::Auth,
 ) -> Result<()> {
     let mut client = Client::connect(
@@ -52,19 +54,11 @@ pub async fn run(
     tracing::info!(source = source.name, "starting session");
     // Marker verification only means something for the synthetic pattern.
     let check_markers = source.kind == gsa_protocol::control::SourceKind::TestPattern;
-    let params = client.start_session(SourceId(source.id.0), None).await?;
-
-    // The chaos rig turns on server-side ABR; keep the sender alive so its
-    // background control writer stays running for the session.
-    let _input = if abr {
-        let input = client.take_input_sender();
-        if let Some(i) = &input {
-            i.set_abr(true);
-        }
-        input
-    } else {
-        None
-    };
+    let params = client
+        .start_session(SourceId(source.id.0), None, bitrate_bps, abr)
+        .await?;
+    // Arms the background control writer that carries stats reports + keyframe requests.
+    let _input = client.take_input_sender();
 
     let mut decoder = make_decoder(force_sw)?;
     let mut decoded = 0u32;
@@ -77,6 +71,16 @@ pub async fn run(
             bail!("connection closed after {decoded} frames");
         };
         decoded += 1;
+        // Progress heartbeat: a failing CI scenario shows where flow stopped.
+        if decoded.is_multiple_of(60) {
+            let s = client.stats();
+            tracing::info!(
+                decoded,
+                dropped = s.frames_dropped_incomplete,
+                recv_mbps = s.recv_mbps,
+                "headless progress"
+            );
+        }
 
         if let Some(marker) = check_markers
             .then(|| {

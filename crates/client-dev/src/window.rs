@@ -123,7 +123,9 @@ fn network_loop(
             let sources = client.list_sources().await?;
             tracing::info!("available sources:\n{}", crate::source_list(&sources));
             let source = crate::pick_source(&sources, source.as_deref())?;
-            let params = client.start_session(SourceId(source.id.0), None).await?;
+            let params = client
+                .start_session(SourceId(source.id.0), None, None, false)
+                .await?;
 
             if let Some(sender) = client.take_input_sender() {
                 let _ = proxy.send_event(AppEvent::Ready(sender, params.bitrate_bps));
@@ -196,6 +198,7 @@ fn network_loop(
                                 target_bitrate_bps,
                                 emitted_bitrate_bps,
                                 abr_enabled,
+                                ..
                             } = event
                             {
                                 target_mbps = Some(f64::from(target_bitrate_bps) / 1_000_000.0);

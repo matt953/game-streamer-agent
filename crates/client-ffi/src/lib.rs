@@ -108,7 +108,11 @@ pub unsafe extern "C" fn gsa_spike_connect(url: *const c_char, seconds: i32) -> 
             _ => return -4,
         };
         let source_id: SourceId = sources[0].id;
-        if client.start_session(source_id, None).await.is_err() {
+        if client
+            .start_session(source_id, None, None, false)
+            .await
+            .is_err()
+        {
             return -5;
         }
 
@@ -162,13 +166,18 @@ pub struct GsaCallbacks {
     /// ignored so new ones stay backward-compatible.
     pub on_notification: Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32, arg: u32)>,
     /// Periodic encoder/network telemetry (~1 Hz): agent target + emitted
-    /// bitrate, client received goodput (all bits/s), and the agent's ABR state.
+    /// bitrate + manual ceiling + ABR's network estimate (0 = unmeasured),
+    /// client received goodput (all bits/s), frames dropped incomplete
+    /// (cumulative), and the agent's ABR state.
     pub on_stats: Option<
         unsafe extern "C" fn(
             ctx: *mut c_void,
             target_bps: u32,
             emitted_bps: u32,
+            ceiling_bps: u32,
+            estimate_bps: u32,
             recv_bps: u32,
+            dropped_frames: u32,
             abr_enabled: bool,
         ),
     >,
@@ -216,6 +225,10 @@ enum SessionReady {
 /// H.264 is always included as the fallback regardless. Query the codec the
 /// agent actually chose with [`gsa_session_codec`].
 ///
+/// `bitrate_bps` is the initial bitrate ceiling (0 = the agent's configured
+/// default); `abr` turns adaptive bitrate on from the first frame. Both remain
+/// adjustable live via [`gsa_set_bitrate`] / [`gsa_set_abr`].
+///
 /// Returns an owned session handle, or NULL on failure (bad url, runtime init,
 /// connect, or start-session). Call `gsa_session_stop` to release.
 ///
@@ -228,6 +241,8 @@ pub unsafe extern "C" fn gsa_session_start(
     url: *const c_char,
     source_id: u32,
     decode_codecs: u32,
+    bitrate_bps: u32,
+    abr: bool,
     callbacks: GsaCallbacks,
 ) -> *mut GsaSession {
     if url.is_null() {
@@ -268,8 +283,12 @@ pub unsafe extern "C" fn gsa_session_start(
         };
         rt.block_on(session_loop(
             addr,
-            source_id,
-            codecs_from_flags(decode_codecs),
+            SessionOpts {
+                source_id,
+                decode_codecs: codecs_from_flags(decode_codecs),
+                bitrate_bps: (bitrate_bps > 0).then_some(bitrate_bps),
+                abr,
+            },
             cbs,
             thread_stop,
             ready_tx,
@@ -536,14 +555,27 @@ pub unsafe extern "C" fn gsa_list_sources(
 /// The session body: connect, take audio, start `source_id`, then pump encoded
 /// video to `on_video` and PCM to `on_audio` until `stop` fires or the
 /// connection closes. Reports readiness through `ready_tx`.
-async fn session_loop(
-    addr: std::net::SocketAddr,
+/// What to stream and how to start it (the `gsa_session_start` args).
+struct SessionOpts {
     source_id: u32,
     decode_codecs: Vec<Codec>,
+    bitrate_bps: Option<u32>,
+    abr: bool,
+}
+
+async fn session_loop(
+    addr: std::net::SocketAddr,
+    opts: SessionOpts,
     cbs: SendCallbacks,
     stop: Arc<Notify>,
     ready_tx: std::sync::mpsc::Sender<SessionReady>,
 ) {
+    let SessionOpts {
+        source_id,
+        decode_codecs,
+        bitrate_bps,
+        abr,
+    } = opts;
     let cbs = cbs.0;
     let mut client = match Client::connect(
         addr,
@@ -569,7 +601,7 @@ async fn session_loop(
         }
     };
     if client
-        .start_session(SourceId(source_id), None)
+        .start_session(SourceId(source_id), None, bitrate_bps, abr)
         .await
         .is_err()
     {
@@ -606,9 +638,11 @@ async fn session_loop(
         }
     });
 
-    // Latest client received goodput (bps), refreshed off the frame path and
-    // reported alongside the agent's telemetry on each `EncodeStats`.
+    // Latest client received goodput (bps) and cumulative incomplete-frame
+    // drops, refreshed off the frame path and reported alongside the agent's
+    // telemetry on each `EncodeStats`.
     let mut recv_bps: u32 = 0;
+    let mut dropped_frames: u32 = 0;
     let mut frames: u64 = 0;
     loop {
         tokio::select! {
@@ -631,12 +665,14 @@ async fn session_loop(
                         ControlEvent::EncodeStats {
                             target_bitrate_bps,
                             emitted_bitrate_bps,
+                            ceiling_bitrate_bps,
+                            estimate_bitrate_bps,
                             abr_enabled,
                         } => {
                             if let Some(cb) = cbs.on_stats {
                                 // SAFETY: `ctx` valid for the session per the contract.
                                 unsafe {
-                                    cb(cbs.ctx, target_bitrate_bps, emitted_bitrate_bps, recv_bps, abr_enabled);
+                                    cb(cbs.ctx, target_bitrate_bps, emitted_bitrate_bps, ceiling_bitrate_bps, estimate_bitrate_bps, recv_bps, dropped_frames, abr_enabled);
                                 }
                             }
                         }
@@ -662,7 +698,9 @@ async fn session_loop(
                     // its windows, so don't do it every frame).
                     frames += 1;
                     if frames.is_multiple_of(15) {
-                        recv_bps = (client.stats().recv_mbps.unwrap_or(0.0) * 1_000_000.0) as u32;
+                        let s = client.stats();
+                        recv_bps = (s.recv_mbps.unwrap_or(0.0) * 1_000_000.0) as u32;
+                        dropped_frames = s.frames_dropped_incomplete as u32;
                     }
                 }
                 _ => break, // closed or errored

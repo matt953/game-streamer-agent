@@ -122,10 +122,13 @@ pub enum ControlEvent {
     GamepadConnected { seat: u8 },
     /// The host's virtual pad for `seat` was unplugged.
     GamepadDisconnected { seat: u8 },
-    /// Periodic encoder telemetry from the agent (target + emitted bitrate, bits/s).
+    /// Periodic encoder telemetry from the agent (target + emitted bitrate +
+    /// manual ceiling, bits/s).
     EncodeStats {
         target_bitrate_bps: u32,
         emitted_bitrate_bps: u32,
+        ceiling_bitrate_bps: u32,
+        estimate_bitrate_bps: u32,
         abr_enabled: bool,
     },
 }
@@ -338,6 +341,8 @@ impl Client {
                             .send(ControlEvent::EncodeStats {
                                 target_bitrate_bps: s.target_bitrate_bps,
                                 emitted_bitrate_bps: s.emitted_bitrate_bps,
+                                ceiling_bitrate_bps: s.ceiling_bitrate_bps,
+                                estimate_bitrate_bps: s.estimate_bitrate_bps,
                                 abr_enabled: s.abr_enabled,
                             })
                             .is_err()
@@ -399,6 +404,8 @@ impl Client {
         &mut self,
         source: gsa_core::id::SourceId,
         mode: Option<VideoMode>,
+        bitrate_bps: Option<u32>,
+        abr: bool,
     ) -> Result<SessionParams> {
         send_msg(
             self.ctl()?,
@@ -406,6 +413,8 @@ impl Client {
                 source,
                 codec_prefs: vec![gsa_core::media::Codec::H264],
                 mode,
+                bitrate_bps,
+                abr,
             }),
         )
         .await?;
@@ -595,6 +604,7 @@ impl Client {
             decode_us_p50: s.decode_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32),
             jitter_us: 0,
             recent_delay_us,
+            recv_bps: s.recv_mbps.map_or(0, |m| (m * 1_000_000.0) as u32),
         }));
     }
 

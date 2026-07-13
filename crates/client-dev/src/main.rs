@@ -41,6 +41,9 @@ struct Cli {
     /// Enable server-side ABR for the session (headless; used by the chaos rig).
     #[arg(long)]
     abr: bool,
+    /// Request a starting bitrate in Mb/s (headless); default: agent config.
+    #[arg(long)]
+    bitrate: Option<u32>,
     /// Pair with the agent instead of streaming: enter the code from `gsa pair`.
     #[arg(long)]
     pair: bool,
@@ -79,6 +82,7 @@ fn main() -> Result<()> {
             cli.source,
             cli.sw_decode,
             cli.abr,
+            cli.bitrate.map(|m| m.saturating_mul(1_000_000)),
             auth,
         ))
     } else {
