@@ -23,6 +23,9 @@ use crate::state::{AgentState, SessionEntry};
 /// keeps the picture alive on a bad link, ceiling bounds a runaway request.
 const BITRATE_MIN_BPS: u32 = 200_000; // 0.2 Mbps
 const BITRATE_MAX_BPS: u32 = 100_000_000; // 100 Mbps
+/// Where ABR opens the encoder when the ceiling is higher — below the ceiling so
+/// the encoder fills the target and the delivered-rate estimate can engage.
+const ABR_START_BPS: u32 = 8_000_000; // 8 Mbps
 
 /// Produces sources on demand (agent wires TestPattern at M0, platform
 /// capture from M1).
@@ -50,6 +53,25 @@ pub trait EncoderFactory: Send + Sync {
             codecs.push(Codec::H264);
         }
         codecs
+    }
+}
+
+/// Resolve a session's (opening bitrate, ABR ceiling) from the client's request
+/// and the agent's configured bitrate.
+///
+/// - **ABR on**: config is the ceiling; the request (or [`ABR_START_BPS`]) is
+///   the ramp start, clamped to the ceiling.
+/// - **ABR off**: the request (or config) is both the fixed rate and the cap.
+fn resolve_bitrates(requested: Option<u32>, abr: bool, config_bps: u32) -> (u32, u32) {
+    if abr {
+        let ceiling = config_bps;
+        let start = requested
+            .map_or(ABR_START_BPS, |b| b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS))
+            .min(ceiling);
+        (start, ceiling)
+    } else {
+        let rate = requested.map_or(config_bps, |b| b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS));
+        (rate, rate)
     }
 }
 
@@ -114,6 +136,8 @@ async fn serve_inner(
     let mut prev_sent_packets = 0u64;
     let mut prev_lost_packets = 0u64;
     let mut tick_count = 0u64;
+    // Latest receiver-reported goodput (bps, at agent-clock µs) — ABR's estimate input.
+    let mut recv_report: Option<(u32, u64)> = None;
 
     let result = loop {
         let msg: C2A = tokio::select! {
@@ -137,9 +161,38 @@ async fn serve_inner(
                     } else {
                         0.0
                     };
-                    let rtt_us = conn.rtt().as_micros().min(u128::from(u32::MAX)) as u32;
-                    let target = ctrl.on_sample(rtt_us, loss, state.clock.now_us());
+                    let rtt = conn.rtt();
+                    let rtt_us = rtt.as_micros().min(u128::from(u32::MAX)) as u32;
+                    let now_us = state.clock.now_us();
+                    // Feed the estimate only when fresh and not app-limited.
+                    let emitted = a.pipeline.emitted_bitrate_bps();
+                    let app_limited = u64::from(emitted) * 100 < u64::from(a.pipeline.bitrate()) * 85;
+                    let estimate_bps = recv_report
+                        .filter(|&(bps, at_us)| {
+                            bps > 0 && !app_limited && now_us.saturating_sub(at_us) < 2_000_000
+                        })
+                        .map(|(bps, _)| bps);
+                    let (target, decision) = ctrl.on_sample(crate::abr::Sample {
+                        rtt_us,
+                        loss,
+                        estimate_bps,
+                        now_us,
+                    });
                     a.pipeline.set_bitrate(target);
+                    if tick_count.is_multiple_of(4) || decision != crate::abr::Decision::Hold {
+                        tracing::debug!(
+                            rtt_ms = rtt_us as f64 / 1000.0,
+                            delay_slope_ms_s = ctrl.delay_slope_us_per_s() / 1000.0,
+                            loss,
+                            est_mbps = estimate_bps.map(|e| f64::from(e) / 1_000_000.0),
+                            app_limited,
+                            emit_mbps = f64::from(emitted) / 1_000_000.0,
+                            target_mbps = f64::from(target) / 1_000_000.0,
+                            ceiling_mbps = f64::from(ctrl.ceiling_bps()) / 1_000_000.0,
+                            ?decision,
+                            "abr"
+                        );
+                    }
                 }
                 if tick_count.is_multiple_of(4)
                     && let Some(a) = &active
@@ -147,6 +200,14 @@ async fn serve_inner(
                     let stats = EncodeStats {
                         target_bitrate_bps: a.pipeline.bitrate(),
                         emitted_bitrate_bps: a.pipeline.emitted_bitrate_bps(),
+                        ceiling_bitrate_bps: abr
+                            .as_ref()
+                            .map_or_else(|| a.pipeline.bitrate(), |c| c.ceiling_bps()),
+                        estimate_bitrate_bps: abr
+                            .as_ref()
+                            .filter(|_| abr_enabled)
+                            .and_then(|c| c.estimate_cap_bps())
+                            .unwrap_or(0),
                         abr_enabled,
                     };
                     if let Err(e) = send_msg(&mut send, &A2C::EncodeStats(stats)).await {
@@ -228,11 +289,12 @@ async fn serve_inner(
                     Ok(started) => {
                         let (mode, bitrate, codec) = (started.mode, started.bitrate, started.codec);
                         let session_id = started.session.id;
-                        // Seed ABR with this session's bitrate as its ceiling.
-                        abr = Some(crate::abr::AbrController::new(
-                            bitrate,
-                            state.clock.now_us(),
-                        ));
+                        // Controller ramps from the opened bitrate up to the ceiling.
+                        let mut ctrl =
+                            crate::abr::AbrController::new(started.ceiling, state.clock.now_us());
+                        ctrl.sync_target(bitrate);
+                        abr = Some(ctrl);
+                        abr_enabled = req.abr;
                         active = Some(started.session);
                         send_msg(
                             &mut send,
@@ -316,7 +378,7 @@ async fn serve_inner(
             C2A::FrameAck { .. } => { /* full NACK/ref-invalidation ladder lands at M3 (spec 04) */
             }
             C2A::StatsReport(stats) => {
-                // Informational now — ABR runs off the agent's own path signals.
+                recv_report = Some((stats.recv_bps, state.clock.now_us()));
                 tracing::debug!(peer, ?stats, "client stats");
             }
             C2A::InputBatch(events) => {
@@ -371,7 +433,11 @@ struct ActiveSession {
 struct StartedSession {
     session: ActiveSession,
     mode: VideoMode,
+    /// The rate the encoder opened at — the ABR start (≤ ceiling) or, without
+    /// ABR, the manual rate.
     bitrate: u32,
+    /// The cap ABR ramps toward (equals `bitrate` without ABR).
+    ceiling: u32,
     codec: Codec,
 }
 
@@ -398,7 +464,8 @@ fn start_session(
         .mode
         .or_else(|| descriptor.modes.first().copied())
         .unwrap_or(state.config.video.mode);
-    let bitrate = state.config.video.bitrate_bps;
+    let (bitrate, ceiling) =
+        resolve_bitrates(req.bitrate_bps, req.abr, state.config.video.bitrate_bps);
 
     // Desktop / virtual displays inject at the OS level; emulators consume
     // input in-process and get no OS injector.
@@ -449,6 +516,7 @@ fn start_session(
         },
         mode,
         bitrate,
+        ceiling,
         codec,
     })
 }
@@ -457,4 +525,65 @@ fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "gsa-agent".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG: u32 = 8_000_000;
+
+    #[test]
+    fn abr_uses_config_as_ceiling_and_request_as_start() {
+        // The convergence-CI case: agent config 8, client requests a 2 Mb/s
+        // start. Ceiling must stay 8 (else ABR can't ramp) and start must be 2.
+        assert_eq!(
+            resolve_bitrates(Some(2_000_000), true, CONFIG),
+            (2_000_000, CONFIG)
+        );
+    }
+
+    #[test]
+    fn abr_without_a_request_starts_at_the_safe_default() {
+        // The apps' case: they request nothing → start at ABR_START, ceiling
+        // is the agent config.
+        assert_eq!(
+            resolve_bitrates(None, true, 35_000_000),
+            (ABR_START_BPS, 35_000_000)
+        );
+    }
+
+    #[test]
+    fn abr_start_never_exceeds_the_ceiling() {
+        // A requested start above the ceiling is clamped down to it.
+        assert_eq!(
+            resolve_bitrates(Some(50_000_000), true, CONFIG),
+            (CONFIG, CONFIG)
+        );
+        // And a low config still caps the default start.
+        assert_eq!(
+            resolve_bitrates(None, true, 4_000_000),
+            (4_000_000, 4_000_000)
+        );
+    }
+
+    #[test]
+    fn manual_rate_is_both_the_rate_and_the_cap() {
+        assert_eq!(
+            resolve_bitrates(Some(25_000_000), false, CONFIG),
+            (25_000_000, 25_000_000)
+        );
+        assert_eq!(resolve_bitrates(None, false, CONFIG), (CONFIG, CONFIG));
+    }
+
+    #[test]
+    fn requests_are_clamped_to_the_safety_band() {
+        // Above the max and below the floor, ABR-off (so the clamp is visible
+        // in the returned rate).
+        assert_eq!(
+            resolve_bitrates(Some(999_000_000), false, CONFIG).0,
+            BITRATE_MAX_BPS
+        );
+        assert_eq!(resolve_bitrates(Some(1), false, CONFIG).0, BITRATE_MIN_BPS);
+    }
 }

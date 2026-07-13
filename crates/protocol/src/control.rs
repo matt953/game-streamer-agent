@@ -70,6 +70,12 @@ pub struct EncodeStats {
     pub target_bitrate_bps: u32,
     /// Rolling emitted video bitrate (bits/s) over ~1 s — the encoder's output.
     pub emitted_bitrate_bps: u32,
+    /// The manual bitrate cap (bits/s) ABR adapts under; equals the target
+    /// when ABR is off.
+    pub ceiling_bitrate_bps: u32,
+    /// ABR's dynamic network cap (bits/s): the headroom-scaled transport
+    /// delivered-rate estimate. 0 when unmeasured or ABR is off.
+    pub estimate_bitrate_bps: u32,
     /// Whether ABR is driving the bitrate, as the agent has it.
     pub abr_enabled: bool,
 }
@@ -113,6 +119,11 @@ pub struct SessionRequest {
     pub source: SourceId,
     pub codec_prefs: Vec<Codec>,
     pub mode: Option<VideoMode>,
+    /// Starting bitrate (bits/s); `None` uses the agent's default. With `abr`
+    /// it's the ramp start (ceiling stays the agent's max); without it, the rate.
+    pub bitrate_bps: Option<u32>,
+    /// Whether ABR drives the bitrate from the first frame.
+    pub abr: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +176,9 @@ pub struct ClientStats {
     pub jitter_us: u32,
     /// Recent one-way delay (µs, capture→received p50) — the ABR delay signal.
     pub recent_delay_us: u32,
+    /// Rolling received video goodput (bits/s) the receiver measured — ABR's
+    /// delivered-rate estimate input.
+    pub recv_bps: u32,
 }
 
 #[cfg(test)]
