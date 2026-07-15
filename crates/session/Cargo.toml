@@ -28,3 +28,4 @@ workspace = true
 
 [dev-dependencies]
 fastrand = "2"
+tracing-subscriber = { workspace = true }

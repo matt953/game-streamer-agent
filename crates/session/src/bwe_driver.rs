@@ -24,6 +24,12 @@ pub struct BweDriver {
     epoch_agent_us: u64,
 }
 
+impl std::fmt::Debug for BweDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BweDriver").finish_non_exhaustive()
+    }
+}
+
 impl BweDriver {
     #[must_use]
     pub fn new(start_bps: u32, now_agent_us: u64) -> Self {
