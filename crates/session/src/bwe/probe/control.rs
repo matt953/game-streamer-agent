@@ -22,6 +22,10 @@ const MIN_TIME_BETWEEN_ALR_PROBES: Duration = Duration::from_secs(5);
 /// collapsed: the probe is no longer meaningful context.
 const ESTIMATE_COLLAPSE_FACTOR: f64 = 0.5;
 
+/// How long the estimate's high-water mark stays relevant for large-drop
+/// detection before it re-anchors to the current level.
+const RECENT_HIGH_WINDOW: Duration = Duration::from_secs(10);
+
 /// Allows probing up to 2x max_bitrate to account for bursty streams.
 const MAX_PROBE_BITRATE_FACTOR: f64 = 2.0;
 
@@ -55,6 +59,10 @@ pub struct ProbeControl {
     last_cause: BandwidthLimitedCause,
 
     prev_estimate: Option<Bitrate>,
+
+    /// Recent high-water mark of the estimate, for drop detection: a gradual
+    /// crush never falls 34% in one step, so per-step comparison misses it.
+    recent_high: Option<(Bitrate, Instant)>,
 
     alr_start: Option<Instant>,
     alr_stop: Option<Instant>,
@@ -98,6 +106,7 @@ impl Default for ProbeControl {
             last_estimate_change: None,
             last_cause: BandwidthLimitedCause::DelayBasedLimited,
             prev_estimate: None,
+            recent_high: None,
             alr_start: None,
             alr_stop: None,
             next_cluster_id: 0.into(),
@@ -130,6 +139,7 @@ impl ProbeControl {
             self.last_stagnant = None;
             self.last_probe = None;
             self.prev_estimate = None;
+            self.recent_high = None;
             self.scheduled_exponential = None;
             self.scheduled_periodic_alr = None;
             self.scheduled_stagnant = None;
@@ -223,21 +233,34 @@ impl ProbeControl {
             return Some(config);
         }
 
-        // Can't probe in certain bandwidth-limited states — except a slow
-        // periodic probe while loss-limited: with light media the loss
-        // controller's ramp-up is bounded by the acknowledged rate, so a
-        // probe is the only exit from a stale loss-limited estimate.
-        let stale_loss_limited = self.last_cause == BandwidthLimitedCause::LossLimitedBwe
-            && self.time_since_last_probe(now) > 2 * MIN_TIME_BETWEEN_ALR_PROBES;
-        if !self.can_probe(estimate) && !stale_loss_limited {
+        // Drop detection must run before the probing gate: the gate itself
+        // opens for a pending large drop.
+        self.track_drop(now, estimate);
+
+        // Can't probe in certain bandwidth-limited states — with two
+        // loss-limited exceptions, because with light media the loss
+        // controller's ramp-up is bounded by the acknowledged rate and a
+        // probe is the only exit: a prompt recovery probe after a large
+        // drop, and a slow periodic probe once the estimate has gone stale.
+        // Active delay increase still blocks everything (the queue is
+        // draining; probing would re-excite it).
+        let loss_limited = self.last_cause == BandwidthLimitedCause::LossLimitedBwe;
+        let drop_recovery = loss_limited
+            && self.large_drop.is_some()
+            && self.time_since_last_probe(now) >= MAX_WAITING_TIME_FOR_PROBING_RESULT;
+        let stale_loss_limited =
+            loss_limited && self.time_since_last_probe(now) > 2 * MIN_TIME_BETWEEN_ALR_PROBES;
+        if !self.can_probe(estimate) && !drop_recovery && !stale_loss_limited {
             return None;
         }
 
         // Try each probe type in order - only one fires per timeout.
+        // Large-drop recovery outranks the exponential ladder: one probe
+        // near the pre-drop rate beats climbing back one doubling at a time.
         let _ = self.maybe_initial(now, desired, estimate)
+            || self.maybe_large_drop(now, desired, estimate)
             || self.maybe_exponential(now, desired, estimate)
             || self.maybe_increase_alr(now, desired, estimate)
-            || self.maybe_large_drop(now, desired, estimate)
             || self.maybe_periodic_alr(now, desired, estimate)
             || self.maybe_stagnant(now, desired, estimate);
 
@@ -475,21 +498,32 @@ impl ProbeControl {
         true
     }
 
+    /// Detect large drops against the recent high-water mark: a crush
+    /// arriving as successive moderate cuts must still read as one drop.
+    fn track_drop(&mut self, now: Instant, estimate: Bitrate) {
+        let high = match self.recent_high {
+            Some((v, t))
+                if estimate <= v && now.saturating_duration_since(t) <= RECENT_HIGH_WINDOW =>
+            {
+                v
+            }
+            _ => {
+                self.recent_high = Some((estimate, now));
+                estimate
+            }
+        };
+        if self.large_drop.is_none() && estimate < high * BITRATE_DROP_THRESHOLD {
+            self.large_drop = Some(LargeDrop {
+                when: now,
+                bitrate_before: high,
+            });
+        }
+    }
+
     fn maybe_large_drop(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
         // Don't interfere with initial probing phase.
         if self.is_during_initial(now) {
             return false;
-        }
-
-        // Detect large drops: estimate fell below 66% of previous.
-        if self.large_drop.is_none()
-            && let Some(prev) = self.prev_estimate
-            && estimate < prev * BITRATE_DROP_THRESHOLD
-        {
-            self.large_drop = Some(LargeDrop {
-                when: now,
-                bitrate_before: prev,
-            });
         }
 
         // No large drop detected.
@@ -503,21 +537,31 @@ impl ProbeControl {
             return false;
         }
 
-        // Large-drop probing requires ALR context (in ALR or recently exited).
-        if !self.in_alr() && !self.alr_ended_recently(now) {
+        // A collapsed estimate is context enough on its own: media is
+        // necessarily light relative to the pre-drop rate, so the recovery
+        // probe cannot meaningfully add congestion. Otherwise require ALR
+        // context (in ALR or recently exited).
+        let collapsed = estimate < drop.bitrate_before * ESTIMATE_COLLAPSE_FACTOR;
+        if !collapsed && !self.in_alr() && !self.alr_ended_recently(now) {
             return false;
         }
 
-        // Respect minimum interval between ALR probes.
-        if self.time_since_last_probe(now) < MIN_TIME_BETWEEN_ALR_PROBES {
+        // Collapsed recovery probes promptly; otherwise respect the minimum
+        // interval between ALR probes.
+        let min_wait = if collapsed {
+            MAX_WAITING_TIME_FOR_PROBING_RESULT
+        } else {
+            MIN_TIME_BETWEEN_ALR_PROBES
+        };
+        if self.time_since_last_probe(now) < min_wait {
             return false;
         }
 
-        // Probe at 85% of pre-drop bitrate.
+        // Probe at 85% of pre-drop bitrate. The drop context stays armed so
+        // a failed recovery probe retries until the drop window expires.
         let target = drop.bitrate_before * PROBE_FRACTION_AFTER_DROP;
+        tracing::trace!("large-drop recovery probe at {}", target);
         self.queue_probe(target, ProbeKind::LargeDrop, desired, now);
-
-        self.large_drop = None;
         true
     }
 
