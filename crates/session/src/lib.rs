@@ -5,6 +5,8 @@
 pub mod abr;
 pub mod admin;
 pub mod audio_pipeline;
+#[allow(dead_code)] // consumed when the v2 controller replaces v1
+pub(crate) mod bwe;
 pub mod pairing;
 pub mod pipeline;
 pub mod service;
