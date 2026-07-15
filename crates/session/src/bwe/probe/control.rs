@@ -229,7 +229,7 @@ impl ProbeControl {
             || self.maybe_exponential(now, desired, estimate)
             || self.maybe_increase_alr(now, desired, estimate)
             || self.maybe_large_drop(now, desired, estimate)
-            || self.maybe_periodic_alr(now, desired)
+            || self.maybe_periodic_alr(now, desired, estimate)
             || self.maybe_stagnant(now, desired, estimate);
 
         self.update_estimate_change(now, estimate);
@@ -357,7 +357,7 @@ impl ProbeControl {
         true
     }
 
-    fn maybe_periodic_alr(&mut self, now: Instant, desired: Bitrate) -> bool {
+    fn maybe_periodic_alr(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
         // Don't interfere with initial probing phase.
         if self.is_during_initial(now) {
             return false;
@@ -373,10 +373,10 @@ impl ProbeControl {
             return false;
         }
 
-        // Periodic ALR probe at 2× desired (capped by queue_probe to 2× desired anyway).
-        // Using desired rather than estimate allows discovering higher capacity when
-        // the app wants more bandwidth than currently estimated.
-        let target = desired * self.config.further_exponential_probe_scale;
+        // Step from the current estimate; never probe past what media would
+        // ever use. Stepping from `desired` floods small links when the cap
+        // is far above them.
+        let target = (estimate * self.config.further_exponential_probe_scale).min(desired);
         self.queue_probe(target, ProbeKind::PeriodicAlr, desired, now);
         true
     }
