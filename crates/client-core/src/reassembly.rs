@@ -126,6 +126,7 @@ mod tests {
 
     fn hdr(frame_id: u32, index: u16, count: u16) -> VideoDatagramHeader {
         VideoDatagramHeader {
+            seq: 0,
             session_epoch: 0,
             frame_id,
             kind: FrameKind::P,

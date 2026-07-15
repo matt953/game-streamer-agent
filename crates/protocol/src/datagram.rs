@@ -17,6 +17,9 @@ use gsa_core::media::FrameKind;
 pub enum DatagramType {
     Video,
     Audio,
+    /// Discardable pacer filler: loads the wire for bandwidth probing; the
+    /// receiver records its arrival (per-packet feedback) and drops it.
+    Padding,
 }
 
 impl DatagramType {
@@ -25,6 +28,7 @@ impl DatagramType {
         match self {
             DatagramType::Video => 1,
             DatagramType::Audio => 2,
+            DatagramType::Padding => 3,
         }
     }
 
@@ -32,14 +36,54 @@ impl DatagramType {
         Ok(match b {
             1 => DatagramType::Video,
             2 => DatagramType::Audio,
+            3 => DatagramType::Padding,
             other => return Err(ProtocolError::UnknownDatagramType(other)),
         })
     }
 }
 
+/// Transport-wide sequence number: bytes [1..5] of every video and padding
+/// datagram, in send order — stamped by the pacer at send time (probe and
+/// media packets share one sequence space, like WebRTC's transport-wide CC).
+pub const SEQ_OFFSET: usize = 1;
+
+/// Stamp the send-order sequence into an encoded datagram (video or padding).
+pub fn stamp_seq(datagram: &mut [u8], seq: u32) {
+    datagram[SEQ_OFFSET..SEQ_OFFSET + 4].copy_from_slice(&seq.to_be_bytes());
+}
+
+/// Read the transport-wide sequence from a video or padding datagram.
+pub fn read_seq(datagram: &[u8]) -> Result<u32, ProtocolError> {
+    if datagram.len() < SEQ_OFFSET + 4 {
+        return Err(ProtocolError::TooShort {
+            got: datagram.len(),
+            need: SEQ_OFFSET + 4,
+        });
+    }
+    Ok(u32::from_be_bytes(
+        datagram[SEQ_OFFSET..SEQ_OFFSET + 4]
+            .try_into()
+            .expect("sized"),
+    ))
+}
+
+/// Build a padding datagram of exactly `len` bytes (≥ header). Sequence is
+/// stamped at send time like every datagram.
+#[must_use]
+pub fn encode_padding(len: usize) -> Vec<u8> {
+    let len = len.max(PADDING_HEADER_LEN);
+    let mut out = vec![0u8; len];
+    out[0] = DatagramType::Padding.to_wire();
+    out
+}
+
+pub const PADDING_HEADER_LEN: usize = 1 + 4;
+
 /// Parsed header of a video datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoDatagramHeader {
+    /// Send-order transport sequence (see [`SEQ_OFFSET`]); 0 until stamped.
+    pub seq: u32,
     /// Bumps on encoder reset; receivers discard stale-epoch chunks.
     pub session_epoch: u8,
     /// Truncated frame id (`FrameId::wire`).
@@ -51,7 +95,7 @@ pub struct VideoDatagramHeader {
     pub capture_ts_us: u32,
 }
 
-pub const VIDEO_HEADER_LEN: usize = 1 + 1 + 4 + 1 + 2 + 2 + 4;
+pub const VIDEO_HEADER_LEN: usize = 1 + 4 + 1 + 4 + 1 + 2 + 2 + 4;
 
 impl VideoDatagramHeader {
     /// Serialize the header followed by `payload` into a fresh buffer.
@@ -59,6 +103,7 @@ impl VideoDatagramHeader {
     pub fn encode_with_payload(&self, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(VIDEO_HEADER_LEN + payload.len());
         out.push(DatagramType::Video.to_wire());
+        out.extend_from_slice(&self.seq.to_be_bytes());
         out.push(self.session_epoch);
         out.extend_from_slice(&self.frame_id.to_be_bytes());
         out.push(self.kind.to_wire());
@@ -82,12 +127,13 @@ impl VideoDatagramHeader {
         if ty != DatagramType::Video {
             return Err(ProtocolError::UnknownDatagramType(datagram[0]));
         }
-        let session_epoch = datagram[1];
-        let frame_id = u32::from_be_bytes(datagram[2..6].try_into().expect("sized"));
-        let kind = FrameKind::from_wire(datagram[6])?;
-        let chunk_index = u16::from_be_bytes(datagram[7..9].try_into().expect("sized"));
-        let chunk_count = u16::from_be_bytes(datagram[9..11].try_into().expect("sized"));
-        let capture_ts_us = u32::from_be_bytes(datagram[11..15].try_into().expect("sized"));
+        let seq = u32::from_be_bytes(datagram[1..5].try_into().expect("sized"));
+        let session_epoch = datagram[5];
+        let frame_id = u32::from_be_bytes(datagram[6..10].try_into().expect("sized"));
+        let kind = FrameKind::from_wire(datagram[10])?;
+        let chunk_index = u16::from_be_bytes(datagram[11..13].try_into().expect("sized"));
+        let chunk_count = u16::from_be_bytes(datagram[13..15].try_into().expect("sized"));
+        let capture_ts_us = u32::from_be_bytes(datagram[15..19].try_into().expect("sized"));
         if chunk_count == 0 || chunk_index >= chunk_count {
             return Err(ProtocolError::InvalidChunk {
                 index: chunk_index,
@@ -96,6 +142,7 @@ impl VideoDatagramHeader {
         }
         Ok((
             Self {
+                seq,
                 session_epoch,
                 frame_id,
                 kind,

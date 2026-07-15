@@ -236,6 +236,7 @@ pub fn start(
             }
             let max = conn.max_datagram_size().unwrap_or(DEFAULT_MAX_DATAGRAM);
             let header = VideoDatagramHeader {
+                seq: 0, // stamped per datagram at send time
                 session_epoch: 0,
                 frame_id: chunk.frame_id.wire(),
                 kind: chunk.kind,

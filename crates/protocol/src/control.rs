@@ -25,6 +25,8 @@ pub enum C2A {
     /// its reference chain (missed/corrupt frame) and needs to resync
     /// (spec 04 loss-recovery ladder).
     RequestKeyframe,
+    /// Per-packet arrival feedback batch (see [`PacketFeedback`]).
+    PacketFeedback(PacketFeedback),
     /// Set the encode target bitrate (bps). When ABR is off this is the live
     /// target; when ABR is on it's the ceiling ABR adapts below (spec 04). The
     /// agent clamps to a sane range.
@@ -166,6 +168,18 @@ pub enum SessionEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtoErrorMsg {
     pub message: String,
+}
+
+/// Per-packet arrival feedback (the TWCC equivalent): the receiver reports
+/// every datagram's transport sequence and arrival time, batched on the
+/// control stream (~20 Hz). Drives the delay-gradient bandwidth estimator.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PacketFeedback {
+    /// Receiver clock (µs) the batch's deltas are relative to.
+    pub base_arrival_us: u64,
+    /// `(seq, arrival − base_arrival_us)` per received datagram, send-order
+    /// gaps meaning loss. Capped per batch; overflow rolls to the next batch.
+    pub samples: Vec<(u32, u32)>,
 }
 
 /// Per-interval client feedback that drives ABR (spec 04).
