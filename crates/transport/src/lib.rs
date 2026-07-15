@@ -66,6 +66,71 @@ fn tuned_socket(addr: SocketAddr) -> Result<UdpSocket> {
     Ok(sock)
 }
 
+/// Fixed-window congestion controller for the media tunnel: rate control is
+/// the application estimator's job; the transport must not second-guess it
+/// by pacing datagrams to its own bandwidth opinion. Reliable streams share
+/// the window but carry little.
+#[derive(Debug, Clone)]
+pub struct PermissiveCcConfig {
+    /// Fixed congestion window (bytes): sized for the protocol maximum at a
+    /// generous rtt (150 Mb/s x 400 ms).
+    pub window: u64,
+}
+
+impl Default for PermissiveCcConfig {
+    fn default() -> Self {
+        Self {
+            window: 8 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PermissiveCc {
+    window: u64,
+}
+
+impl quinn::congestion::Controller for PermissiveCc {
+    fn on_congestion_event(
+        &mut self,
+        _now: std::time::Instant,
+        _sent: std::time::Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+impl quinn::congestion::ControllerFactory for PermissiveCcConfig {
+    fn build(
+        self: Arc<Self>,
+        _now: std::time::Instant,
+        _current_mtu: u16,
+    ) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(PermissiveCc {
+            window: self.window,
+        })
+    }
+}
+
 /// Shared transport tuning for both ends.
 fn transport_config() -> TransportConfig {
     let mut tc = TransportConfig::default();
@@ -77,9 +142,15 @@ fn transport_config() -> TransportConfig {
     // Cap the datagram send queue (~60 ms at 35 Mb/s) so a sender outpacing the
     // path sheds stale datagrams instead of queueing seconds of them.
     tc.datagram_send_buffer_size(256 * 1024);
-    // BBR, not cubic: cubic halves its window on any loss, so random Wi-Fi/
-    // cellular loss would throttle the tunnel below the link's real capacity.
-    tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // A fixed permissive window: the application estimator owns rate control;
+    // a transport controller pacing datagrams to its own bandwidth opinion
+    // strangles the estimator's probes (measured on radio links).
+    // GSA_TUNNEL_CC=bbr restores the old behavior for A/B diagnosis.
+    if std::env::var("GSA_TUNNEL_CC").as_deref() == Ok("bbr") {
+        tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    } else {
+        tc.congestion_controller_factory(Arc::new(PermissiveCcConfig::default()));
+    }
     // Pin the UDP payload to the QUIC baseline (1200 B) and disable Path-MTU
     // discovery — discovery overshoots on reduced-MTU paths (VPN/5G) and the
     // oversized datagrams get dropped. (TODO: make this a knob / re-enable
