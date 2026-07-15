@@ -1,0 +1,10 @@
+#!/bin/sh
+# Local pre-commit gate (enable once with: git config core.hooksPath .githooks).
+# Runs the fast quality checks (userspace UDP
+# shaper — no root, any platform). This never runs in cloud CI, only locally.
+# Bypass in a genuine pinch with `git commit --no-verify`.
+set -e
+echo "[pre-commit] fmt…"    ; cargo fmt --all --check
+echo "[pre-commit] clippy…" ; cargo clippy --workspace --all-targets -- -D warnings
+echo "[pre-commit] tests…"  ; cargo test --workspace
+echo "[pre-commit] OK"

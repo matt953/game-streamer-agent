@@ -131,6 +131,8 @@ fn run_generator(mode: VideoMode, clock: MediaClock, sink: FrameSink, stop: &Ato
     // ~80 kbps and never fills a real pipe). For manually stressing ABR on a
     // hardware encoder — openh264 can't sustain it, so the CI rig doesn't use it.
     let noise = std::env::var_os("GSA_TESTPATTERN_NOISE").is_some();
+    // Compressible-but-hungry load for the ABR-convergence rig (see `draw_detail`).
+    let detail = std::env::var_os("GSA_TESTPATTERN_DETAIL").is_some();
 
     tracing::debug!(
         width = w,
@@ -143,6 +145,8 @@ fn run_generator(mode: VideoMode, clock: MediaClock, sink: FrameSink, stop: &Ato
         let mut buf = vec![0u8; stride * h];
         if noise {
             draw_noise(&mut buf, w, h, stride, index);
+        } else if detail {
+            draw_detail(&mut buf, w, h, stride, index);
         } else {
             draw(&mut buf, w, h, stride, index);
         }
@@ -218,6 +222,30 @@ fn draw_noise(buf: &mut [u8], w: usize, h: usize, stride: usize, index: u32) {
             buf[px] = v as u8;
             buf[px + 1] = (v >> 8) as u8;
             buf[px + 2] = (v >> 16) as u8;
+            buf[px + 3] = 0xff;
+        }
+    }
+}
+
+/// A moving plaid of low-frequency gradient ramps that deforms over time: carries
+/// several Mb/s at a high ceiling but quantizes down cleanly under a tight cap,
+/// while staying cheap enough for the sw encoder to keep real-time.
+fn draw_detail(buf: &mut [u8], w: usize, h: usize, stride: usize, index: u32) {
+    // Triangle wave over an 8-bit phase → linear ramps (cheap, deterministic).
+    let tri = |p: i32| -> u8 {
+        let m = (p & 0xff) as u8;
+        if m < 128 { m * 2 } else { (255 - m) * 2 }
+    };
+    let t = index as i32;
+    for y in 0..h {
+        let row = y * stride;
+        let yy = y as i32;
+        for x in 0..w {
+            let px = row + x * 4;
+            let xx = x as i32;
+            buf[px] = tri((xx + yy) * 4 + t * 5); // B
+            buf[px + 1] = tri(yy * 4 + t * 3); // G
+            buf[px + 2] = tri(xx * 4 + t * 2); // R
             buf[px + 3] = 0xff;
         }
     }

@@ -2,10 +2,12 @@
 //! `cargo xtask ci-e2e` runs the loopback pipeline and asserts on it; the
 //! JSON report it writes is the latency-ledger artifact (spec 13).
 
+mod shaper;
+
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -29,14 +31,6 @@ enum Cmd {
         #[arg(long, default_value = "target/e2e-report.json")]
         report: PathBuf,
     },
-    /// Network-chaos e2e (Linux): shape the loopback (loss/jitter/rate) with
-    /// `tc netem` and assert the stream stays playable with ABR on — the M3
-    /// exit criterion (spec 04). Needs sudo + NET_ADMIN.
-    CiChaos {
-        /// Frames to stream under the shaped link.
-        #[arg(long, default_value_t = 300)]
-        frames: u32,
-    },
     /// macOS: code-sign the built debug binaries with a stable identity so
     /// Screen Recording / Accessibility grants survive rebuilds.
     DevSign {
@@ -49,7 +43,6 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::CiE2e { frames, report } => ci_e2e(frames, &report),
-        Cmd::CiChaos { frames } => ci_chaos(frames),
         Cmd::DevSign { identity } => dev_sign(identity),
     }
 }
@@ -218,127 +211,8 @@ fn ci_e2e(frames: u32, report_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Shape the loopback and assert the pipeline stays playable with ABR on. The
-/// budget is the real test: if loss recovery breaks under shaping, the stream
-/// slideshows and can't deliver `frames` in time.
-fn ci_chaos(frames: u32) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!("ci-chaos is Linux-only (uses tc/netem)");
-    }
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    eprintln!("[ci-chaos] building agent + client...");
-    let status = Command::new(&cargo)
-        .args(["build", "-p", "gsa-agent", "-p", "gsa-client-dev"])
-        .status()
-        .context("cargo build")?;
-    if !status.success() {
-        bail!("build failed");
-    }
-
-    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let addr = format!("127.0.0.1:{port}");
-    let socket = control_socket_for_test(port);
-    let exe = |name: &str| PathBuf::from("target/debug").join(name);
-
-    // The M3 exit profile: ~30 ms RTT (each way on lo) + jitter, 2% loss, 20 Mbit.
-    eprintln!("[ci-chaos] shaping lo: delay 15ms±5ms, loss 2%, rate 20mbit");
-    tc(&[
-        "qdisc", "replace", "dev", "lo", "root", "netem", "delay", "15ms", "5ms", "loss", "2%",
-        "rate", "20mbit",
-    ])?;
-    let _netem = NetemGuard; // tears the qdisc down on any exit path
-
-    let agent = KillOnDrop(
-        Command::new(exe("gsa"))
-            .args(["run", "--listen", &addr, "--control-socket", &socket])
-            .env("RUST_LOG", "info")
-            .env("GSA_DEV_OPEN", "1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("spawn agent")?,
-    );
-    std::thread::sleep(Duration::from_millis(1500));
-
-    let report_path = std::env::temp_dir().join(format!("gsa-chaos-{port}.json"));
-    eprintln!("[ci-chaos] streaming {frames} frames with ABR under chaos...");
-    let mut child = Command::new(exe("gsa-client-dev"))
-        .args([
-            "--connect",
-            &addr,
-            "--headless",
-            "--json",
-            "--abr",
-            "--frames",
-            &frames.to_string(),
-        ])
-        .env("GSA_DEV_OPEN", "1")
-        .stdout(Stdio::from(std::fs::File::create(&report_path)?))
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("spawn client")?;
-
-    // Generous budget (~8× real-time): a stall shows up as never finishing.
-    let budget = Duration::from_secs(u64::from(frames) / 15 + 20);
-    let deadline = Instant::now() + budget;
-    let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break s;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("client did not deliver {frames} frames within {budget:?} under chaos — stalled");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    if !status.success() {
-        bail!("client failed under chaos: {status}");
-    }
-    drop(agent);
-
-    let report: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(&report_path)?).context("parse client JSON")?;
-    let p50 = report["latency_ms_p50"].as_f64();
-    let dropped = report["frames_dropped_incomplete"].as_u64().unwrap_or(0);
-    let recv = report["recv_mbps"].as_f64().unwrap_or(0.0);
-    eprintln!(
-        "[ci-chaos] delivered {frames} frames; dropped {dropped}, recv {recv:.2} Mb/s, p50 {p50:?} ms"
-    );
-
-    let Some(p50) = p50 else {
-        bail!("no latency measurements under chaos")
-    };
-    if p50 > 250.0 {
-        bail!("glass-to-glass p50 {p50} ms under chaos — pipeline queueing/stalling");
-    }
-    eprintln!("[ci-chaos] OK — playable under 2% loss / ~30 ms RTT / 20 mbit with ABR");
-    Ok(())
-}
-
-/// Run a `tc` command via sudo (netem needs NET_ADMIN).
-fn tc(args: &[&str]) -> Result<()> {
-    let status = Command::new("sudo")
-        .arg("tc")
-        .args(args)
-        .status()
-        .context("run tc (needs sudo + NET_ADMIN)")?;
-    if !status.success() {
-        bail!("tc {args:?} failed");
-    }
-    Ok(())
-}
-
-/// Removes the loopback netem qdisc on drop, whatever the test's outcome.
-struct NetemGuard;
-impl Drop for NetemGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("sudo")
-            .args(["tc", "qdisc", "del", "dev", "lo", "root"])
-            .status();
-    }
-}
-
+/// Run each scenario through the userspace shaper and assert the pipeline stays
+/// playable with ABR on.
 fn control_socket_for_test(port: u16) -> String {
     #[cfg(unix)]
     {

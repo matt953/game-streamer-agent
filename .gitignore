@@ -4,3 +4,4 @@
 crates/protocol/fuzz/target
 crates/protocol/fuzz/artifacts
 .DS_Store
+/logs

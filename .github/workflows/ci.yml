@@ -43,7 +43,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Direct invocation with a pinned toolchain, not the EmbarkStudios action
+      # (its floating tag pulled a cargo-deny whose CLI it drove wrong — a
+      # `warn` subcommand that broke the job with nothing wrong in our deps).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
 
   features:
     name: feature matrix
@@ -81,20 +90,6 @@ jobs:
         with:
           name: latency-ledger-${{ matrix.os }}-${{ github.sha }}
           path: target/e2e-report.json
-
-  chaos:
-    name: abr chaos (linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.93"
-      - uses: Swatinem/rust-cache@v2
-      # Shapes the loopback with tc/netem (2% loss, ~30ms RTT, 20mbit) and
-      # asserts the stream stays playable with ABR on (spec 04 M3 exit).
-      - run: cargo xtask ci-chaos --frames 300
 
   fuzz-smoke:
     name: fuzz smoke
