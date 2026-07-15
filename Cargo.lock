@@ -1189,8 +1189,11 @@ version = "0.1.0"
 dependencies = [
  "gsa-client-core",
  "gsa-core",
+ "gsa-transport",
  "libc",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

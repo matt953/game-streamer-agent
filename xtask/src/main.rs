@@ -2,6 +2,7 @@
 //! `cargo xtask ci-e2e` runs the loopback pipeline and asserts on it; the
 //! JSON report it writes is the latency-ledger artifact (spec 13).
 
+mod logs;
 mod shaper;
 
 use std::net::TcpListener;
@@ -33,6 +34,13 @@ enum Cmd {
     },
     /// macOS: code-sign the built debug binaries with a stable identity so
     /// Screen Recording / Accessibility grants survive rebuilds.
+    /// Dev log collector: receives the streams pushed by an agent running
+    /// with GSA_LOG_SINK (and, automatically, its debug-build clients).
+    Logs {
+        /// Address to listen on.
+        #[arg(long, default_value = "0.0.0.0:9600")]
+        listen: String,
+    },
     DevSign {
         /// Signing identity (default: the first Apple Development identity).
         #[arg(long)]
@@ -43,6 +51,7 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::CiE2e { frames, report } => ci_e2e(frames, &report),
+        Cmd::Logs { listen } => logs::logs(&listen),
         Cmd::DevSign { identity } => dev_sign(identity),
     }
 }

@@ -132,6 +132,9 @@ pub struct SessionParams {
     pub codec: Codec,
     pub mode: VideoMode,
     pub bitrate_bps: u32,
+    /// Dev log collector (`host:port`) the agent pushes its logs to; debug
+    /// clients push theirs to the same place. `None` outside dev.
+    pub log_sink: Option<String>,
 }
 
 /// Wire description of a launchable/streamable source (spec 09's

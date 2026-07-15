@@ -16,7 +16,10 @@ crate-type = ["lib", "staticlib"]
 [dependencies]
 gsa-client-core = { workspace = true }
 gsa-core = { workspace = true }
+gsa-transport = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Apple only: raise the streaming threads' QoS (pthread_set_qos_class_self_np).
 [target.'cfg(target_vendor = "apple")'.dependencies]

@@ -303,6 +303,7 @@ async fn serve_inner(
                                 codec,
                                 mode,
                                 bitrate_bps: bitrate,
+                                log_sink: std::env::var("GSA_LOG_SINK").ok(),
                             }),
                         )
                         .await?;

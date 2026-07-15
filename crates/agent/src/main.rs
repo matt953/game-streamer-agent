@@ -200,22 +200,95 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RingWriter {
     }
 }
 
-/// Set up tracing to stderr plus an in-memory ring (for `gsa logs`); returns
-/// the shared buffer.
+/// A tracing writer that pushes each formatted line to the dev log collector
+/// (`GSA_LOG_SINK`) via the transport crate's reconnecting sender.
+#[derive(Clone)]
+struct SinkWriter(gsa_transport::logsink::LogSink);
+
+impl std::io::Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(s) = std::str::from_utf8(buf) {
+            let line = s.trim_end();
+            if !line.is_empty() {
+                self.0.push(line.to_string());
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SinkWriter {
+    type Writer = SinkWriter;
+    fn make_writer(&'a self) -> SinkWriter {
+        self.clone()
+    }
+}
+
+/// Filter for the dev log sink: our crates at debug (the 1 Hz `abr` line and
+/// friends are the whole point), dependencies at info. `GSA_LOG_SINK_FILTER`
+/// overrides.
+fn sink_filter() -> tracing_subscriber::EnvFilter {
+    if let Ok(f) = std::env::var("GSA_LOG_SINK_FILTER") {
+        return tracing_subscriber::EnvFilter::new(f);
+    }
+    let mut spec = String::from("info");
+    for krate in [
+        "gsa_agent",
+        "gsa_session",
+        "gsa_transport",
+        "gsa_sources",
+        "gsa_capture_macos",
+        "gsa_capture_windows",
+        "gsa_encode_videotoolbox",
+        "gsa_encode_nvenc",
+        "gsa_encode_sw",
+        "gsa_input",
+        "gsa_audio",
+    ] {
+        spec.push_str(&format!(",{krate}=debug"));
+    }
+    tracing_subscriber::EnvFilter::new(spec)
+}
+
+/// Set up tracing to stderr plus an in-memory ring (for `gsa logs`), plus —
+/// when `GSA_LOG_SINK=host:port` is set (dev-only, but works in release
+/// builds like `GSA_DEV_OPEN`) — a debug-level push to the remote log
+/// collector. Returns the shared ring buffer.
 fn init_tracing() -> gsa_session::admin::LogBuffer {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
 
     let logs = gsa_session::admin::LogBuffer::default();
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let local_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let sink_layer = std::env::var("GSA_LOG_SINK").ok().map(|addr| {
+        let hello = format!(
+            "hello role=agent os={} pid={}",
+            std::env::consts::OS,
+            std::process::id()
+        );
+        let sink = gsa_transport::logsink::LogSink::spawn(addr, hello);
+        fmt::layer()
+            .with_ansi(false)
+            .with_writer(SinkWriter(sink))
+            .with_filter(sink_filter())
+    });
     tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(local_filter()),
+        )
         .with(
             fmt::layer()
                 .with_ansi(false)
-                .with_writer(RingWriter(logs.clone())),
+                .with_writer(RingWriter(logs.clone()))
+                .with_filter(local_filter()),
         )
+        .with(sink_layer)
         .init();
     logs
 }

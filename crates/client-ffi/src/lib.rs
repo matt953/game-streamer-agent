@@ -6,6 +6,8 @@
 //! types. This first function is a **spike**: prove the core links, connects,
 //! and receives from inside the app before the real callback surface lands.
 
+mod devlog;
+
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -245,6 +247,7 @@ pub unsafe extern "C" fn gsa_session_start(
     abr: bool,
     callbacks: GsaCallbacks,
 ) -> *mut GsaSession {
+    devlog::init();
     if url.is_null() {
         return std::ptr::null_mut();
     }
@@ -600,13 +603,20 @@ async fn session_loop(
             return;
         }
     };
-    if client
+    let params = match client
         .start_session(SourceId(source_id), None, bitrate_bps, abr)
         .await
-        .is_err()
     {
-        let _ = ready_tx.send(SessionReady::Failed);
-        return;
+        Ok(p) => p,
+        Err(_) => {
+            let _ = ready_tx.send(SessionReady::Failed);
+            return;
+        }
+    };
+    // Agent running with a dev log collector: push our logs there too
+    // (debug builds only — no-op in release).
+    if let Some(sink) = &params.log_sink {
+        devlog::activate(sink);
     }
     // Host-pushed notifications (e.g. gamepad plugged) arrive on the control
     // stream; handle them in the select loop below so they fire on this thread

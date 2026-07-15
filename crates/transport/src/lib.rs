@@ -9,6 +9,7 @@
 //! authentication before any pins exist.
 
 mod identity;
+pub mod logsink;
 mod pairing;
 mod peers;
 mod pinned;

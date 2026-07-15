@@ -19,7 +19,8 @@ use serde::de::DeserializeOwned;
 
 /// Protocol version. Bumped on any incompatible wire change; the
 /// `Hello`/`HelloAck` exchange rejects mismatches with a typed error.
-pub const PROTO_VERSION: u16 = 0;
+/// v1: `SessionParams.log_sink` (dev log collector advertisement).
+pub const PROTO_VERSION: u16 = 1;
 
 /// Maximum accepted size for one control message (defense-in-depth cap for
 /// attacker-controlled length prefixes).
