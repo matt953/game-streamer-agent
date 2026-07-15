@@ -16,6 +16,7 @@ path = "src/main.rs"
 gsa-core = { workspace = true }
 gsa-protocol = { workspace = true }
 gsa-client-core = { workspace = true }
+gsa-decode-videotoolbox = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

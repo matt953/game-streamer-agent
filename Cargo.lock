@@ -1166,6 +1166,7 @@ dependencies = [
  "gilrs",
  "gsa-client-core",
  "gsa-core",
+ "gsa-decode-videotoolbox",
  "gsa-protocol",
  "objc2-core-foundation",
  "objc2-core-media",
@@ -1198,6 +1199,20 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gsa-decode-videotoolbox"
+version = "0.1.0"
+dependencies = [
+ "block2 0.6.2",
+ "gsa-core",
+ "objc2 0.6.4",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-video-toolbox",
+ "tracing",
 ]
 
 [[package]]

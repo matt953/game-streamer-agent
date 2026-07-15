@@ -35,6 +35,7 @@ pub async fn run(
     json: bool,
     source: Option<String>,
     force_sw: bool,
+    hw_decode: bool,
     ledger: Option<std::path::PathBuf>,
     abr: bool,
     bitrate_bps: Option<u32>,
@@ -44,7 +45,11 @@ pub async fn run(
         addr,
         "client-dev-headless",
         decoder_max_profile(force_sw),
-        &[gsa_core::media::Codec::H264],
+        if hw_decode {
+            &[gsa_core::media::Codec::Hevc, gsa_core::media::Codec::H264][..]
+        } else {
+            &[gsa_core::media::Codec::H264][..]
+        },
         auth.server_auth(),
     )
     .await?;
@@ -61,7 +66,6 @@ pub async fn run(
     // Arms the background control writer that carries stats reports + keyframe requests.
     let _input = client.take_input_sender();
 
-    let mut decoder = make_decoder(force_sw)?;
     let mut ledger_file = match &ledger {
         Some(path) => Some(std::io::BufWriter::new(std::fs::File::create(path)?)),
         None => None,
@@ -71,45 +75,113 @@ pub async fn run(
     let mut marker_regressions = 0u64;
     let mut last_marker: Option<u32> = None;
 
-    while decoded < frames {
-        let Some(out) = client.recv_frame(decoder.as_mut()).await? else {
-            bail!("connection closed after {decoded} frames");
-        };
-        decoded += 1;
-        // Ledger row: stage times as µs-from-capture, joined by frame id.
-        if let Some(w) = &mut ledger_file {
-            use std::io::Write as _;
-            let lat = out.latency_us.unwrap_or(0);
-            writeln!(w, "{{\"f\":{},\"recv\":{lat},\"dec\":{lat}}}", out.frame_id)?;
-            if decoded.is_multiple_of(16) {
-                w.flush()?;
-            }
-        }
-        // Progress heartbeat: a failing CI scenario shows where flow stopped.
-        if decoded.is_multiple_of(60) {
-            let s = client.stats();
-            tracing::info!(
-                decoded,
-                dropped = s.frames_dropped_incomplete,
-                recv_mbps = s.recv_mbps,
-                "headless progress"
-            );
-        }
-
-        if let Some(marker) = check_markers
-            .then(|| {
-                gsa_core::pattern::read_marker_rgba(&out.frame.pixels, out.frame.width as usize)
-            })
-            .flatten()
-        {
-            marker_read_ok += 1;
-            if let Some(prev) = last_marker {
-                // Markers may skip (dropped frames) but must never go back.
-                if marker.wrapping_sub(prev) > u32::MAX / 2 {
-                    marker_regressions += 1;
+    if hw_decode {
+        // Hardware path: encoded passthrough (the apps' path) into the
+        // zero-copy VideoToolbox decoder. No software fallback: any decode
+        // error fails the run.
+        let codec = client
+            .negotiated_codec()
+            .ok_or_else(|| anyhow::anyhow!("no negotiated codec"))?;
+        let mut vt = gsa_decode_videotoolbox::VtDecoder::new(codec)
+            .map_err(|e| anyhow::anyhow!("hw decoder: {e}"))?;
+        while decoded < frames {
+            let Some(enc) = client.recv_encoded().await? else {
+                bail!("connection closed after {decoded} frames");
+            };
+            let t0 = std::time::Instant::now();
+            let surface = vt
+                .decode(&enc.data)
+                .map_err(|e| anyhow::anyhow!("hw decode: {e}"))?;
+            let Some(surface) = surface else { continue };
+            decoded += 1;
+            if let Some(w) = &mut ledger_file {
+                use std::io::Write as _;
+                let recv_us = enc.latency_us.unwrap_or(0);
+                let dec_us = u64::from(recv_us) + t0.elapsed().as_micros() as u64;
+                writeln!(
+                    w,
+                    "{{\"f\":{},\"recv\":{recv_us},\"dec\":{dec_us}}}",
+                    enc.frame_id
+                )?;
+                if decoded.is_multiple_of(16) {
+                    w.flush()?;
                 }
             }
-            last_marker = Some(marker);
+            if decoded.is_multiple_of(60) {
+                let s = client.stats();
+                tracing::info!(
+                    decoded,
+                    dropped = s.frames_dropped_incomplete,
+                    recv_mbps = s.recv_mbps,
+                    "headless progress (hw)"
+                );
+            }
+            // Sampled integrity check: a small luma readback, after timing.
+            if check_markers && decoded.is_multiple_of(30) {
+                let w = gsa_core::pattern::MIN_WIDTH as u32;
+                let h = gsa_core::pattern::BLOCK as u32;
+                if surface.width() >= w
+                    && surface.height() >= h
+                    && let Some(marker) = gsa_core::pattern::read_marker_luma(
+                        &surface
+                            .read_luma_region(0, 0, w, h)
+                            .map_err(|e| anyhow::anyhow!("marker readback: {e}"))?,
+                        w as usize,
+                        w as usize,
+                    )
+                {
+                    marker_read_ok += 1;
+                    if let Some(prev) = last_marker
+                        && marker.wrapping_sub(prev) > u32::MAX / 2
+                    {
+                        marker_regressions += 1;
+                    }
+                    last_marker = Some(marker);
+                }
+            }
+        }
+    } else {
+        let mut decoder = make_decoder(force_sw)?;
+        while decoded < frames {
+            let Some(out) = client.recv_frame(decoder.as_mut()).await? else {
+                bail!("connection closed after {decoded} frames");
+            };
+            decoded += 1;
+            // Ledger row: stage times as µs-from-capture, joined by frame id.
+            if let Some(w) = &mut ledger_file {
+                use std::io::Write as _;
+                let lat = out.latency_us.unwrap_or(0);
+                writeln!(w, "{{\"f\":{},\"recv\":{lat},\"dec\":{lat}}}", out.frame_id)?;
+                if decoded.is_multiple_of(16) {
+                    w.flush()?;
+                }
+            }
+            // Progress heartbeat: a failing CI scenario shows where flow stopped.
+            if decoded.is_multiple_of(60) {
+                let s = client.stats();
+                tracing::info!(
+                    decoded,
+                    dropped = s.frames_dropped_incomplete,
+                    recv_mbps = s.recv_mbps,
+                    "headless progress"
+                );
+            }
+
+            if let Some(marker) = check_markers
+                .then(|| {
+                    gsa_core::pattern::read_marker_rgba(&out.frame.pixels, out.frame.width as usize)
+                })
+                .flatten()
+            {
+                marker_read_ok += 1;
+                if let Some(prev) = last_marker {
+                    // Markers may skip (dropped frames) but must never go back.
+                    if marker.wrapping_sub(prev) > u32::MAX / 2 {
+                        marker_regressions += 1;
+                    }
+                }
+                last_marker = Some(marker);
+            }
         }
     }
 

@@ -1,0 +1,30 @@
+[package]
+name = "gsa-decode-videotoolbox"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "macOS VideoToolbox hardware decoder for the dev harness: zero-copy IOSurface output"
+
+[dependencies]
+gsa-core = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-core-foundation = { workspace = true, features = ["CFNumber", "CFDictionary", "CFString"] }
+objc2-core-media = { workspace = true, features = ["CMSampleBuffer", "CMTime", "CMFormatDescription", "CMBlockBuffer"] }
+objc2-core-video = { workspace = true, features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
+objc2-video-toolbox = { workspace = true, features = ["VTDecompressionSession", "VTDecompressionProperties", "VTSession", "VTErrors", "objc2-core-media", "block2"] }
+block2 = { workspace = true }
+
+# FFI crate: opts out of the workspace-wide `unsafe_code = "forbid"`. Every
+# unsafe block carries a SAFETY comment (undocumented_unsafe_blocks = deny).
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

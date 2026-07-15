@@ -17,6 +17,7 @@ members = [
     "crates/capture-windows",
     "crates/encode-nvenc",
     "crates/encode-videotoolbox",
+    "crates/decode-videotoolbox",
     "crates/input",
     "crates/agent",
     "xtask",
@@ -44,6 +45,7 @@ gsa-capture-macos = { path = "crates/capture-macos" }
 gsa-capture-windows = { path = "crates/capture-windows" }
 gsa-encode-nvenc = { path = "crates/encode-nvenc" }
 gsa-encode-videotoolbox = { path = "crates/encode-videotoolbox" }
+gsa-decode-videotoolbox = { path = "crates/decode-videotoolbox" }
 gsa-input = { path = "crates/input" }
 
 # external
