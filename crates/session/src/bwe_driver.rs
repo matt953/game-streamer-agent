@@ -22,6 +22,10 @@ pub struct BweDriver {
     /// the estimator consumes deltas, and RTT uses agent-side times only.
     epoch: Instant,
     epoch_agent_us: u64,
+    /// Sent records awaiting arrival: reordering across feedback batches must
+    /// not read as loss. A record is lost only when it stays unmatched past
+    /// the grace window.
+    pending: std::collections::BTreeMap<u32, SendRecord>,
 }
 
 impl std::fmt::Debug for BweDriver {
@@ -39,6 +43,7 @@ impl BweDriver {
             epoch_agent_us: now_agent_us,
             active_probe: None,
             last_now: Instant::now(),
+            pending: std::collections::BTreeMap::new(),
         }
     }
 
@@ -71,45 +76,74 @@ impl BweDriver {
     /// Feed one feedback batch joined against the sent records it covers.
     /// `sent` must contain every record with seq ≤ the batch's highest seq;
     /// records absent from `feedback` count as lost.
+    /// Feed one feedback batch. `sent` holds the newly drained send records;
+    /// arrivals match against these plus earlier still-pending ones.
     pub fn on_feedback(
         &mut self,
         sent: &[SendRecord],
         feedback: &PacketFeedback,
         now_agent_us: u64,
     ) {
-        if sent.is_empty() {
-            return;
-        }
+        const LOST_GRACE_US: u64 = 500_000;
         for r in sent {
             if !r.padding {
                 self.on_media_sent(r.bytes, r.sent_us);
             }
+            self.pending.insert(r.seq, *r);
         }
-        let now = self.mono(self.instant_at(now_agent_us));
         let arrivals: std::collections::HashMap<u32, u64> = feedback
             .samples
             .iter()
             .map(|&(seq, delta)| (seq, feedback.base_arrival_us + u64::from(delta)))
             .collect();
-        let records: Vec<TwccSendRecord> = sent
-            .iter()
-            .map(|r| {
-                let packet_id = match r.cluster {
-                    Some(c) => TwccPacketId::with_cluster(u64::from(r.seq), c),
-                    None => TwccPacketId::new(u64::from(r.seq)),
-                };
-                let remote = arrivals
-                    .get(&r.seq)
-                    .map(|&us| self.epoch + Duration::from_micros(us));
-                TwccSendRecord::new(
-                    packet_id,
-                    self.instant_at(r.sent_us),
-                    r.bytes as usize,
-                    remote.is_some().then_some(now),
-                    remote,
-                )
-            })
+
+        let now = self.mono(self.instant_at(now_agent_us));
+        let mut records: Vec<TwccSendRecord> = Vec::new();
+        let matched: Vec<u32> = self
+            .pending
+            .keys()
+            .copied()
+            .filter(|seq| arrivals.contains_key(seq))
             .collect();
+        for seq in &matched {
+            let r = self.pending.remove(seq).expect("matched key");
+            let packet_id = match r.cluster {
+                Some(c) => TwccPacketId::with_cluster(u64::from(r.seq), c),
+                None => TwccPacketId::new(u64::from(r.seq)),
+            };
+            let remote = self.epoch + Duration::from_micros(arrivals[seq]);
+            records.push(TwccSendRecord::new(
+                packet_id,
+                self.instant_at(r.sent_us),
+                r.bytes as usize,
+                Some(now),
+                Some(remote),
+            ));
+        }
+        // Expire the truly lost: unmatched well past their send time.
+        let expired: Vec<u32> = self
+            .pending
+            .iter()
+            .filter(|(_, r)| now_agent_us.saturating_sub(r.sent_us) > LOST_GRACE_US)
+            .map(|(&seq, _)| seq)
+            .collect();
+        for seq in expired {
+            let r = self.pending.remove(&seq).expect("expired key");
+            let packet_id = match r.cluster {
+                Some(c) => TwccPacketId::with_cluster(u64::from(r.seq), c),
+                None => TwccPacketId::new(u64::from(r.seq)),
+            };
+            records.push(TwccSendRecord::new(
+                packet_id,
+                self.instant_at(r.sent_us),
+                r.bytes as usize,
+                None,
+                None,
+            ));
+        }
+        if records.is_empty() {
+            return;
+        }
         self.bwe.update(records.iter(), now);
     }
 
