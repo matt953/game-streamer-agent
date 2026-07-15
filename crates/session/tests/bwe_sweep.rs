@@ -93,9 +93,27 @@ struct Cell {
     /// Radio-outage delay spikes: every ~2 s, all arrivals in a ~150 ms
     /// window gain this extra delay (µs). 0 disables.
     spike_us: u64,
+    /// Total outage: all packets sent in [outage_at_us, outage_at_us +
+    /// outage_dur_us) are dropped. 0 duration disables.
+    outage_at_us: u64,
+    outage_dur_us: u64,
+}
+
+struct CellStats {
+    /// Time-averaged estimate over the final 20 s.
+    avg: f64,
+    /// Highest estimate sampled at any tick.
+    max: f64,
+    /// Seconds the estimate spent below half capacity in the 20 s after the
+    /// outage began — the stream-degraded time.
+    degraded_s: f64,
 }
 
 fn run_cell(cell: &Cell) -> f64 {
+    run_cell_stats(cell).avg
+}
+
+fn run_cell_stats(cell: &Cell) -> CellStats {
     let capacity = cell.link_mbps * 1e6;
     let mut link = Link::new(capacity, cell.prop_us, (capacity / 8.0 * 0.15) as u64);
     let start_bps = cell.start_bps;
@@ -118,6 +136,9 @@ fn run_cell(cell: &Cell) -> f64 {
     // sawtoothing controller, where an endpoint is a coin flip.
     let mut avg_sum = 0.0f64;
     let mut avg_n = 0u64;
+    let mut max_est = 0.0f64;
+    let outage_end = cell.outage_at_us + cell.outage_dur_us;
+    let mut degraded_ticks = 0u64;
 
     while now_us < RUN_US {
         // 1 ms simulation step.
@@ -129,7 +150,11 @@ fn run_cell(cell: &Cell) -> f64 {
             while next_media_us <= now_us {
                 let arrival = link
                     .send(next_media_us, PACKET_BYTES, cell.jitter_us, &mut rng)
-                    .map(|a| link.spike(next_media_us, a, cell.spike_us));
+                    .map(|a| link.spike(next_media_us, a, cell.spike_us))
+                    .filter(|_| {
+                        cell.outage_dur_us == 0
+                            || !(cell.outage_at_us..outage_end).contains(&next_media_us)
+                    });
                 sent.push(SendRecord {
                     seq,
                     sent_us: next_media_us,
@@ -165,7 +190,10 @@ fn run_cell(cell: &Cell) -> f64 {
             for _ in 0..burst {
                 let arrival = link
                     .send(due, PACKET_BYTES, cell.jitter_us, &mut rng)
-                    .map(|a| link.spike(due, a, cell.spike_us));
+                    .map(|a| link.spike(due, a, cell.spike_us))
+                    .filter(|_| {
+                        cell.outage_dur_us == 0 || !(cell.outage_at_us..outage_end).contains(&due)
+                    });
                 sent.push(SendRecord {
                     seq,
                     sent_us: due,
@@ -227,13 +255,24 @@ fn run_cell(cell: &Cell) -> f64 {
                 estimate = e as f64;
             }
             target_bps = estimate.clamp(FLOOR_BPS, PROTOCOL_MAX_BPS);
+            max_est = max_est.max(estimate);
+            if cell.outage_dur_us > 0
+                && (cell.outage_at_us..cell.outage_at_us + 20_000_000).contains(&now_us)
+                && estimate < 0.5 * cell.link_mbps * 1e6
+            {
+                degraded_ticks += 1;
+            }
             if now_us > RUN_US - 20_000_000 {
                 avg_sum += estimate;
                 avg_n += 1;
             }
         }
     }
-    avg_sum / avg_n.max(1) as f64
+    CellStats {
+        avg: avg_sum / avg_n.max(1) as f64,
+        max: max_est,
+        degraded_s: degraded_ticks as f64 * TICK_US as f64 / 1e6,
+    }
 }
 
 #[test]
@@ -250,6 +289,8 @@ fn estimator_converges_for_any_encoder_output() {
                 prop_us: 20_000,
                 start_bps: 3_000_000,
                 spike_us: 0,
+                outage_at_us: 0,
+                outage_dur_us: 0,
             });
             // Sustained overshoot caps the achievable target at C/f: the
             // wire carries C, the encoder mandates f x target.
@@ -283,12 +324,14 @@ fn trace_one_cell() {
         .with_env_filter(EnvFilter::new("gsa_session=trace"))
         .try_init();
     let est = run_cell(&Cell {
-        link_mbps: 15.0,
+        link_mbps: 20.0,
         fraction: 0.5,
         jitter_us: 10_000,
         prop_us: 60_000,
-        start_bps: 100_000_000,
+        start_bps: 3_000_000,
         spike_us: 120_000,
+        outage_at_us: 25_000_000,
+        outage_dur_us: 1_000_000,
     });
     println!("final estimate: {:.2} Mb/s", est / 1e6);
 }
@@ -306,6 +349,8 @@ fn estimator_survives_arrival_jitter() {
             prop_us: 20_000,
             start_bps: 3_000_000,
             spike_us: 0,
+            outage_at_us: 0,
+            outage_dur_us: 0,
         });
         let ceiling = (link_mbps * 1e6_f64).min(PROTOCOL_MAX_BPS);
         if est < 0.5 * ceiling {
@@ -339,6 +384,8 @@ fn estimator_recovers_after_a_network_change() {
         prop_us: 60_000,
         start_bps: 100_000_000,
         spike_us: 0,
+        outage_at_us: 0,
+        outage_dur_us: 0,
     });
     assert!(
         est > 0.4 * 15e6,
@@ -358,10 +405,72 @@ fn estimator_survives_cellular_delay_spikes() {
         prop_us: 60_000,
         start_bps: 100_000_000,
         spike_us: 120_000,
+        outage_at_us: 0,
+        outage_dur_us: 0,
     });
     assert!(
         est > 0.4 * 15e6,
         "spikes pinned the estimate: est {:.2} Mb/s",
         est / 1e6
+    );
+}
+
+/// A transient total outage (tunnel rebuffer, radio handover) crushes the
+/// estimate; recovery must jump back near the pre-drop rate via probing,
+/// not crawl up one doubling at a time.
+#[test]
+fn estimator_recovers_quickly_after_an_outage() {
+    let stats = run_cell_stats(&Cell {
+        link_mbps: 20.0,
+        fraction: 0.5,
+        jitter_us: 10_000,
+        prop_us: 60_000,
+        start_bps: 3_000_000,
+        spike_us: 120_000,
+        outage_at_us: 25_000_000,
+        outage_dur_us: 1_000_000,
+    });
+    eprintln!(
+        "outage cell: avg {:.2} max {:.2} degraded {:.2}s",
+        stats.avg / 1e6,
+        stats.max / 1e6,
+        stats.degraded_s
+    );
+    assert!(
+        stats.degraded_s <= 5.0,
+        "estimate spent {:.1}s below half capacity after the outage (limit 5)",
+        stats.degraded_s
+    );
+}
+
+/// Airtime clumping can compress a probe cluster's arrivals, overreading its
+/// delivery rate; a single optimistic probe must not carry the estimate far
+/// beyond the link.
+#[test]
+fn estimator_does_not_overshoot_on_clumped_arrivals() {
+    let stats = run_cell_stats(&Cell {
+        link_mbps: 20.0,
+        fraction: 0.25,
+        jitter_us: 10_000,
+        prop_us: 60_000,
+        start_bps: 3_000_000,
+        spike_us: 0,
+        outage_at_us: 0,
+        outage_dur_us: 0,
+    });
+    eprintln!(
+        "clump cell: avg {:.2} max {:.2}",
+        stats.avg / 1e6,
+        stats.max / 1e6
+    );
+    assert!(
+        stats.max <= 1.35 * 20e6,
+        "estimate overshot the link: max {:.2} Mb/s",
+        stats.max / 1e6
+    );
+    assert!(
+        stats.avg >= 0.5 * 20e6 && stats.avg <= 1.2 * 20e6,
+        "estimate should ride near capacity: avg {:.2} Mb/s",
+        stats.avg / 1e6
     );
 }
