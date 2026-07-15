@@ -40,7 +40,7 @@ impl Link {
     }
 
     /// Send one packet at `now`; `Some(arrival_us)` unless the queue drops it.
-    fn send(&mut self, now_us: u64, bytes: u32) -> Option<u64> {
+    fn send(&mut self, now_us: u64, bytes: u32, jitter_us: u64, rng: &mut u64) -> Option<u64> {
         // Drain the queue model up to now.
         let drained = (now_us.saturating_sub(self.last_drain_us)) as f64 * self.capacity_bps / 8e6;
         self.queued_bytes = self.queued_bytes.saturating_sub(drained as u64);
@@ -52,13 +52,27 @@ impl Link {
         let serialization_us = (f64::from(bytes) * 8e6 / self.capacity_bps) as u64;
         let start_us = self.free_at_us.max(now_us);
         self.free_at_us = start_us + serialization_us;
-        Some(self.free_at_us + self.prop_us)
+        // Radio aggregation: arrivals quantize to airtime slots, so packets
+        // clump into shared bursts instead of spreading smoothly.
+        let raw = self.free_at_us + self.prop_us;
+        let j = if jitter_us == 0 {
+            0
+        } else {
+            *rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let slot = raw.div_ceil(jitter_us) * jitter_us;
+            (slot - raw) + (*rng >> 33) % 500
+        };
+        Some(raw + j)
     }
 }
 
 struct Cell {
     link_mbps: f64,
     fraction: f64,
+    /// Per-packet arrival jitter amplitude (µs), airtime-clumping style.
+    jitter_us: u64,
 }
 
 fn run_cell(cell: &Cell) -> f64 {
@@ -79,6 +93,7 @@ fn run_cell(cell: &Cell) -> f64 {
     let mut next_feedback_us = FEEDBACK_INTERVAL_US;
     let mut next_tick_us = 0;
     let mut estimate = f64::from(start_bps);
+    let mut rng: u64 = 0x9e3779b97f4a7c15;
     // Time-averaged estimate over the final 20 s: a fair sample of a
     // sawtoothing controller, where an endpoint is a coin flip.
     let mut avg_sum = 0.0f64;
@@ -92,7 +107,7 @@ fn run_cell(cell: &Cell) -> f64 {
         let media_rate = cell.fraction * target_bps;
         if media_rate > 0.0 {
             while next_media_us <= now_us {
-                let arrival = link.send(next_media_us, PACKET_BYTES);
+                let arrival = link.send(next_media_us, PACKET_BYTES, cell.jitter_us, &mut rng);
                 sent.push(SendRecord {
                     seq,
                     sent_us: next_media_us,
@@ -122,7 +137,7 @@ fn run_cell(cell: &Cell) -> f64 {
                 .max(1.0) as usize;
             let burst = per_slot.min(remaining);
             for _ in 0..burst {
-                let arrival = link.send(due, PACKET_BYTES);
+                let arrival = link.send(due, PACKET_BYTES, cell.jitter_us, &mut rng);
                 sent.push(SendRecord {
                     seq,
                     sent_us: due,
@@ -140,19 +155,21 @@ fn run_cell(cell: &Cell) -> f64 {
             }
         }
 
-        // Deliveries.
-        while let Some(&(a, s)) = in_flight.front() {
-            if a > now_us {
-                break;
+        // Deliveries (jitter reorders: scan the whole in-flight set).
+        let mut i = 0;
+        while i < in_flight.len() {
+            if in_flight[i].0 <= now_us {
+                let (a, s) = in_flight.remove(i).unwrap();
+                arrivals.push((s, a));
+            } else {
+                i += 1;
             }
-            in_flight.pop_front();
-            arrivals.push((s, a));
         }
 
         // Feedback batch (the client's 20 Hz report).
         if now_us >= next_feedback_us && !arrivals.is_empty() {
             next_feedback_us = now_us + FEEDBACK_INTERVAL_US;
-            let base = arrivals[0].1;
+            let base = arrivals.iter().map(|&(_, a)| a).min().unwrap();
             let fb = PacketFeedback {
                 base_arrival_us: base,
                 samples: arrivals
@@ -201,6 +218,7 @@ fn estimator_converges_for_any_encoder_output() {
             let est = run_cell(&Cell {
                 link_mbps,
                 fraction,
+                jitter_us: 0,
             });
             // Sustained overshoot caps the achievable target at C/f: the
             // wire carries C, the encoder mandates f x target.
@@ -236,6 +254,38 @@ fn trace_one_cell() {
     let est = run_cell(&Cell {
         link_mbps: 1.0,
         fraction: 0.0,
+        jitter_us: 0,
     });
     println!("final estimate: {:.2} Mb/s", est / 1e6);
+}
+
+/// Radio links clump arrivals; the estimator must not read clean-link jitter
+/// as congestion. Models the field failure seen on a fast WiFi link.
+#[test]
+fn estimator_survives_arrival_jitter() {
+    let mut failures = Vec::new();
+    for &(link_mbps, jitter_us) in &[(100.0, 3_000u64), (100.0, 8_000), (25.0, 5_000)] {
+        let est = run_cell(&Cell {
+            link_mbps,
+            fraction: 0.3,
+            jitter_us,
+        });
+        let ceiling = (link_mbps * 1e6_f64).min(PROTOCOL_MAX_BPS);
+        if est < 0.5 * ceiling {
+            failures.push(format!(
+                "link {link_mbps} Mb/s jitter {jitter_us}us: est {:.2} Mb/s < {:.2}",
+                est / 1e6,
+                0.5 * ceiling / 1e6
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "jitter failures:
+{}",
+        failures.join(
+            "
+"
+        )
+    );
 }
