@@ -502,7 +502,7 @@ mod test {
         let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(2), ProbeKind::Initial);
 
         let base = Instant::now();
-        let received = (0..5).map(|i| {
+        let received = (0..10).map(|i| {
             let seq: TwccSeq = (1000 + i).into();
             let pid = TwccPacketId::with_cluster(seq, cluster);
             // send spaced 4ms, recv spaced 4ms (same ordering)

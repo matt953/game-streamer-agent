@@ -59,14 +59,21 @@ impl ProbeKind {
 
 impl ProbeClusterConfig {
     /// Create a new probe cluster configuration with standard defaults:
-    /// - 15ms duration (enough to get meaningful feedback without excessive delay)
-    /// - 5 minimum packets (statistical significance for BWE analysis)
+    /// - duration sized for ~10 packets, clamped to 15-100 ms
+    /// - 8 minimum packets (statistical significance for BWE analysis)
     pub fn new(cluster: TwccClusterId, target_bitrate: Bitrate, kind: ProbeKind) -> Self {
         Self {
             cluster,
             target_bitrate,
-            target_duration: Duration::from_millis(15),
-            min_packet_count: 5,
+            // Low-rate clusters stretch so enough packets span radio
+            // aggregation windows; 15 ms of a 500 kb/s probe is one packet,
+            // which no validity gate can measure.
+            target_duration: {
+                let for_ten_packets =
+                    Duration::from_secs_f64(10.0 * 1200.0 * 8.0 / target_bitrate.as_f64().max(1.0));
+                for_ten_packets.clamp(Duration::from_millis(15), Duration::from_millis(100))
+            },
+            min_packet_count: 8,
             min_probe_delta: Duration::from_millis(2),
             kind,
         }
@@ -366,12 +373,12 @@ mod test {
     fn probe_cluster_complete_when_both_criteria_met() {
         let now = Instant::now();
         let config = ProbeClusterConfig::new(1.into(), Bitrate::mbps(3), ProbeKind::Initial);
-        // target_bytes = 3 Mbps * 15ms = 45,000 bits = 5,625 bytes
+        // target_bytes = 3 Mbps * 32ms = 96,000 bits = 12,000 bytes
         let mut state = ProbeClusterState::new(config);
 
-        // Send 5 packets of 1200 bytes each = 6000 bytes
-        // Meets both: 6000 >= 5625 bytes AND 5 >= 5 packets
-        state.test_set_state(DataSize::bytes(6000), 5, now);
+        // Send 10 packets of 1200 bytes each = 12,000 bytes
+        // Meets both: 12,000 >= 12,000 bytes AND 10 >= 8 packets
+        state.test_set_state(DataSize::bytes(12_000), 10, now);
 
         // Complete: both bytes and packets met, even at same instant
         assert!(state.is_complete(now));
@@ -384,7 +391,7 @@ mod test {
         let mut state = ProbeClusterState::new(config);
 
         // Send all packets at exactly the same instant (duration = 0)
-        state.test_set_state(DataSize::bytes(6000), 5, now);
+        state.test_set_state(DataSize::bytes(12_000), 10, now);
 
         // Should still complete (this is the bug fix - no duration requirement)
         assert!(state.is_complete(now));
