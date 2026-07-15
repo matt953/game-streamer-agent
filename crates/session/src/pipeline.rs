@@ -103,24 +103,35 @@ async fn run_probe(
         .max_datagram_size()
         .unwrap_or(DEFAULT_MAX_DATAGRAM)
         .min(1200);
-    let bytes_total = (job.rate_bps / 8.0 * job.duration.as_secs_f64()) as usize;
-    let count = bytes_total.div_ceil(size).max(job.min_packets);
-    let spacing = job.duration.div_f64(count as f64).max(job.min_delta);
-    for _ in 0..count {
-        let mut d = gsa_protocol::datagram::encode_padding(size);
-        gsa_protocol::datagram::stamp_seq(&mut d, *next_seq);
-        history.push(SendRecord {
-            seq: *next_seq,
-            sent_us: clock.now_us(),
-            bytes: d.len() as u32,
-            padding: true,
-            cluster: Some(job.cluster),
-        });
-        *next_seq = next_seq.wrapping_add(1);
-        if conn.send_datagram(bytes::Bytes::from(d)).is_err() {
-            return;
+    let total = ((job.rate_bps / 8.0 * job.duration.as_secs_f64()) as usize)
+        .div_ceil(size)
+        .max(job.min_packets);
+    // Token bucket against the wall clock: timer jitter self-corrects, so the
+    // cluster's average rate matches the estimator's expectation.
+    let start = std::time::Instant::now();
+    let mut sent = 0usize;
+    while sent < total {
+        let owed_bytes = job.rate_bps / 8.0 * start.elapsed().as_secs_f64();
+        let owed = ((owed_bytes / size as f64) as usize).max(1).min(total);
+        while sent < owed {
+            let mut d = gsa_protocol::datagram::encode_padding(size);
+            gsa_protocol::datagram::stamp_seq(&mut d, *next_seq);
+            history.push(SendRecord {
+                seq: *next_seq,
+                sent_us: clock.now_us(),
+                bytes: d.len() as u32,
+                padding: true,
+                cluster: Some(job.cluster),
+            });
+            *next_seq = next_seq.wrapping_add(1);
+            if conn.send_datagram(bytes::Bytes::from(d)).is_err() {
+                return;
+            }
+            sent += 1;
         }
-        tokio::time::sleep(spacing).await;
+        if sent < total {
+            tokio::time::sleep(job.min_delta).await;
+        }
     }
 }
 
