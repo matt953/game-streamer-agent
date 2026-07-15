@@ -170,6 +170,16 @@ impl LossController {
         self.current_estimate.loss_limited_bandwidth = bandwidth_estimate;
     }
 
+    /// A measured probe supersedes accumulated loss history: adopt the rate,
+    /// clear the observation window, and defer to the delay estimate until
+    /// fresh loss evidence arrives.
+    pub fn on_probe_result(&mut self, bandwidth_estimate: Bitrate) {
+        self.current_estimate.loss_limited_bandwidth = bandwidth_estimate;
+        self.reset_observations();
+        self.num_observations = 0;
+        self.state = LossControllerState::DelayBased;
+    }
+
     /// Update the acknowledged bitrate based on TWCC feedback.
     pub fn set_acknowledged_bitrate(&mut self, acknowledged_bitrate: Bitrate) {
         self.acknowledged_bitrate = acknowledged_bitrate;

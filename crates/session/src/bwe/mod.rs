@@ -242,9 +242,9 @@ impl SendSideBandwidthEstimator {
             return;
         }
 
-        // When probe succeeds, set bandwidth directly
+        // When probe succeeds, adopt it over accumulated loss history.
         if is_probe_result {
-            self.loss_controller.set_bandwidth_estimate(delay_estimate);
+            self.loss_controller.on_probe_result(delay_estimate);
         }
 
         if let Some(acked_bitrate) = acked_bitrate {
