@@ -212,6 +212,13 @@ impl SendSideBandwidthEstimator {
 
         let acked_bitrate = self.acked_bitrate_estimator.current_estimate();
 
+        // Congestion means delivery ran at roughly link rate: remember it.
+        if self.delay_controller.is_overusing()
+            && let Some(acked) = acked_bitrate
+        {
+            self.link_capacity_estimator.update_from_overuse(acked, now);
+        }
+
         // Use the latest probe result from this update, if any
         let probe_result = latest_probe_result;
 
@@ -302,7 +309,10 @@ impl SendSideBandwidthEstimator {
         let link_capacity = self.link_capacity_estimator.capacity_estimate(now);
         self.loss_controller
             .set_link_capacity_estimate(link_capacity);
-        self.delay_controller.set_link_capacity(link_capacity);
+        // The crush floor arms from the conservative bound: what the link
+        // almost surely still carries even if recent samples were optimistic.
+        self.delay_controller
+            .set_link_capacity(self.link_capacity_estimator.lower_bound(now));
         if self.delay_controller.capacity_discredited() {
             self.link_capacity_estimator.reset();
             self.delay_controller.set_link_capacity(None);
