@@ -145,12 +145,27 @@ async fn serve_inner(
     let mut min_rtt_us = u64::MAX;
     let mut unclean_until_us = 0u64;
 
+    // Control reads run on their own task: `recv_msg` holds framing state
+    // across two reads, so cancelling it mid-message (as select! would at
+    // every tick) desyncs the stream. Channel reads cancel safely.
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<Result<C2A>>(16);
+    tokio::spawn(async move {
+        loop {
+            let r = recv_msg(&mut recv).await;
+            let failed = r.is_err();
+            if msg_tx.send(r).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+
     let result = loop {
         let msg: C2A = tokio::select! {
-            r = recv_msg(&mut recv) => match r {
-                Ok(m) => m,
-                Err(_) if conn.close_reason().is_some() => break Ok(()),
-                Err(e) => break Err(e),
+            r = msg_rx.recv() => match r {
+                Some(Ok(m)) => m,
+                Some(Err(_)) if conn.close_reason().is_some() => break Ok(()),
+                Some(Err(e)) => break Err(e),
+                None => break Ok(()),
             },
             _ = abr_tick.tick() => {
                 tick_count += 1;
