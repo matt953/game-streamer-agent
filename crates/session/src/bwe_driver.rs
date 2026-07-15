@@ -16,6 +16,8 @@ pub struct BweDriver {
     bwe: Bwe,
     /// Outstanding probe cluster and when to consider it finished.
     active_probe: Option<(u64, Instant)>,
+    /// Estimator-internal time must never run backwards; feeds are clamped.
+    last_now: Instant,
     /// Anchor pairing the µs clocks to `Instant` math. Offsets are arbitrary;
     /// the estimator consumes deltas, and RTT uses agent-side times only.
     epoch: Instant,
@@ -30,11 +32,29 @@ impl BweDriver {
             epoch: Instant::now(),
             epoch_agent_us: now_agent_us,
             active_probe: None,
+            last_now: Instant::now(),
         }
     }
 
     fn instant_at(&self, us: u64) -> Instant {
         self.epoch + Duration::from_micros(us.saturating_sub(self.epoch_agent_us))
+    }
+
+    fn mono(&mut self, i: Instant) -> Instant {
+        self.last_now = self.last_now.max(i);
+        self.last_now
+    }
+
+    /// Media bytes handed to the wire (drives underuse detection). Callers
+    /// with real-time visibility feed this at send time; the session layer
+    /// feeds it from the send history just before the matching feedback.
+    pub fn on_media_sent(&mut self, bytes: u32, sent_us: u64) {
+        let at = self.mono(self.instant_at(sent_us));
+        self.bwe.on_media_sent(
+            crate::bwe::bandwidth::DataSize::bytes(i64::from(bytes)),
+            false,
+            at,
+        );
     }
 
     /// The estimator wants the send rate it should assume media aims for.
@@ -54,17 +74,12 @@ impl BweDriver {
         if sent.is_empty() {
             return;
         }
-        let now = self.instant_at(now_agent_us);
-        // Media-vs-padding accounting drives ALR detection.
         for r in sent {
             if !r.padding {
-                self.bwe.on_media_sent(
-                    crate::bwe::bandwidth::DataSize::bytes(i64::from(r.bytes)),
-                    false,
-                    self.instant_at(r.sent_us),
-                );
+                self.on_media_sent(r.bytes, r.sent_us);
             }
         }
+        let now = self.mono(self.instant_at(now_agent_us));
         let arrivals: std::collections::HashMap<u32, u64> = feedback
             .samples
             .iter()
@@ -95,7 +110,10 @@ impl BweDriver {
     /// Periodic drive: may emit a probe burst for the pacer. Returns the job
     /// to queue, already registered with the estimator.
     pub fn on_tick(&mut self, now_agent_us: u64) -> Option<ProbeJob> {
-        let now = self.instant_at(now_agent_us);
+        let now = self.mono(self.instant_at(now_agent_us));
+        // Advance underuse detection even when media is silent.
+        self.bwe
+            .on_media_sent(crate::bwe::bandwidth::DataSize::bytes(0), false, now);
         if let Some((cluster, deadline)) = self.active_probe
             && now >= deadline
         {
