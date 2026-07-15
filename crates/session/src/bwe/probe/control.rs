@@ -18,6 +18,10 @@ const PROBE_UNCERTAINTY: f64 = 0.05;
 const ALR_ENDED_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_TIME_BETWEEN_ALR_PROBES: Duration = Duration::from_secs(5);
 
+/// An estimate below this fraction of its level at the last probe counts as
+/// collapsed: the probe is no longer meaningful context.
+const ESTIMATE_COLLAPSE_FACTOR: f64 = 0.5;
+
 /// Allows probing up to 2x max_bitrate to account for bursty streams.
 const MAX_PROBE_BITRATE_FACTOR: f64 = 2.0;
 
@@ -219,8 +223,13 @@ impl ProbeControl {
             return Some(config);
         }
 
-        // Can't probe in certain bandwidth-limited states.
-        if !self.can_probe(estimate) {
+        // Can't probe in certain bandwidth-limited states — except a slow
+        // periodic probe while loss-limited: with light media the loss
+        // controller's ramp-up is bounded by the acknowledged rate, so a
+        // probe is the only exit from a stale loss-limited estimate.
+        let stale_loss_limited = self.last_cause == BandwidthLimitedCause::LossLimitedBwe
+            && self.time_since_last_probe(now) > 2 * MIN_TIME_BETWEEN_ALR_PROBES;
+        if !self.can_probe(estimate) && !stale_loss_limited {
             return None;
         }
 
@@ -288,7 +297,15 @@ impl ProbeControl {
         };
 
         // Estimate must exceed 70% of last probe rate to trigger further probing.
-        if estimate < last.further {
+        // Exception: an estimate that has collapsed far below where it stood
+        // at the last probe makes that probe stale context — re-arm the
+        // ladder from the current estimate (throttled) rather than gate on a
+        // level the estimate can't reach again without probing.
+        let collapsed = last
+            .was_estimate
+            .is_some_and(|w| estimate < w * ESTIMATE_COLLAPSE_FACTOR)
+            && self.time_since_last_probe(now) >= MIN_TIME_BETWEEN_ALR_PROBES;
+        if estimate < last.further && !collapsed {
             return false;
         }
 
