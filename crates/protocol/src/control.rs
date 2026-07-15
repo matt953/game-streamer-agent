@@ -182,7 +182,7 @@ pub struct PacketFeedback {
     pub samples: Vec<(u32, u32)>,
 }
 
-/// Per-interval client feedback that drives ABR (spec 04).
+/// Periodic client-side stream health for HUDs and logs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientStats {
     pub frames_received: u64,
@@ -191,11 +191,6 @@ pub struct ClientStats {
     pub frames_decoded: u64,
     pub decode_us_p50: u32,
     pub jitter_us: u32,
-    /// Recent one-way delay (µs, capture→received p50) — the ABR delay signal.
-    pub recent_delay_us: u32,
-    /// Rolling received video goodput (bits/s) the receiver measured — ABR's
-    /// delivered-rate estimate input.
-    pub recv_bps: u32,
 }
 
 #[cfg(test)]

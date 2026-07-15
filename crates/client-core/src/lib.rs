@@ -607,7 +607,6 @@ impl Client {
         let Some(tx) = &self.control_tx else { return };
         self.last_stats_report_us = now;
         let s = self.stats.summary(self.reassembler.frames_dropped());
-        let recent_delay_us = s.recent_latency_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32);
         let _ = tx.send(C2A::StatsReport(gsa_protocol::control::ClientStats {
             frames_received: s.frames_complete,
             frames_complete: s.frames_complete,
@@ -615,8 +614,6 @@ impl Client {
             frames_decoded: s.frames_decoded,
             decode_us_p50: s.decode_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32),
             jitter_us: 0,
-            recent_delay_us,
-            recv_bps: s.recv_mbps.map_or(0, |m| (m * 1_000_000.0) as u32),
         }));
     }
 
