@@ -55,14 +55,18 @@ fn dev_sign(identity: Option<String>) -> Result<()> {
         None => first_apple_dev_identity()?,
     };
     eprintln!("[dev-sign] signing with: {identity}");
-    for bin in ["gsa", "gsa-client-dev"] {
-        let path = format!("target/debug/{bin}");
-        if !std::path::Path::new(&path).exists() {
+    for path in [
+        "target/debug/gsa",
+        "target/debug/gsa-client-dev",
+        "target/release/gsa",
+        "target/release/gsa-client-dev",
+    ] {
+        if !std::path::Path::new(path).exists() {
             eprintln!("[dev-sign] skip {path} (build it first)");
             continue;
         }
         let status = Command::new("codesign")
-            .args(["--force", "--sign", &identity, "--timestamp=none", &path])
+            .args(["--force", "--sign", &identity, "--timestamp=none", path])
             .status()
             .context("run codesign")?;
         if !status.success() {
