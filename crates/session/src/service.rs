@@ -22,7 +22,7 @@ use crate::state::{AgentState, SessionEntry};
 /// Bitrate clamp band for client `SetBitrate` requests (and, later, ABR): floor
 /// keeps the picture alive on a bad link, ceiling bounds a runaway request.
 const BITRATE_MIN_BPS: u32 = 200_000; // 0.2 Mbps
-const BITRATE_MAX_BPS: u32 = 100_000_000; // 100 Mbps
+const BITRATE_MAX_BPS: u32 = 150_000_000; // protocol sanity maximum
 /// Where ABR opens the encoder when the ceiling is higher — below the ceiling so
 /// the encoder fills the target and the delivered-rate estimate can engage.
 const ABR_START_BPS: u32 = 8_000_000; // 8 Mbps
@@ -62,15 +62,17 @@ pub trait EncoderFactory: Send + Sync {
 /// - **ABR on**: config is the ceiling; the request (or [`ABR_START_BPS`]) is
 ///   the ramp start, clamped to the ceiling.
 /// - **ABR off**: the request (or config) is both the fixed rate and the cap.
-fn resolve_bitrates(requested: Option<u32>, abr: bool, config_bps: u32) -> (u32, u32) {
+fn resolve_bitrates(requested: Option<u32>, abr: bool, host_cap: Option<u32>) -> (u32, u32) {
+    let ceiling = host_cap.map_or(BITRATE_MAX_BPS, |c| {
+        c.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS)
+    });
     if abr {
-        let ceiling = config_bps;
         let start = requested
             .map_or(ABR_START_BPS, |b| b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS))
             .min(ceiling);
         (start, ceiling)
     } else {
-        let rate = requested.map_or(config_bps, |b| b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS));
+        let rate = requested.map_or(ceiling, |b| b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS));
         (rate, rate)
     }
 }
@@ -542,11 +544,19 @@ mod tests {
     const CONFIG: u32 = 8_000_000;
 
     #[test]
+    fn unset_host_cap_means_the_protocol_maximum() {
+        assert_eq!(
+            resolve_bitrates(None, true, None),
+            (ABR_START_BPS, BITRATE_MAX_BPS)
+        );
+    }
+
+    #[test]
     fn abr_uses_config_as_ceiling_and_request_as_start() {
         // The convergence-CI case: agent config 8, client requests a 2 Mb/s
         // start. Ceiling must stay 8 (else ABR can't ramp) and start must be 2.
         assert_eq!(
-            resolve_bitrates(Some(2_000_000), true, CONFIG),
+            resolve_bitrates(Some(2_000_000), true, Some(CONFIG)),
             (2_000_000, CONFIG)
         );
     }
@@ -556,7 +566,7 @@ mod tests {
         // The apps' case: they request nothing → start at ABR_START, ceiling
         // is the agent config.
         assert_eq!(
-            resolve_bitrates(None, true, 35_000_000),
+            resolve_bitrates(None, true, Some(35_000_000)),
             (ABR_START_BPS, 35_000_000)
         );
     }
@@ -565,12 +575,12 @@ mod tests {
     fn abr_start_never_exceeds_the_ceiling() {
         // A requested start above the ceiling is clamped down to it.
         assert_eq!(
-            resolve_bitrates(Some(50_000_000), true, CONFIG),
+            resolve_bitrates(Some(50_000_000), true, Some(CONFIG)),
             (CONFIG, CONFIG)
         );
         // And a low config still caps the default start.
         assert_eq!(
-            resolve_bitrates(None, true, 4_000_000),
+            resolve_bitrates(None, true, Some(4_000_000)),
             (4_000_000, 4_000_000)
         );
     }
@@ -578,10 +588,13 @@ mod tests {
     #[test]
     fn manual_rate_is_both_the_rate_and_the_cap() {
         assert_eq!(
-            resolve_bitrates(Some(25_000_000), false, CONFIG),
+            resolve_bitrates(Some(25_000_000), false, Some(CONFIG)),
             (25_000_000, 25_000_000)
         );
-        assert_eq!(resolve_bitrates(None, false, CONFIG), (CONFIG, CONFIG));
+        assert_eq!(
+            resolve_bitrates(None, false, Some(CONFIG)),
+            (CONFIG, CONFIG)
+        );
     }
 
     #[test]
@@ -589,9 +602,12 @@ mod tests {
         // Above the max and below the floor, ABR-off (so the clamp is visible
         // in the returned rate).
         assert_eq!(
-            resolve_bitrates(Some(999_000_000), false, CONFIG).0,
+            resolve_bitrates(Some(999_000_000), false, Some(CONFIG)).0,
             BITRATE_MAX_BPS
         );
-        assert_eq!(resolve_bitrates(Some(1), false, CONFIG).0, BITRATE_MIN_BPS);
+        assert_eq!(
+            resolve_bitrates(Some(1), false, Some(CONFIG)).0,
+            BITRATE_MIN_BPS
+        );
     }
 }

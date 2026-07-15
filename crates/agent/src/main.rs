@@ -314,7 +314,7 @@ fn load_config(
         cfg.control_socket = Some(sock);
     }
     if let Some(mbps) = bitrate_mbps {
-        cfg.video.bitrate_bps = mbps.saturating_mul(1_000_000);
+        cfg.video.bitrate_bps = Some(mbps.saturating_mul(1_000_000));
     }
     Ok(cfg)
 }

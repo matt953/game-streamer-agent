@@ -22,7 +22,8 @@ pub struct AgentConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
     pub mode: VideoMode,
-    pub bitrate_bps: u32,
+    /// Host bitrate cap (bits/s); `None` = unlimited up to the protocol max.
+    pub bitrate_bps: Option<u32>,
 }
 
 impl Default for AgentConfig {
@@ -47,7 +48,7 @@ impl Default for VideoConfig {
                 height: 720,
                 fps: 60,
             },
-            bitrate_bps: 35_000_000,
+            bitrate_bps: None,
         }
     }
 }
