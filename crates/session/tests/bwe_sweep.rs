@@ -66,6 +66,18 @@ impl Link {
         };
         Some(raw + j)
     }
+
+    fn spike(&self, now_us: u64, arrival: u64, spike_us: u64) -> u64 {
+        if spike_us == 0 {
+            return arrival;
+        }
+        // 150 ms outage window every 2 s of link time.
+        if now_us % 2_000_000 < 150_000 {
+            arrival + spike_us
+        } else {
+            arrival
+        }
+    }
 }
 
 struct Cell {
@@ -73,12 +85,20 @@ struct Cell {
     fraction: f64,
     /// Per-packet arrival jitter amplitude (µs), airtime-clumping style.
     jitter_us: u64,
+    /// One-way propagation delay (µs).
+    prop_us: u64,
+    /// Estimator's starting estimate (bps) — models state carried across a
+    /// network change.
+    start_bps: u32,
+    /// Radio-outage delay spikes: every ~2 s, all arrivals in a ~150 ms
+    /// window gain this extra delay (µs). 0 disables.
+    spike_us: u64,
 }
 
 fn run_cell(cell: &Cell) -> f64 {
     let capacity = cell.link_mbps * 1e6;
-    let mut link = Link::new(capacity, 20_000, (capacity / 8.0 * 0.15) as u64);
-    let start_bps = 3_000_000u32;
+    let mut link = Link::new(capacity, cell.prop_us, (capacity / 8.0 * 0.15) as u64);
+    let start_bps = cell.start_bps;
     let mut driver = BweDriver::new(start_bps, 0);
     let mut now_us: u64 = 0;
     let mut seq: u32 = 0;
@@ -107,7 +127,9 @@ fn run_cell(cell: &Cell) -> f64 {
         let media_rate = cell.fraction * target_bps;
         if media_rate > 0.0 {
             while next_media_us <= now_us {
-                let arrival = link.send(next_media_us, PACKET_BYTES, cell.jitter_us, &mut rng);
+                let arrival = link
+                    .send(next_media_us, PACKET_BYTES, cell.jitter_us, &mut rng)
+                    .map(|a| link.spike(next_media_us, a, cell.spike_us));
                 sent.push(SendRecord {
                     seq,
                     sent_us: next_media_us,
@@ -131,13 +153,19 @@ fn run_cell(cell: &Cell) -> f64 {
                 break;
             }
             probe_queue.pop_front();
-            let slot_us = job.min_delta.as_micros() as u64;
+            // Pace at the job rate like the real pacer's token bucket: slots
+            // stretch beyond min_delta when one packet per slot already
+            // exceeds the rate.
+            let packet_us = (f64::from(PACKET_BYTES) * 8e6 / job.rate_bps) as u64;
+            let slot_us = (job.min_delta.as_micros() as u64).max(packet_us);
             let per_slot = ((job.rate_bps * slot_us as f64 / 8e6) / f64::from(PACKET_BYTES))
                 .round()
                 .max(1.0) as usize;
             let burst = per_slot.min(remaining);
             for _ in 0..burst {
-                let arrival = link.send(due, PACKET_BYTES, cell.jitter_us, &mut rng);
+                let arrival = link
+                    .send(due, PACKET_BYTES, cell.jitter_us, &mut rng)
+                    .map(|a| link.spike(due, a, cell.spike_us));
                 sent.push(SendRecord {
                     seq,
                     sent_us: due,
@@ -219,6 +247,9 @@ fn estimator_converges_for_any_encoder_output() {
                 link_mbps,
                 fraction,
                 jitter_us: 0,
+                prop_us: 20_000,
+                start_bps: 3_000_000,
+                spike_us: 0,
             });
             // Sustained overshoot caps the achievable target at C/f: the
             // wire carries C, the encoder mandates f x target.
@@ -252,9 +283,12 @@ fn trace_one_cell() {
         .with_env_filter(EnvFilter::new("gsa_session=trace"))
         .try_init();
     let est = run_cell(&Cell {
-        link_mbps: 1.0,
-        fraction: 0.0,
-        jitter_us: 0,
+        link_mbps: 15.0,
+        fraction: 0.5,
+        jitter_us: 10_000,
+        prop_us: 60_000,
+        start_bps: 100_000_000,
+        spike_us: 120_000,
     });
     println!("final estimate: {:.2} Mb/s", est / 1e6);
 }
@@ -269,6 +303,9 @@ fn estimator_survives_arrival_jitter() {
             link_mbps,
             fraction: 0.3,
             jitter_us,
+            prop_us: 20_000,
+            start_bps: 3_000_000,
+            spike_us: 0,
         });
         let ceiling = (link_mbps * 1e6_f64).min(PROTOCOL_MAX_BPS);
         if est < 0.5 * ceiling {
@@ -287,5 +324,44 @@ fn estimator_survives_arrival_jitter() {
             "
 "
         )
+    );
+}
+
+/// Cellular VPN entry: high carried-over estimate crashes into a 15 Mb/s
+/// tunnel with long RTT and heavy airtime clumping. The estimator must claw
+/// back to a usable rate, not camp at the floor.
+#[test]
+fn estimator_recovers_after_a_network_change() {
+    let est = run_cell(&Cell {
+        link_mbps: 15.0,
+        fraction: 0.5,
+        jitter_us: 8_000,
+        prop_us: 60_000,
+        start_bps: 100_000_000,
+        spike_us: 0,
+    });
+    assert!(
+        est > 0.4 * 15e6,
+        "stuck after network change: est {:.2} Mb/s",
+        est / 1e6
+    );
+}
+
+/// Cellular delay spikes (radio scheduling outages) must not read as
+/// permanent congestion: probing has to survive them or recovery dies.
+#[test]
+fn estimator_survives_cellular_delay_spikes() {
+    let est = run_cell(&Cell {
+        link_mbps: 15.0,
+        fraction: 0.5,
+        jitter_us: 10_000,
+        prop_us: 60_000,
+        start_bps: 100_000_000,
+        spike_us: 120_000,
+    });
+    assert!(
+        est > 0.4 * 15e6,
+        "spikes pinned the estimate: est {:.2} Mb/s",
+        est / 1e6
     );
 }
