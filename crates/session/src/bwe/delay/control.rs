@@ -137,6 +137,17 @@ impl DelayController {
         self.last_estimate
     }
 
+    /// Probe-proven capacity floor for overuse decreases.
+    pub fn set_link_capacity(&mut self, capacity: Option<super::super::bandwidth::Bitrate>) {
+        self.rate_control.set_link_capacity(capacity);
+    }
+
+    /// Relief-free floored cutting outlasted a transient spike: the capacity
+    /// memory that produced the floor should be reset.
+    pub fn capacity_discredited(&self) -> bool {
+        self.rate_control.capacity_discredited()
+    }
+
     /// Whether the delay-based detector currently signals overuse.
     ///
     /// This is useful for gating behaviors (like probing) that would otherwise

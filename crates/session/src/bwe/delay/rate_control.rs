@@ -20,6 +20,11 @@ const MULTIPLICATIVE_INCREASE_COEF: f64 = 1.08;
 /// The maximal ratio of the observed bitrate that we allow estimating in a single increase.
 const MAX_ESTIMATE_RATIO: f64 = 1.5;
 const DEFAULT_BACKOFF_TIME: Duration = Duration::from_millis(100);
+
+/// Relief-free floored cutting longer than this discredits the capacity
+/// memory — long enough to ride out a transient delay spike, short enough
+/// to track a genuine capacity drop.
+const CAPACITY_DISCREDIT_AFTER: Duration = Duration::from_millis(500);
 /// Number of standard deviations below mean to reset observed bitrate average.
 const OBSERVED_BITRATE_RESET_THRESHOLD_STD: f64 = 3.0;
 
@@ -44,6 +49,12 @@ pub struct RateControl {
     last_estimate_update: Option<Instant>,
     // Last RTT estimate in micro-seconds
     last_rtt: Option<Duration>,
+    /// Probe-proven link capacity: floors overuse decreases so a delay spike
+    /// on an under-filled link cannot collapse the estimate. Discredited by
+    /// consecutive floored cuts that bring no relief.
+    link_capacity: Option<Bitrate>,
+    floored_since: Option<Instant>,
+    capacity_discredited: bool,
 }
 
 impl RateControl {
@@ -61,6 +72,9 @@ impl RateControl {
             averaged_observed_bitrate: MovingAverage::new(OBSERVED_BIT_RATE_SMOOTHING_FACTOR),
             last_estimate_update: None,
             last_rtt: None,
+            link_capacity: None,
+            floored_since: None,
+            capacity_discredited: false,
         }
     }
 
@@ -77,6 +91,11 @@ impl RateControl {
             self.last_rtt = Some(rtt);
         }
 
+        if signal == Signal::Normal {
+            // Relief between overuse episodes: benign recurring spikes must
+            // not accumulate toward discrediting the capacity floor.
+            self.floored_since = None;
+        }
         self.state = self.state.transition(signal);
         log_rate_control_observed_bitrate!(
             observed_bitrate.as_f64(),
@@ -177,7 +196,22 @@ impl RateControl {
         // Changing state here could trigger unintended AIMD decrease/increase logic.
     }
 
+    /// Latest probe-proven capacity, if any; `None` clears it.
+    pub fn set_link_capacity(&mut self, capacity: Option<Bitrate>) {
+        if capacity.is_none() {
+            self.capacity_discredited = false;
+        }
+        self.link_capacity = capacity;
+    }
+
+    /// Consecutive floored cuts brought no relief: the caller should reset
+    /// the capacity memory that produced the floor.
+    pub fn capacity_discredited(&self) -> bool {
+        self.capacity_discredited
+    }
+
     fn increase(&mut self, observed_bitrate: Bitrate, now: Instant) {
+        self.floored_since = None;
         // when we're already above what we're actually sending
         // See: aimd_rate_control.cc line 251-252
         let increase_limit = observed_bitrate * 1.5 + Bitrate::kbps(10);
@@ -239,6 +273,29 @@ impl RateControl {
     fn decrease(&mut self, observed_bitrate: Bitrate, now: Instant) {
         log_rate_control_applied_change!("decrease");
         let mut new_estimate = observed_bitrate * BETA;
+
+        // Cutting to the observed rate assumes the sender fills the estimate;
+        // light media makes that a collapse. Floor at the probe-proven
+        // capacity — unless repeated floored cuts bring no relief, which
+        // means the capacity memory no longer reflects the link.
+        let floor = self
+            .link_capacity
+            .filter(|_| !self.capacity_discredited)
+            .map(|c| c * BETA);
+        if let Some(f) = floor
+            && f > new_estimate
+        {
+            new_estimate = f;
+            // Relief-free floored cutting that outlasts any transient spike
+            // means the capacity memory no longer reflects the link.
+            let since = *self.floored_since.get_or_insert(now);
+            if now.saturating_duration_since(since) > CAPACITY_DISCREDIT_AFTER {
+                self.capacity_discredited = true;
+                new_estimate = observed_bitrate * BETA;
+            }
+        } else {
+            self.floored_since = None;
+        }
 
         if self.estimated_bitrate < new_estimate {
             // Avoid increasing the bitrate on overuse

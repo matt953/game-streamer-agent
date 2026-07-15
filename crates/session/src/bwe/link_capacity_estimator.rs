@@ -74,7 +74,6 @@ impl LinkCapacityEstimator {
     }
 
     /// Reset the capacity estimate.
-    #[cfg(test)]
     pub fn reset(&mut self) {
         if self.capacity_estimate.is_some() {
             trace!("Link capacity estimate reset");

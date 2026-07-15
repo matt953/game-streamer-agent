@@ -130,7 +130,7 @@ struct SendSideBandwidthEstimator {
     started_at: Option<Instant>,
     alr_detector: AlrDetector,
     link_capacity_estimator: LinkCapacityEstimator,
-    last_updated_estimate: Option<Bitrate>,
+    last_updated_estimate: Option<(Bitrate, BandwidthLimitedCause)>,
 }
 
 impl SendSideBandwidthEstimator {
@@ -181,15 +181,12 @@ impl SendSideBandwidthEstimator {
 
         // Feed records to probe estimator for analysis and process any new probe results
         let mut latest_probe_result = None;
-        for (config, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
+        for (_config, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
             latest_probe_result = Some(bitrate);
 
-            // Update link capacity estimator for every successful ALR probe, not just the latest.
-            // The estimator internally takes the max of all probe results, building up knowledge
-            // of proven link capacity. This differs from the delay controller, which only receives
-            if config.is_alr_probe() {
-                self.link_capacity_estimator.update_from_probe(bitrate, now);
-            }
+            // Every successful probe is proven delivery: arm the capacity
+            // memory regardless of what triggered the probe.
+            self.link_capacity_estimator.update_from_probe(bitrate, now);
         }
 
         let mut acked_packets = vec![];
@@ -305,6 +302,11 @@ impl SendSideBandwidthEstimator {
         let link_capacity = self.link_capacity_estimator.capacity_estimate(now);
         self.loss_controller
             .set_link_capacity_estimate(link_capacity);
+        self.delay_controller.set_link_capacity(link_capacity);
+        if self.delay_controller.capacity_discredited() {
+            self.link_capacity_estimator.reset();
+            self.delay_controller.set_link_capacity(None);
+        }
 
         // Clean up expired probe cluster state
         self.probe_estimator.handle_timeout(now);
@@ -327,18 +329,19 @@ impl SendSideBandwidthEstimator {
         let Some(estimate) = self.last_estimate() else {
             return;
         };
-        // Did it change?
-        if self.last_updated_estimate == Some(estimate) {
+        let cause = self.bandwidth_limited_cause();
+        // Did either the value or the limiting cause change? A pinned value
+        // with a shifting cause must still reach the probe controller — its
+        // probing decisions key off the cause.
+        if self.last_updated_estimate == Some((estimate, cause)) {
             return;
         }
-
-        let cause = self.bandwidth_limited_cause();
 
         self.probe_control.set_estimated_bitrate(estimate, cause);
         self.alr_detector.set_estimated_bitrate(estimate);
 
         // Don't update until this changes.
-        self.last_updated_estimate = Some(estimate);
+        self.last_updated_estimate = Some((estimate, cause));
     }
 
     fn bandwidth_limited_cause(&self) -> BandwidthLimitedCause {
