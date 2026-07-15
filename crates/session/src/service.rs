@@ -138,6 +138,9 @@ async fn serve_inner(
     let mut tick_count = 0u64;
     // Latest receiver-reported goodput (bps, at agent-clock µs) — ABR's estimate input.
     let mut recv_report: Option<(u32, u64)> = None;
+    // Path-clean tracking: decaying-min rtt floor + hold-down after signals.
+    let mut min_rtt_us = u64::MAX;
+    let mut unclean_until_us = 0u64;
 
     let result = loop {
         let msg: C2A = tokio::select! {
@@ -161,6 +164,18 @@ async fn serve_inner(
                     } else {
                         0.0
                     };
+                // Burst gating for the pacer: any loss, or rtt well above the
+                // observed floor, parks burst mode for 2 s (manual mode too).
+                if let Some(a) = &active {
+                    let rtt_us = conn.rtt().as_micros() as u64;
+                    min_rtt_us = min_rtt_us.min(rtt_us).max(1);
+                    min_rtt_us += min_rtt_us / 512;
+                    let now_us = state.clock.now_us();
+                    if loss > 0.0 || rtt_us > min_rtt_us * 3 / 2 + 10_000 {
+                        unclean_until_us = now_us + 2_000_000;
+                    }
+                    a.pipeline.set_path_clean(now_us >= unclean_until_us);
+                }
                     let rtt = conn.rtt();
                     let rtt_us = rtt.as_micros().min(u128::from(u32::MAX)) as u32;
                     let now_us = state.clock.now_us();

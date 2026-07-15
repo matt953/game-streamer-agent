@@ -25,6 +25,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 /// Pace the send at the live target × this gain (WebRTC's pacing factor), so an
 /// IDR drains within a few frame intervals instead of jamming the send queue.
 const PACING_GAIN: f64 = 2.5;
+/// Longest a single frame may take to leave the machine when the path shows
+/// no congestion signals; the burst is capped at 8x the target so one frame
+/// cannot overflow the transport's datagram buffer.
+const PACING_MAX_SPREAD: Duration = Duration::from_micros(1_000);
 /// Pacing rate floor (bytes/s): keeps startup and IDR recovery moving at a low target.
 const PACING_FLOOR_BYTES_PER_SEC: f64 = 250_000.0; // 2 Mb/s
 /// Send-queue depth (frames) past which the backlog is dropped and an IDR forced.
@@ -43,6 +47,9 @@ pub struct PipelineHandle {
     /// Live encode target bitrate (bps) — the actuator the manual knob and the
     /// ABR controller both drive; the encode thread and pacer read it.
     bitrate: Arc<AtomicU32>,
+    /// Whether the path currently shows no congestion signals (session layer
+    /// updates it): gates the latency-budget burst.
+    path_clean: Arc<AtomicBool>,
     /// Rolling emitted video bitrate (bps) on the send path — actual encoder
     /// output, pushed to the client.
     emitted_bitrate: Arc<AtomicU32>,
@@ -58,6 +65,11 @@ impl PipelineHandle {
     /// encoded frame; a no-op if unchanged.
     pub fn set_bitrate(&self, bitrate_bps: u32) {
         self.bitrate.store(bitrate_bps, Ordering::Relaxed);
+    }
+
+    /// Report whether the path is free of congestion signals (loss, delay).
+    pub fn set_path_clean(&self, clean: bool) {
+        self.path_clean.store(clean, Ordering::Relaxed);
     }
 
     /// The current live target bitrate (bps).
@@ -83,6 +95,7 @@ impl std::fmt::Debug for PipelineHandle {
 /// Start a pipeline streaming `source` through `encoder` onto `conn`'s
 /// datagrams. Returns immediately; work happens on dedicated threads plus
 /// one tokio task.
+#[allow(clippy::too_many_arguments)] // pipeline assembly point: one arg per stage
 pub fn start(
     mut source: Box<dyn RenderSource>,
     mut encoder: Box<dyn Encoder>,
@@ -197,6 +210,8 @@ pub fn start(
     let frames_ctr = frames_sent.clone();
     let force_idr_send = force_idr.clone();
     let bitrate_pace = bitrate.clone();
+    let path_clean = Arc::new(AtomicBool::new(true));
+    let path_clean_pace = path_clean.clone();
     let emitted_bitrate = Arc::new(AtomicU32::new(0));
     let emitted_send = emitted_bitrate.clone();
     tokio::spawn(async move {
@@ -237,7 +252,15 @@ pub fn start(
             };
             // Pace at the live target so ABR's bound applies to the wire too.
             let br = f64::from(bitrate_pace.load(Ordering::Relaxed));
-            let rate = (br / 8.0 * PACING_GAIN).max(PACING_FLOOR_BYTES_PER_SEC);
+            let total_len: usize = datagrams.iter().map(Vec::len).sum();
+            let budget_rate = if path_clean_pace.load(Ordering::Relaxed) {
+                (total_len as f64 / PACING_MAX_SPREAD.as_secs_f64()).min(br)
+            } else {
+                0.0 // congestion signals present: smooth spread only
+            };
+            let rate = (br / 8.0 * PACING_GAIN)
+                .max(PACING_FLOOR_BYTES_PER_SEC)
+                .max(budget_rate);
             let frame_start = std::time::Instant::now();
             let mut deadline = frame_start;
             for d in datagrams {
@@ -334,6 +357,7 @@ pub fn start(
         frames_sent,
         force_idr,
         bitrate,
+        path_clean,
         emitted_bitrate,
     })
 }

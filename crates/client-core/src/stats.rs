@@ -105,10 +105,11 @@ impl LatencyStats {
     fn recv_bitrate_bps(&self) -> Option<f64> {
         let &(oldest_us, oldest_bytes) = self.recv_window.front()?;
         let &(newest_us, _) = self.recv_window.back()?;
-        let span_us = newest_us.saturating_sub(oldest_us);
-        if span_us == 0 {
-            return None;
-        }
+        // Burst pacing clusters arrivals: a raw first-to-last span shrinks
+        // under clustering and inflates the rate. Floor it at half the window.
+        let span_us = newest_us
+            .saturating_sub(oldest_us)
+            .max(BITRATE_WINDOW_US / 2);
         // Bytes in (oldest, newest] — drop the boundary sample so the span and
         // the byte total cover the same interval.
         let bytes = self.recv_bytes.saturating_sub(oldest_bytes);
@@ -218,13 +219,24 @@ mod tests {
     #[test]
     fn recv_bitrate_tracks_recent_goodput() {
         let mut s = LatencyStats::default();
-        // 10 frames × 25 000 B, 10 ms apart: span (excl. boundary) = 90 ms,
-        // bytes in (oldest, newest] = 9×25 000 = 225 000 → 20 Mb/s.
+        // 20 frames × 25 000 B, 50 ms apart: span = 950 ms → 4 Mb/s.
+        for i in 0..20u64 {
+            s.on_frame_complete(25_000, i * 50_000);
+        }
+        let mbps = s.summary(0).recv_mbps.unwrap();
+        assert!((3.6..=4.4).contains(&mbps), "recv_mbps {mbps}");
+    }
+
+    #[test]
+    fn recv_bitrate_resists_burst_clustering() {
+        let mut s = LatencyStats::default();
+        // 10 frames in a 90 ms cluster: the raw span would read 20 Mb/s; the
+        // half-window floor keeps it grounded.
         for i in 0..10u64 {
             s.on_frame_complete(25_000, i * 10_000);
         }
         let mbps = s.summary(0).recv_mbps.unwrap();
-        assert!((18.0..=22.0).contains(&mbps), "recv_mbps {mbps}");
+        assert!(mbps < 5.0, "clustered arrivals inflated recv_mbps {mbps}");
     }
 
     #[test]
