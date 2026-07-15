@@ -36,7 +36,7 @@ pub const ALPN: &[u8] = b"gsa/0";
 /// UDP/datagram buffer target (bytes): large enough to absorb one frame's
 /// datagram burst without dropping, small enough to bound queuing latency.
 /// The OS clamps the socket buffer to its own max.
-const SOCKET_BUFFER_BYTES: usize = 1024 * 1024;
+const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// A non-blocking UDP socket bound to `addr` with enlarged buffers (quinn
 /// requires non-blocking).
