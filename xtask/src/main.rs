@@ -41,6 +41,19 @@ enum Cmd {
         #[arg(long, default_value = "0.0.0.0:9600")]
         listen: String,
     },
+    /// Dev link shaper: relay UDP to `--to` with delay/jitter/rate/loss.
+    Shape {
+        #[arg(long)]
+        to: std::net::SocketAddr,
+        #[arg(long, default_value_t = 200_000)]
+        rate_kbit: u32,
+        #[arg(long, default_value_t = 8)]
+        delay_ms: u32,
+        #[arg(long, default_value_t = 2)]
+        jitter_ms: u32,
+        #[arg(long, default_value_t = 0.0)]
+        loss_pct: f64,
+    },
     DevSign {
         /// Signing identity (default: the first Apple Development identity).
         #[arg(long)]
@@ -52,6 +65,29 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::CiE2e { frames, report } => ci_e2e(frames, &report),
         Cmd::Logs { listen } => logs::logs(&listen),
+        Cmd::Shape {
+            to,
+            rate_kbit,
+            delay_ms,
+            jitter_ms,
+            loss_pct,
+        } => {
+            let shaper = shaper::Shaper::start(
+                to,
+                &shaper::Shaping {
+                    rate_kbit,
+                    delay_ms,
+                    jitter_ms,
+                    loss_pct,
+                    buffer_pkts: Some(2048),
+                },
+                1,
+            )?;
+            eprintln!("[shape] front {} -> {to}", shaper.front);
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
         Cmd::DevSign { identity } => dev_sign(identity),
     }
 }
