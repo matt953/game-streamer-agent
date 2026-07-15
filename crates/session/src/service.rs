@@ -488,6 +488,7 @@ fn start_session(
         bitrate,
         codec,
         h264_profile,
+        state.clock.clone(),
     )?;
     let id = state.allocate_session();
     state.register_session(

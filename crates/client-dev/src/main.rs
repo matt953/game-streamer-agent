@@ -38,6 +38,9 @@ struct Cli {
     /// Force the software (openh264) decoder instead of platform hardware.
     #[arg(long)]
     sw_decode: bool,
+    /// Headless: write a per-frame stage ledger (JSONL) to this path.
+    #[arg(long)]
+    ledger: Option<std::path::PathBuf>,
     /// Enable server-side ABR for the session (headless; used by the chaos rig).
     #[arg(long)]
     abr: bool,
@@ -81,6 +84,7 @@ fn main() -> Result<()> {
             cli.json,
             cli.source,
             cli.sw_decode,
+            cli.ledger,
             cli.abr,
             cli.bitrate.map(|m| m.saturating_mul(1_000_000)),
             auth,

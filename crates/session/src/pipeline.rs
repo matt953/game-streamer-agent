@@ -91,6 +91,7 @@ pub fn start(
     bitrate_bps: u32,
     codec: Codec,
     h264_profile: H264Profile,
+    clock: gsa_core::time::MediaClock,
 ) -> Result<PipelineHandle> {
     let (sink, rx) = frame_channel();
     encoder.open(EncodeConfig {
@@ -114,7 +115,16 @@ pub fn start(
     let frames_sent = Arc::new(AtomicU64::new(0));
     let force_idr = Arc::new(AtomicBool::new(false));
     let bitrate = Arc::new(AtomicU32::new(bitrate_bps));
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Channel carries (chunk, encode_in agent-µs) so the ledger can split the
+    // capture→encode wait from the encode itself.
+    let (chunk_tx, mut chunk_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(gsa_encode_api::EncodedChunk, u64)>();
+    // Per-frame stage ledger (JSONL), dev-only via GSA_LEDGER=path.
+    let mut ledger = std::env::var("GSA_LEDGER")
+        .ok()
+        .and_then(|p| std::fs::File::create(p).ok())
+        .map(std::io::BufWriter::new);
+    let clock_enc = clock.clone();
 
     let stop_enc = stop.clone();
     let force_idr_enc = force_idr.clone();
@@ -151,6 +161,7 @@ pub fn start(
                     idr: force_idr_enc.swap(false, Ordering::AcqRel),
                     ..Default::default()
                 };
+                let encode_in_us = clock_enc.now_us();
                 if let Err(e) = encoder.submit(&frame, directives) {
                     tracing::error!(error = %e, "encode submit failed; stopping pipeline");
                     break;
@@ -161,7 +172,7 @@ pub fn start(
                 // The bound only trips on a genuinely dropped/failed frame.
                 match encoder.next_chunk(DRAIN_TIMEOUT) {
                     Ok(Some(chunk)) => {
-                        if chunk_tx.send(chunk).is_err() {
+                        if chunk_tx.send((chunk, encode_in_us)).is_err() {
                             return; // sender task gone (connection closed)
                         }
                     }
@@ -173,7 +184,7 @@ pub fn start(
                 }
                 // Sweep up any additional chunks without blocking.
                 while let Ok(Some(chunk)) = encoder.poll_bitstream() {
-                    if chunk_tx.send(chunk).is_err() {
+                    if chunk_tx.send((chunk, encode_in_us)).is_err() {
                         return;
                     }
                 }
@@ -194,7 +205,8 @@ pub fn start(
         // Rolling (send_time, encoded bytes) window for the emitted bitrate.
         let mut emit_window: VecDeque<(Instant, u64)> = VecDeque::new();
         let mut emit_bytes = 0u64;
-        while let Some(chunk) = chunk_rx.recv().await {
+        let mut ledger_rows = 0u32;
+        while let Some((chunk, encode_in_us)) = chunk_rx.recv().await {
             // Pacing fell behind the encoder: drop the stale backlog and force
             // an IDR so decode resyncs from the freshest frame.
             if chunk_rx.len() > SEND_BACKLOG_CAP {
@@ -250,6 +262,25 @@ pub fn start(
                 }
             }
             let sent = frames_ctr.fetch_add(1, Ordering::Relaxed) + 1;
+            // Ledger row: every stage as µs-from-capture, joined by frame id.
+            if let Some(w) = &mut ledger {
+                use std::io::Write as _;
+                let cap = chunk.capture_ts_us;
+                let _ = writeln!(
+                    w,
+                    "{{\"f\":{},\"ein\":{},\"eout\":{},\"sent\":{},\"bytes\":{},\"idr\":{}}}",
+                    chunk.frame_id.wire(),
+                    encode_in_us.saturating_sub(cap),
+                    chunk.encode_done_ts_us.saturating_sub(cap),
+                    clock.now_us().saturating_sub(cap),
+                    chunk.data.len(),
+                    chunk.kind == gsa_core::media::FrameKind::Idr,
+                );
+                ledger_rows += 1;
+                if ledger_rows.is_multiple_of(16) {
+                    let _ = w.flush();
+                }
+            }
             // Roll the emitted-bitrate window with this frame's encoded size.
             {
                 let now = Instant::now();

@@ -35,6 +35,7 @@ pub async fn run(
     json: bool,
     source: Option<String>,
     force_sw: bool,
+    ledger: Option<std::path::PathBuf>,
     abr: bool,
     bitrate_bps: Option<u32>,
     auth: crate::pairing::Auth,
@@ -61,6 +62,10 @@ pub async fn run(
     let _input = client.take_input_sender();
 
     let mut decoder = make_decoder(force_sw)?;
+    let mut ledger_file = match &ledger {
+        Some(path) => Some(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => None,
+    };
     let mut decoded = 0u32;
     let mut marker_read_ok = 0u64;
     let mut marker_regressions = 0u64;
@@ -71,6 +76,15 @@ pub async fn run(
             bail!("connection closed after {decoded} frames");
         };
         decoded += 1;
+        // Ledger row: stage times as µs-from-capture, joined by frame id.
+        if let Some(w) = &mut ledger_file {
+            use std::io::Write as _;
+            let lat = out.latency_us.unwrap_or(0);
+            writeln!(w, "{{\"f\":{},\"recv\":{lat},\"dec\":{lat}}}", out.frame_id)?;
+            if decoded.is_multiple_of(16) {
+                w.flush()?;
+            }
+        }
         // Progress heartbeat: a failing CI scenario shows where flow stopped.
         if decoded.is_multiple_of(60) {
             let s = client.stats();
