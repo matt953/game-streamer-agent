@@ -244,6 +244,7 @@ mod tests {
 
     fn hdr() -> VideoDatagramHeader {
         VideoDatagramHeader {
+            seq: 0,
             session_epoch: 3,
             frame_id: 0xdead_beef,
             kind: FrameKind::P,

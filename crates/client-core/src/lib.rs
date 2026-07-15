@@ -180,6 +180,10 @@ pub struct Client {
     last_keyframe_request_us: u64,
     /// Client-clock µs of the last `StatsReport` sent (ABR signal, ~2 Hz).
     last_stats_report_us: u64,
+    /// Pending per-packet arrival samples (seq, arrival µs) for the next
+    /// `PacketFeedback` batch (~20 Hz).
+    feedback_batch: Vec<(u32, u64)>,
+    last_feedback_us: u64,
     /// True while the P-frame reference chain is broken (lost/undecodable
     /// frame); we skip P-frames until a keyframe resyncs the decoder (spec 04).
     awaiting_idr: bool,
@@ -262,6 +266,8 @@ impl Client {
             last_frame_id: None,
             last_keyframe_request_us: 0,
             last_stats_report_us: 0,
+            feedback_batch: Vec::new(),
+            last_feedback_us: 0,
             // Until the first keyframe, the decoder has no reference; skip any
             // P-frames that arrive ahead of it.
             awaiting_idr: true,
@@ -457,13 +463,19 @@ impl Client {
                 .copied()
                 .map(gsa_protocol::DatagramType::from_wire)
             {
+                Some(Ok(gsa_protocol::DatagramType::Padding)) => {
+                    self.record_arrival(&datagram);
+                    continue;
+                }
                 Some(Ok(gsa_protocol::DatagramType::Audio)) => {
                     if let Some(a) = &mut self.audio {
                         a.handle(&datagram);
                     }
                     continue;
                 }
-                Some(Ok(gsa_protocol::DatagramType::Video)) => {}
+                Some(Ok(gsa_protocol::DatagramType::Video)) => {
+                    self.record_arrival(&datagram);
+                }
                 _ => {
                     tracing::warn!("unknown datagram dropped");
                     continue;
@@ -605,6 +617,38 @@ impl Client {
             jitter_us: 0,
             recent_delay_us,
             recv_bps: s.recv_mbps.map_or(0, |m| (m * 1_000_000.0) as u32),
+        }));
+    }
+
+    /// Record one sequenced datagram's arrival and flush the feedback batch
+    /// at ~20 Hz (or when full). Fire-and-forget like the stats report.
+    fn record_arrival(&mut self, datagram: &[u8]) {
+        const FEEDBACK_INTERVAL_US: u64 = 50_000;
+        const MAX_BATCH: usize = 512;
+        let Ok(seq) = gsa_protocol::datagram::read_seq(datagram) else {
+            return;
+        };
+        let now = self.clock.now_us();
+        self.feedback_batch.push((seq, now));
+        if self.feedback_batch.len() < MAX_BATCH
+            && now.saturating_sub(self.last_feedback_us) < FEEDBACK_INTERVAL_US
+        {
+            return;
+        }
+        self.last_feedback_us = now;
+        let Some(tx) = &self.control_tx else {
+            self.feedback_batch.clear();
+            return;
+        };
+        let base = self.feedback_batch.first().map_or(now, |&(_, t)| t);
+        let samples = self
+            .feedback_batch
+            .drain(..)
+            .map(|(seq, t)| (seq, t.saturating_sub(base) as u32))
+            .collect();
+        let _ = tx.send(C2A::PacketFeedback(gsa_protocol::control::PacketFeedback {
+            base_arrival_us: base,
+            samples,
         }));
     }
 

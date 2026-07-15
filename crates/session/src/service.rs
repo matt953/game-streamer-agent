@@ -353,6 +353,19 @@ async fn serve_inner(
                 )
                 .await?;
             }
+            C2A::PacketFeedback(fb) => {
+                // ABR v2 substrate: join arrivals against the send history.
+                // Phase 1 only proves the loop (logged); the goog_cc port
+                // consumes these samples in phase 2.
+                if let Some(a) = &active
+                    && let Some(&(max_seq, _)) = fb.samples.last()
+                {
+                    let sent = a.pipeline.send_history.take_upto(max_seq);
+                    let received = fb.samples.len();
+                    let lost = sent.len().saturating_sub(received);
+                    tracing::trace!(received, lost, max_seq, "packet feedback");
+                }
+            }
             C2A::RequestKeyframe => {
                 if let Some(a) = &active {
                     a.pipeline.request_keyframe();

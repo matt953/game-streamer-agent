@@ -34,6 +34,50 @@ const PACING_FLOOR_BYTES_PER_SEC: f64 = 250_000.0; // 2 Mb/s
 /// Send-queue depth (frames) past which the backlog is dropped and an IDR forced.
 const SEND_BACKLOG_CAP: usize = 4;
 
+/// One sent datagram's bookkeeping, joined later against the receiver's
+/// per-packet feedback: (send µs, size, padding) keyed by transport seq.
+#[derive(Debug, Clone, Copy)]
+pub struct SendRecord {
+    pub seq: u32,
+    pub sent_us: u64,
+    pub bytes: u32,
+    pub padding: bool,
+}
+
+/// Bounded send history the feedback join reads (spec 04, ABR v2 substrate).
+#[derive(Debug, Default)]
+pub struct SendHistory {
+    inner: std::sync::Mutex<VecDeque<SendRecord>>,
+}
+
+const SEND_HISTORY_CAP: usize = 8192;
+
+impl SendHistory {
+    fn push(&self, rec: SendRecord) {
+        let mut q = self.inner.lock().unwrap();
+        if q.len() == SEND_HISTORY_CAP {
+            q.pop_front();
+        }
+        q.push_back(rec);
+    }
+
+    /// Take the records covering `seqs`; older records are dropped (the
+    /// feedback for them is gone for good — counted as lost by the caller).
+    pub fn take_upto(&self, max_seq: u32) -> Vec<SendRecord> {
+        let mut q = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        while let Some(front) = q.front() {
+            if front.seq <= max_seq {
+                out.push(*front);
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        out
+    }
+}
+
 pub struct PipelineHandle {
     stop: Arc<AtomicBool>,
     source: Box<dyn RenderSource>,
@@ -50,6 +94,8 @@ pub struct PipelineHandle {
     /// Whether the path currently shows no congestion signals (session layer
     /// updates it): gates the latency-budget burst.
     path_clean: Arc<AtomicBool>,
+    /// Send-side bookkeeping for the per-packet feedback join.
+    pub send_history: Arc<SendHistory>,
     /// Rolling emitted video bitrate (bps) on the send path — actual encoder
     /// output, pushed to the client.
     emitted_bitrate: Arc<AtomicU32>,
@@ -212,6 +258,9 @@ pub fn start(
     let bitrate_pace = bitrate.clone();
     let path_clean = Arc::new(AtomicBool::new(true));
     let path_clean_pace = path_clean.clone();
+    let send_history = Arc::new(SendHistory::default());
+    let history_send = send_history.clone();
+    let mut next_seq: u32 = 0;
     let emitted_bitrate = Arc::new(AtomicU32::new(0));
     let emitted_send = emitted_bitrate.clone();
     tokio::spawn(async move {
@@ -264,7 +313,15 @@ pub fn start(
                 .max(budget_rate);
             let frame_start = std::time::Instant::now();
             let mut deadline = frame_start;
-            for d in datagrams {
+            for mut d in datagrams {
+                gsa_protocol::datagram::stamp_seq(&mut d, next_seq);
+                history_send.push(SendRecord {
+                    seq: next_seq,
+                    sent_us: clock.now_us(),
+                    bytes: d.len() as u32,
+                    padding: false,
+                });
+                next_seq = next_seq.wrapping_add(1);
                 let now = std::time::Instant::now();
                 if deadline > now {
                     // tokio's timer floor is ~1 ms, so only sleep once the
@@ -359,6 +416,7 @@ pub fn start(
         force_idr,
         bitrate,
         path_clean,
+        send_history,
         emitted_bitrate,
     })
 }
