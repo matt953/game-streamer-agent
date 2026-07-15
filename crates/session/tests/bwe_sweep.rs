@@ -239,24 +239,3 @@ fn trace_one_cell() {
     });
     println!("final estimate: {:.2} Mb/s", est / 1e6);
 }
-
-/// The retired controller gated its estimate on encoder output reaching 85%
-/// of target, so any lighter content starved it of a signal forever. Kept as
-/// the permanent record of why the estimate must not depend on the encoder.
-#[test]
-fn v1_froze_without_encoder_cooperation() {
-    let mut v1 = gsa_session::abr::AbrController::new(150_000_000, 0);
-    v1.sync_target(3_000_000);
-    let mut t = 0u64;
-    for _ in 0..240 {
-        // Light content on a clean 100 Mb/s link: no estimate ever qualifies.
-        v1.on_sample(gsa_session::abr::Sample {
-            rtt_us: 2_000,
-            loss: 0.0,
-            estimate_bps: None,
-            now_us: t,
-        });
-        t += 250_000;
-    }
-    assert_eq!(v1.target_bps(), 3_000_000, "v1 frozen at start, by design");
-}

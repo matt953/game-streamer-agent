@@ -2,7 +2,6 @@
 //! transport pipelines per connection, speaks the control protocol, and
 //! exposes the local admin API (`ControlService`).
 
-pub mod abr;
 pub mod admin;
 pub mod audio_pipeline;
 #[allow(dead_code)] // consumed when the v2 controller replaces v1

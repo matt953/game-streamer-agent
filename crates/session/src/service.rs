@@ -118,10 +118,10 @@ async fn serve_inner(
 
     let mut active: Option<ActiveSession> = None;
     // ABR (spec 04): controller lives per-session (`None` between sessions);
-    // `abr_enabled` gates whether it drives the bitrate. Off by default.
-    let mut abr: Option<crate::abr::AbrController> = None;
-    // v2 estimator in shadow mode: estimates and probes, controls nothing yet.
+    // `abr_enabled` gates whether the estimator drives the bitrate.
     let mut bwe2: Option<crate::bwe_driver::BweDriver> = None;
+    let mut session_ceiling: u32 = BITRATE_MAX_BPS;
+    let mut last_estimate_bps: u32 = 0;
     let mut abr_enabled = false;
     let mut helloed = false;
     // Client's max decodable H.264 profile (from Hello), negotiated at session start.
@@ -139,7 +139,6 @@ async fn serve_inner(
     let mut prev_lost_packets = 0u64;
     let mut tick_count = 0u64;
     // Latest receiver-reported goodput (bps, at agent-clock µs) — ABR's estimate input.
-    let mut recv_report: Option<(u32, u64)> = None;
     // Path-clean tracking: decaying-min rtt floor + hold-down after signals.
     let mut min_rtt_us = u64::MAX;
     let mut unclean_until_us = 0u64;
@@ -158,28 +157,11 @@ async fn serve_inner(
                 let lost_delta = path.lost_packets.saturating_sub(prev_lost_packets);
                 prev_sent_packets = path.sent_packets;
                 prev_lost_packets = path.lost_packets;
-                if let (Some(a), Some(d)) = (&active, &mut bwe2) {
-                    d.set_desired_bitrate(a.pipeline.bitrate());
-                    if let Some(job) = d.on_tick(state.clock.now_us()) {
-                        a.pipeline.send_probe(job);
-                    }
-                    if tick_count.is_multiple_of(4)
-                        && let Some(est) = d.estimate_bps()
-                    {
-                        tracing::debug!(
-                            est2_mbps = est as f64 / 1_000_000.0,
-                            "bwe2 shadow estimate"
-                        );
-                    }
-                }
-                if abr_enabled
-                    && let (Some(a), Some(ctrl)) = (&active, &mut abr)
-                {
-                    let loss = if sent_delta > 0 {
-                        lost_delta as f64 / sent_delta as f64
-                    } else {
-                        0.0
-                    };
+                let loss = if sent_delta > 0 {
+                    lost_delta as f64 / sent_delta as f64
+                } else {
+                    0.0
+                };
                 // Burst gating for the pacer: any loss, or rtt well above the
                 // observed floor, parks burst mode for 2 s (manual mode too).
                 if let Some(a) = &active {
@@ -192,36 +174,32 @@ async fn serve_inner(
                     }
                     a.pipeline.set_path_clean(now_us >= unclean_until_us);
                 }
-                    let rtt = conn.rtt();
-                    let rtt_us = rtt.as_micros().min(u128::from(u32::MAX)) as u32;
+                // The estimator measures the link continuously (probing when
+                // media is light); in Auto its estimate drives the target.
+                if let (Some(a), Some(d)) = (&active, &mut bwe2) {
                     let now_us = state.clock.now_us();
-                    // Feed the estimate only when fresh and not app-limited.
-                    let emitted = a.pipeline.emitted_bitrate_bps();
-                    let app_limited = u64::from(emitted) * 100 < u64::from(a.pipeline.bitrate()) * 85;
-                    let estimate_bps = recv_report
-                        .filter(|&(bps, at_us)| {
-                            bps > 0 && !app_limited && now_us.saturating_sub(at_us) < 2_000_000
-                        })
-                        .map(|(bps, _)| bps);
-                    let (target, decision) = ctrl.on_sample(crate::abr::Sample {
-                        rtt_us,
-                        loss,
-                        estimate_bps,
-                        now_us,
-                    });
-                    a.pipeline.set_bitrate(target);
-                    if tick_count.is_multiple_of(4) || decision != crate::abr::Decision::Hold {
+                    d.set_desired_bitrate(session_ceiling);
+                    if let Some(job) = d.on_tick(now_us) {
+                        a.pipeline.send_probe(job);
+                    }
+                    if let Some(est) = d.estimate_bps() {
+                        last_estimate_bps = est.min(u64::from(u32::MAX)) as u32;
+                    }
+                    if abr_enabled && last_estimate_bps > 0 {
+                        // 90% of measured: headroom for audio and overhead.
+                        let target = (u64::from(last_estimate_bps) * 90 / 100) as u32;
+                        a.pipeline
+                            .set_bitrate(target.clamp(BITRATE_MIN_BPS, session_ceiling));
+                    }
+                    if tick_count.is_multiple_of(4) {
                         tracing::debug!(
-                            rtt_ms = rtt_us as f64 / 1000.0,
-                            delay_slope_ms_s = ctrl.delay_slope_us_per_s() / 1000.0,
+                            est_mbps = f64::from(last_estimate_bps) / 1_000_000.0,
+                            target_mbps = f64::from(a.pipeline.bitrate()) / 1_000_000.0,
+                            emit_mbps = f64::from(a.pipeline.emitted_bitrate_bps()) / 1_000_000.0,
+                            ceiling_mbps = f64::from(session_ceiling) / 1_000_000.0,
                             loss,
-                            est_mbps = estimate_bps.map(|e| f64::from(e) / 1_000_000.0),
-                            app_limited,
-                            emit_mbps = f64::from(emitted) / 1_000_000.0,
-                            target_mbps = f64::from(target) / 1_000_000.0,
-                            ceiling_mbps = f64::from(ctrl.ceiling_bps()) / 1_000_000.0,
-                            ?decision,
-                            "abr"
+                            abr = abr_enabled,
+                            "bwe"
                         );
                     }
                 }
@@ -231,14 +209,8 @@ async fn serve_inner(
                     let stats = EncodeStats {
                         target_bitrate_bps: a.pipeline.bitrate(),
                         emitted_bitrate_bps: a.pipeline.emitted_bitrate_bps(),
-                        ceiling_bitrate_bps: abr
-                            .as_ref()
-                            .map_or_else(|| a.pipeline.bitrate(), |c| c.ceiling_bps()),
-                        estimate_bitrate_bps: abr
-                            .as_ref()
-                            .filter(|_| abr_enabled)
-                            .and_then(|c| c.estimate_cap_bps())
-                            .unwrap_or(0),
+                        ceiling_bitrate_bps: session_ceiling,
+                        estimate_bitrate_bps: last_estimate_bps,
                         abr_enabled,
                     };
                     if let Err(e) = send_msg(&mut send, &A2C::EncodeStats(stats)).await {
@@ -321,10 +293,7 @@ async fn serve_inner(
                         let (mode, bitrate, codec) = (started.mode, started.bitrate, started.codec);
                         let session_id = started.session.id;
                         // Controller ramps from the opened bitrate up to the ceiling.
-                        let mut ctrl =
-                            crate::abr::AbrController::new(started.ceiling, state.clock.now_us());
-                        ctrl.sync_target(bitrate);
-                        abr = Some(ctrl);
+                        session_ceiling = started.ceiling;
                         bwe2 = Some(crate::bwe_driver::BweDriver::new(
                             bitrate,
                             state.clock.now_us(),
@@ -361,7 +330,6 @@ async fn serve_inner(
                     state.remove_session(a.id);
                     tracing::info!(peer, session = a.id, "session stopped by client");
                 }
-                abr = None;
                 bwe2 = None;
             }
             C2A::Ping { client_ts_us } => {
@@ -395,10 +363,8 @@ async fn serve_inner(
                     // same pipeline actuator server-side.
                     let clamped = bitrate_bps.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS);
                     a.pipeline.set_bitrate(clamped);
-                    // The manual bitrate is ABR's ceiling.
-                    if let Some(ctrl) = &mut abr {
-                        ctrl.set_ceiling(clamped);
-                    }
+                    // The manual bitrate doubles as Auto's ceiling.
+                    session_ceiling = clamped;
                     tracing::info!(
                         peer,
                         session = a.id,
@@ -409,21 +375,17 @@ async fn serve_inner(
             }
             C2A::SetAbr { enabled } => {
                 abr_enabled = enabled;
-                if let (Some(a), Some(ctrl)) = (&active, &mut abr) {
-                    if enabled {
-                        // Start adapting from the current bitrate.
-                        ctrl.sync_target(a.pipeline.bitrate());
-                    } else {
-                        // Restore the manual bitrate (the ceiling) on disable.
-                        a.pipeline.set_bitrate(ctrl.ceiling_bps());
-                    }
+                if let Some(a) = &active
+                    && !enabled
+                {
+                    // Restore the manual bitrate (the ceiling) on disable.
+                    a.pipeline.set_bitrate(session_ceiling);
                 }
                 tracing::info!(peer, enabled, "abr toggled by client");
             }
             C2A::FrameAck { .. } => { /* full NACK/ref-invalidation ladder lands at M3 (spec 04) */
             }
             C2A::StatsReport(stats) => {
-                recv_report = Some((stats.recv_bps, state.clock.now_us()));
                 tracing::debug!(peer, ?stats, "client stats");
             }
             C2A::InputBatch(events) => {
