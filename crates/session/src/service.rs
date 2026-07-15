@@ -120,6 +120,8 @@ async fn serve_inner(
     // ABR (spec 04): controller lives per-session (`None` between sessions);
     // `abr_enabled` gates whether it drives the bitrate. Off by default.
     let mut abr: Option<crate::abr::AbrController> = None;
+    // v2 estimator in shadow mode: estimates and probes, controls nothing yet.
+    let mut bwe2: Option<crate::bwe_driver::BweDriver> = None;
     let mut abr_enabled = false;
     let mut helloed = false;
     // Client's max decodable H.264 profile (from Hello), negotiated at session start.
@@ -156,6 +158,20 @@ async fn serve_inner(
                 let lost_delta = path.lost_packets.saturating_sub(prev_lost_packets);
                 prev_sent_packets = path.sent_packets;
                 prev_lost_packets = path.lost_packets;
+                if let (Some(a), Some(d)) = (&active, &mut bwe2) {
+                    d.set_desired_bitrate(a.pipeline.bitrate());
+                    if let Some(job) = d.on_tick(state.clock.now_us()) {
+                        a.pipeline.send_probe(job);
+                    }
+                    if tick_count.is_multiple_of(4)
+                        && let Some(est) = d.estimate_bps()
+                    {
+                        tracing::debug!(
+                            est2_mbps = est as f64 / 1_000_000.0,
+                            "bwe2 shadow estimate"
+                        );
+                    }
+                }
                 if abr_enabled
                     && let (Some(a), Some(ctrl)) = (&active, &mut abr)
                 {
@@ -309,6 +325,10 @@ async fn serve_inner(
                             crate::abr::AbrController::new(started.ceiling, state.clock.now_us());
                         ctrl.sync_target(bitrate);
                         abr = Some(ctrl);
+                        bwe2 = Some(crate::bwe_driver::BweDriver::new(
+                            bitrate,
+                            state.clock.now_us(),
+                        ));
                         abr_enabled = req.abr;
                         active = Some(started.session);
                         send_msg(
@@ -342,6 +362,7 @@ async fn serve_inner(
                     tracing::info!(peer, session = a.id, "session stopped by client");
                 }
                 abr = None;
+                bwe2 = None;
             }
             C2A::Ping { client_ts_us } => {
                 send_msg(
@@ -354,16 +375,11 @@ async fn serve_inner(
                 .await?;
             }
             C2A::PacketFeedback(fb) => {
-                // ABR v2 substrate: join arrivals against the send history.
-                // Phase 1 only proves the loop (logged); the goog_cc port
-                // consumes these samples in phase 2.
-                if let Some(a) = &active
+                if let (Some(a), Some(d)) = (&active, &mut bwe2)
                     && let Some(&(max_seq, _)) = fb.samples.last()
                 {
                     let sent = a.pipeline.send_history.take_upto(max_seq);
-                    let received = fb.samples.len();
-                    let lost = sent.len().saturating_sub(received);
-                    tracing::trace!(received, lost, max_seq, "packet feedback");
+                    d.on_feedback(&sent, &fb, state.clock.now_us());
                 }
             }
             C2A::RequestKeyframe => {

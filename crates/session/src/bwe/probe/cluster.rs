@@ -101,6 +101,10 @@ impl ProbeClusterConfig {
     }
 
     /// Get the target bitrate.
+    pub fn target_duration(&self) -> Duration {
+        self.target_duration
+    }
+
     pub fn target_bitrate(&self) -> Bitrate {
         self.target_bitrate
     }

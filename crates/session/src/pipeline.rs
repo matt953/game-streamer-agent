@@ -42,6 +42,8 @@ pub struct SendRecord {
     pub sent_us: u64,
     pub bytes: u32,
     pub padding: bool,
+    /// Probe cluster this datagram belongs to, if any.
+    pub cluster: Option<u64>,
 }
 
 /// Bounded send history the feedback join reads (spec 04, ABR v2 substrate).
@@ -78,6 +80,50 @@ impl SendHistory {
     }
 }
 
+/// One padding burst the pacer executes to measure link capacity.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeJob {
+    pub cluster: u64,
+    pub rate_bps: f64,
+    pub duration: Duration,
+    pub min_packets: usize,
+    pub min_delta: Duration,
+}
+
+/// Execute one probe cluster: padding datagrams at the cluster rate for its
+/// duration, spaced by its minimum delta, all stamped and recorded.
+async fn run_probe(
+    conn: &quinn::Connection,
+    history: &SendHistory,
+    clock: &gsa_core::time::MediaClock,
+    next_seq: &mut u32,
+    job: ProbeJob,
+) {
+    let size = conn
+        .max_datagram_size()
+        .unwrap_or(DEFAULT_MAX_DATAGRAM)
+        .min(1200);
+    let bytes_total = (job.rate_bps / 8.0 * job.duration.as_secs_f64()) as usize;
+    let count = bytes_total.div_ceil(size).max(job.min_packets);
+    let spacing = job.duration.div_f64(count as f64).max(job.min_delta);
+    for _ in 0..count {
+        let mut d = gsa_protocol::datagram::encode_padding(size);
+        gsa_protocol::datagram::stamp_seq(&mut d, *next_seq);
+        history.push(SendRecord {
+            seq: *next_seq,
+            sent_us: clock.now_us(),
+            bytes: d.len() as u32,
+            padding: true,
+            cluster: Some(job.cluster),
+        });
+        *next_seq = next_seq.wrapping_add(1);
+        if conn.send_datagram(bytes::Bytes::from(d)).is_err() {
+            return;
+        }
+        tokio::time::sleep(spacing).await;
+    }
+}
+
 pub struct PipelineHandle {
     stop: Arc<AtomicBool>,
     source: Box<dyn RenderSource>,
@@ -96,6 +142,8 @@ pub struct PipelineHandle {
     path_clean: Arc<AtomicBool>,
     /// Send-side bookkeeping for the per-packet feedback join.
     pub send_history: Arc<SendHistory>,
+    /// Queue of probe bursts for the sender task.
+    probe_tx: tokio::sync::mpsc::UnboundedSender<ProbeJob>,
     /// Rolling emitted video bitrate (bps) on the send path — actual encoder
     /// output, pushed to the client.
     emitted_bitrate: Arc<AtomicU32>,
@@ -116,6 +164,12 @@ impl PipelineHandle {
     /// Report whether the path is free of congestion signals (loss, delay).
     pub fn set_path_clean(&self, clean: bool) {
         self.path_clean.store(clean, Ordering::Relaxed);
+    }
+
+    /// Queue a padding probe burst; the sender executes it promptly, media
+    /// or idle. Returns false when the sender is gone.
+    pub fn send_probe(&self, job: ProbeJob) -> bool {
+        self.probe_tx.send(job).is_ok()
     }
 
     /// The current live target bitrate (bps).
@@ -261,6 +315,7 @@ pub fn start(
     let send_history = Arc::new(SendHistory::default());
     let history_send = send_history.clone();
     let mut next_seq: u32 = 0;
+    let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeJob>();
     let emitted_bitrate = Arc::new(AtomicU32::new(0));
     let emitted_send = emitted_bitrate.clone();
     tokio::spawn(async move {
@@ -270,7 +325,19 @@ pub fn start(
         let mut emit_window: VecDeque<(Instant, u64)> = VecDeque::new();
         let mut emit_bytes = 0u64;
         let mut ledger_rows = 0u32;
-        while let Some((chunk, encode_in_us)) = chunk_rx.recv().await {
+        loop {
+            let (chunk, encode_in_us) = tokio::select! {
+                biased;
+                job = probe_rx.recv() => {
+                    let Some(job) = job else { break };
+                    run_probe(&conn, &history_send, &clock, &mut next_seq, job).await;
+                    continue;
+                }
+                msg = chunk_rx.recv() => match msg {
+                    Some(m) => m,
+                    None => break,
+                },
+            };
             // Pacing fell behind the encoder: drop the stale backlog and force
             // an IDR so decode resyncs from the freshest frame.
             if chunk_rx.len() > SEND_BACKLOG_CAP {
@@ -320,6 +387,7 @@ pub fn start(
                     sent_us: clock.now_us(),
                     bytes: d.len() as u32,
                     padding: false,
+                    cluster: None,
                 });
                 next_seq = next_seq.wrapping_add(1);
                 let now = std::time::Instant::now();
@@ -417,6 +485,7 @@ pub fn start(
         bitrate,
         path_clean,
         send_history,
+        probe_tx,
         emitted_bitrate,
     })
 }
