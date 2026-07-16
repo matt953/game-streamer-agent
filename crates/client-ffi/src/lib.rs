@@ -361,6 +361,12 @@ pub unsafe extern "C" fn gsa_set_bitrate(session: *const GsaSession, bitrate_bps
     }
 }
 
+/// The protocol's bitrate ceiling (bps) — the top of every bitrate control.
+#[unsafe(no_mangle)]
+pub extern "C" fn gsa_bitrate_max_bps() -> u32 {
+    gsa_protocol::BITRATE_MAX_BPS
+}
+
 /// Enable/disable server-side ABR for the session. Fire-and-forget; NULL is a
 /// no-op.
 ///

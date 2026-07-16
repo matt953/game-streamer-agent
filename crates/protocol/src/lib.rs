@@ -24,6 +24,11 @@ use serde::de::DeserializeOwned;
 ///     `C2A::PacketFeedback` (ABR v2 substrate, spec 04).
 pub const PROTO_VERSION: u16 = 2;
 
+/// Bitrate clamp band (spec 04): the floor keeps a stream alive; the ceiling
+/// is the protocol sanity maximum every endpoint (and every UI) may rely on.
+pub const BITRATE_MIN_BPS: u32 = 200_000;
+pub const BITRATE_MAX_BPS: u32 = 150_000_000;
+
 /// Maximum accepted size for one control message (defense-in-depth cap for
 /// attacker-controlled length prefixes).
 pub const MAX_CONTROL_MSG: usize = 1 << 20;

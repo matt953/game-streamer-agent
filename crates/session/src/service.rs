@@ -13,16 +13,12 @@ use gsa_protocol::control::{
     A2C, C2A, EncodeStats, HelloAck, Notification, ProtoErrorMsg, SessionParams, SourceKind,
 };
 use gsa_protocol::grant::Scope;
-use gsa_protocol::{PROTO_VERSION, control};
+use gsa_protocol::{BITRATE_MAX_BPS, BITRATE_MIN_BPS, PROTO_VERSION, control};
 use gsa_transport::{recv_msg, send_msg};
 
 use crate::pipeline;
 use crate::state::{AgentState, SessionEntry};
 
-/// Bitrate clamp band for client `SetBitrate` requests (and, later, ABR): floor
-/// keeps the picture alive on a bad link, ceiling bounds a runaway request.
-const BITRATE_MIN_BPS: u32 = 200_000; // 0.2 Mbps
-const BITRATE_MAX_BPS: u32 = 150_000_000; // protocol sanity maximum
 /// Where ABR opens the encoder when the ceiling is higher — below the ceiling so
 /// the encoder fills the target and the delivered-rate estimate can engage.
 const ABR_START_BPS: u32 = 8_000_000; // 8 Mbps

@@ -1195,6 +1195,7 @@ version = "0.1.0"
 dependencies = [
  "gsa-client-core",
  "gsa-core",
+ "gsa-protocol",
  "gsa-transport",
  "libc",
  "tokio",
