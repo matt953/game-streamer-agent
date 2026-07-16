@@ -256,6 +256,9 @@ fn run_cell_stats(cell: &Cell) -> CellStats {
             }
             target_bps = estimate.clamp(FLOOR_BPS, PROTOCOL_MAX_BPS);
             max_est = max_est.max(estimate);
+            if std::env::var("GSA_SWEEP_DUMP").is_ok() && now_us % 2_000_000 < 250_000 {
+                eprintln!("T {:.0}s est {:.2}M", now_us as f64 / 1e6, estimate / 1e6);
+            }
             if cell.outage_dur_us > 0
                 && (cell.outage_at_us..cell.outage_at_us + 20_000_000).contains(&now_us)
                 && estimate < 0.5 * cell.link_mbps * 1e6
@@ -324,14 +327,14 @@ fn trace_one_cell() {
         .with_env_filter(EnvFilter::new("gsa_session=trace"))
         .try_init();
     let est = run_cell(&Cell {
-        link_mbps: 20.0,
+        link_mbps: 1.0,
         fraction: 0.5,
-        jitter_us: 10_000,
-        prop_us: 60_000,
+        jitter_us: 0,
+        prop_us: 20_000,
         start_bps: 3_000_000,
-        spike_us: 120_000,
-        outage_at_us: 25_000_000,
-        outage_dur_us: 1_000_000,
+        outage_at_us: 0,
+        outage_dur_us: 0,
+        spike_us: 0,
     });
     println!("final estimate: {:.2} Mb/s", est / 1e6);
 }
@@ -471,6 +474,34 @@ fn estimator_does_not_overshoot_on_clumped_arrivals() {
     assert!(
         stats.avg >= 0.5 * 20e6 && stats.avg <= 1.2 * 20e6,
         "estimate should ride near capacity: avg {:.2} Mb/s",
+        stats.avg / 1e6
+    );
+}
+
+/// A saturating encoder emitting ~72% of the estimate (the 90% target
+/// factor times real hardware-encoder adherence ~80%) sits in the dead
+/// zone: too much media for ALR probing, too little delivered rate for
+/// AIMD's observed-throughput cap to allow a climb. Discovery of headroom
+/// must come from probing anyway. Models the field failure of a game
+/// stream stuck at 4 Mb/s on a 25 Mb/s tunnel after startup probes died
+/// on a cold tunnel.
+#[test]
+fn estimator_climbs_out_of_a_low_start_under_full_media() {
+    let stats = run_cell_stats(&Cell {
+        link_mbps: 25.0,
+        fraction: 0.8,
+        jitter_us: 20_000,
+        prop_us: 60_000,
+        start_bps: 8_000_000,
+        // Cold tunnel at session start: the startup probes die.
+        outage_at_us: 1_000,
+        outage_dur_us: 2_000_000,
+        // Cellular delay wobble keeps clipping the AIMD climb.
+        spike_us: 40_000,
+    });
+    assert!(
+        stats.avg >= 0.5 * 25e6,
+        "stuck below capacity under full media: avg {:.2} Mb/s",
         stats.avg / 1e6
     );
 }
