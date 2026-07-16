@@ -11,7 +11,10 @@ use crate::bwe::prelude::{already_happened, not_happening};
 const MAX_WAITING_TIME_FOR_PROBING_RESULT: Duration = Duration::from_secs(1);
 
 /// `kProbeUncertainty`, `kAlrEndedTimeout`, `kMinTimeBetweenAlrProbes`.
-const BITRATE_DROP_THRESHOLD: f64 = 0.66;
+/// Drop detection compares against the recent high-water mark, so the
+/// threshold must sit below the natural sawtooth amplitude at capacity
+/// (troughs reach ~0.6x of peaks); only a genuine collapse halves.
+const BITRATE_DROP_THRESHOLD: f64 = 0.5;
 const BITRATE_DROP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_FRACTION_AFTER_DROP: f64 = 0.85;
 const PROBE_UNCERTAINTY: f64 = 0.05;
@@ -31,6 +34,17 @@ const MAX_PROBE_BITRATE_FACTOR: f64 = 2.0;
 
 /// Minimum time between stagnant periodic probes to avoid excessive probing when at capacity.
 const MIN_TIME_BETWEEN_STAGNANT_PROBES: Duration = Duration::from_secs(15);
+
+/// Fruitless stagnant probes stretch their interval up to this factor.
+const MAX_STAGNANT_BACKOFF: u32 = 4;
+
+/// Bounds for the adaptive cluster-duration floor.
+const MIN_PROBE_DURATION: Duration = Duration::from_millis(15);
+const MAX_PROBE_DURATION: Duration = Duration::from_millis(100);
+
+/// A probe measuring at least this fraction of its rate proved the cluster
+/// span was long enough for this link.
+const PROBE_FRUITFUL_FRACTION: f64 = 0.7;
 
 /// Threshold for considering an estimate change significant (5%).
 const ESTIMATE_CHANGE_THRESHOLD: f64 = 0.05;
@@ -55,7 +69,19 @@ pub struct ProbeControl {
     prev_desired: Option<Bitrate>,
 
     last_estimate: Option<Bitrate>,
-    last_estimate_change: Option<Instant>,
+    /// Upward-progress tracking for stagnation detection: the estimate's
+    /// high-water mark and when it last rose past it. A noisy estimate that
+    /// goes nowhere must still read as stagnant.
+    progress_high: Option<Bitrate>,
+    last_progress: Option<Instant>,
+    /// Consecutive stagnant probes without progress stretch the interval:
+    /// a genuinely full link should not be harassed every cycle.
+    stagnant_backoff: u32,
+
+    /// Adaptive cluster-duration floor: radio links clump arrivals into
+    /// bursts, and a cluster inside one burst has no measurable arrival
+    /// spread. Failed probes stretch the floor; successes relax it.
+    duration_floor: Duration,
     last_cause: BandwidthLimitedCause,
 
     prev_estimate: Option<Bitrate>,
@@ -103,7 +129,10 @@ impl Default for ProbeControl {
             desired_bitrate: None,
             prev_desired: None,
             last_estimate: None,
-            last_estimate_change: None,
+            progress_high: None,
+            last_progress: None,
+            stagnant_backoff: 1,
+            duration_floor: MIN_PROBE_DURATION,
             last_cause: BandwidthLimitedCause::DelayBasedLimited,
             prev_estimate: None,
             recent_high: None,
@@ -135,7 +164,10 @@ impl ProbeControl {
             self.pending.clear();
             self.last_estimate = None;
             self.desired_bitrate = None;
-            self.last_estimate_change = None;
+            self.progress_high = None;
+            self.last_progress = None;
+            self.stagnant_backoff = 1;
+            self.duration_floor = MIN_PROBE_DURATION;
             self.last_stagnant = None;
             self.last_probe = None;
             self.prev_estimate = None;
@@ -203,6 +235,31 @@ impl ProbeControl {
         self.scheduled_stagnant = None;
     }
 
+    /// A probe cluster finalized. Arrival clumping corrupts short clusters
+    /// both ways — compressed spans get rejected by the ratio guard, and
+    /// spans rounded up to burst boundaries dilute the measured rate far
+    /// below the probed rate — and both mean only a longer cluster can
+    /// measure this link. A low measurement WITH queue build is different:
+    /// that is a saturated link answering honestly, and longer clusters
+    /// would only dig the queue deeper.
+    pub fn on_probe_outcome(
+        &mut self,
+        measured: Option<Bitrate>,
+        target: Bitrate,
+        overusing: bool,
+    ) {
+        let fruitful = measured.is_some_and(|m| m >= target * PROBE_FRUITFUL_FRACTION);
+        if fruitful {
+            self.duration_floor = (self.duration_floor / 2).max(MIN_PROBE_DURATION);
+            self.stagnant_backoff = 1;
+        } else if overusing {
+            // A saturated link answered honestly: leave it alone for a while.
+            self.stagnant_backoff = MAX_STAGNANT_BACKOFF;
+        } else {
+            self.duration_floor = (self.duration_floor * 2).min(MAX_PROBE_DURATION);
+        }
+    }
+
     pub fn poll_timeout(&self) -> Instant {
         self.next_timeout
     }
@@ -264,7 +321,7 @@ impl ProbeControl {
             || self.maybe_periodic_alr(now, desired, estimate)
             || self.maybe_stagnant(now, desired, estimate);
 
-        self.update_estimate_change(now, estimate);
+        self.update_progress(now, estimate);
 
         // Update prev_estimate for next cycle (used by large drop and stagnation detection).
         self.prev_estimate = Some(estimate);
@@ -279,17 +336,15 @@ impl ProbeControl {
         self.pending.pop_front()
     }
 
-    fn update_estimate_change(&mut self, now: Instant, estimate: Bitrate) {
-        // Track when estimate last changed significantly (>5%).
-        if let Some(prev) = self.prev_estimate
-            && estimate != prev
-        {
-            self.last_estimate_change = Some(now);
+    fn update_progress(&mut self, now: Instant, estimate: Bitrate) {
+        let high = self.progress_high.get_or_insert(estimate);
+        if estimate > *high * (1.0 + ESTIMATE_CHANGE_THRESHOLD) {
+            *high = estimate;
+            self.last_progress = Some(now);
+            self.stagnant_backoff = 1;
         }
-
-        // Initialize baseline if not set yet.
-        if self.last_estimate_change.is_none() {
-            self.last_estimate_change = Some(now);
+        if self.last_progress.is_none() {
+            self.last_progress = Some(now);
         }
     }
 
@@ -421,44 +476,17 @@ impl ProbeControl {
         true
     }
 
-    /// Probe when estimate has stagnated (no change for 15+ seconds) despite unmet demand.
+    /// Probe when the estimate has made no upward progress despite unmet
+    /// demand. This is the escape for the non-ALR deadlock: a saturating
+    /// encoder on a small target keeps media at ~100% of the estimate, so
+    /// ALR probing never engages, while AIMD's increase (capped by observed
+    /// throughput, clipped by jitter cuts) cannot compound. The media can
+    /// only measure up to the target — headroom above it needs a probe.
     ///
-    /// This probe type addresses a deadlock scenario in the BWE system where AIMD recovery
-    /// cannot make progress after network capacity is restored:
-    ///
-    /// **The Deadlock:**
-    /// 1. Network degrades from 5 Mbps → 1 Mbps, estimate drops to ~900 kbps
-    /// 2. Application reduces send rate to ~500 kbps (below estimate)
-    /// 3. Network recovers to 5 Mbps
-    /// 4. AIMD tries to increase but is capped at 1.5× observed throughput:
-    ///    500 kbps × 1.5 = 750 kbps maximum
-    /// 5. Sending at 500 kbps = 71% of estimate, which is above ALR threshold (65%)
-    /// 6. ALR never triggers → no periodic probing
-    /// 7. Large-drop probe requires ALR or recent ALR exit (see `maybe_large_drop`)
-    /// 8. System is stuck: estimate ~700 kbps on a 5 Mbps network
-    ///
-    /// **AIMD's 1.5× Cap (line 191 in rate_control.rs):**
-    /// `observed_bitrate * 1.5 + Bitrate::kbps(10)`
-    /// This prevents runaway growth beyond actual sending rate. It's conservative but
-    /// necessary - without it, the estimate could grow unbounded even when we're barely
-    /// sending anything.
-    ///
-    /// **ALR Detection Threshold:**
-    /// ALR triggers when sending < 65% of estimate consistently for 500ms with budget
-    /// accumulation > 80%. At 60-70% send rate, you're in the deadlock zone: too high
-    /// to trigger ALR, too low for AIMD to help much.
-    ///
-    /// **Loss Controller's 1.5× Cap:**
-    /// The loss controller also applies a 1.5× cap during recovery (line 303 in
-    /// loss_controller.rs), compounding the AIMD limitation.
-    ///
-    /// 1. Large-drop recovery probe (requires ALR or recent ALR exit)
-    ///    the ALR requirement from large-drop probes
-    ///
-    /// - Catches deadlock regardless of whether a drop was detected
-    /// - Provides periodic escape from any stagnation scenario, not just post-drop
-    /// - Uses a conservative 15-second wait to avoid probing at convergence
-    /// - Rate-limited to once per 30 seconds to prevent oscillation
+    /// Progress means a new estimate high-water mark, so a noisy estimate
+    /// that goes nowhere still reads as stagnant. Fruitless probes back off
+    /// exponentially: a genuinely full link gets an occasional check, not a
+    /// harassment cycle.
     fn maybe_stagnant(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
         // Don't interfere with initial probing phase.
         if self.is_during_initial(now) {
@@ -470,11 +498,11 @@ impl ProbeControl {
             return false;
         }
 
-        let Some(last_change) = self.last_estimate_change else {
+        let Some(last_progress) = self.last_progress else {
             return false;
         };
 
-        if now.saturating_duration_since(last_change) < MIN_TIME_BETWEEN_STAGNANT_PROBES {
+        if now.saturating_duration_since(last_progress) < MIN_TIME_BETWEEN_STAGNANT_PROBES {
             return false;
         }
 
@@ -483,17 +511,19 @@ impl ProbeControl {
             return false;
         }
 
-        // Rate limit: at least 30 seconds between stagnation probes.
+        // Backed-off interval since the last fruitless stagnant probe.
+        let interval = MIN_TIME_BETWEEN_STAGNANT_PROBES * self.stagnant_backoff;
         if let Some(last_probe) = self.last_stagnant
-            && now.saturating_duration_since(last_probe) < MIN_TIME_BETWEEN_STAGNANT_PROBES
+            && now.saturating_duration_since(last_probe) < interval
         {
             return false;
         }
 
-        // Probe at 2× estimate (conservative, won't overwhelm if at capacity).
-        let probe_rate = estimate * STAGNANT_PROBE_SCALE;
+        // Probe at 2x estimate (conservative, won't overwhelm if at capacity).
+        let probe_rate = (estimate * STAGNANT_PROBE_SCALE).min(desired);
         self.queue_probe(probe_rate, ProbeKind::Stagnant, desired, now);
         self.last_stagnant = Some(now);
+        self.stagnant_backoff = (self.stagnant_backoff * 2).min(MAX_STAGNANT_BACKOFF);
 
         true
     }
@@ -577,9 +607,14 @@ impl ProbeControl {
 
         let cluster_id = self.next_cluster_id.inc();
 
+        // Duration starts minimal (a heavy cluster inflates the queue of a
+        // saturated link and cuts the estimate it came to measure) and only
+        // stretches to the adaptive floor the link's arrival clumping has
+        // taught us. The packet-count minimum guarantees measurable span at
+        // low rates regardless.
         let config = ProbeClusterConfig::new(cluster_id, bitrate, kind)
             .with_min_packet_count(self.config.min_probe_packets_sent)
-            .with_duration(self.config.min_probe_duration)
+            .with_duration(self.config.min_probe_duration.max(self.duration_floor))
             .with_min_probe_delta(self.config.min_probe_delta);
 
         // Threshold for further exponential probing (probe_bitrate * 0.7).
@@ -917,8 +952,8 @@ mod test {
         pc.set_alr_start_time(now + Duration::from_secs(2));
         pc.set_alr_stop_time(now + Duration::from_secs(3));
 
-        // Simulate large drop (to 60% of original = 3 Mbps, below 66% threshold)
-        pc.set_estimated_bitrate(Bitrate::mbps(3), BandwidthLimitedCause::DelayBasedLimited);
+        // Simulate large drop (to 40% of original = 2 Mbps, below the 50% threshold)
+        pc.set_estimated_bitrate(Bitrate::mbps(2), BandwidthLimitedCause::DelayBasedLimited);
 
         // Check at now+5s (within 3s of ALR ending, so alr_ended_recently is true)
         let later = now + Duration::from_secs(5);
