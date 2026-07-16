@@ -395,8 +395,17 @@ async fn serve_inner(
                 if let Some(a) = &active
                     && !enabled
                 {
-                    // Restore the manual bitrate (the ceiling) on disable.
-                    a.pipeline.set_bitrate(session_ceiling);
+                    // The ceiling was "up to", never an asserted rate: pin at
+                    // what the link measurably carries, ceiling as fallback.
+                    // Clients read the pinned number back from EncodeStats.
+                    let pinned = if last_estimate_bps > 0 {
+                        ((u64::from(last_estimate_bps) * 90 / 100) as u32)
+                            .clamp(BITRATE_MIN_BPS, session_ceiling)
+                    } else {
+                        session_ceiling
+                    };
+                    a.pipeline.set_bitrate(pinned);
+                    tracing::info!(peer, pinned, "abr disabled; bitrate pinned");
                 }
                 tracing::info!(peer, enabled, "abr toggled by client");
             }
