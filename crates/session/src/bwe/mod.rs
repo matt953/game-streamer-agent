@@ -181,8 +181,11 @@ impl SendSideBandwidthEstimator {
 
         // Feed records to probe estimator for analysis and process any new probe results
         let mut latest_probe_result = None;
-        for (_config, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
+        let overusing = self.delay_controller.is_overusing();
+        for (config, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
             latest_probe_result = Some(bitrate);
+            self.probe_control
+                .on_probe_outcome(Some(bitrate), config.target_bitrate(), overusing);
 
             // Every successful probe is proven delivery: arm the capacity
             // memory regardless of what triggered the probe.
@@ -320,6 +323,11 @@ impl SendSideBandwidthEstimator {
 
         // Clean up expired probe cluster state
         self.probe_estimator.handle_timeout(now);
+        let overusing = self.delay_controller.is_overusing();
+        for _ in 0..self.probe_estimator.take_clumped_probes() {
+            self.probe_control
+                .on_probe_outcome(None, bandwidth::Bitrate::ZERO, overusing);
+        }
 
         // Feed the current estimate into subcontrollers, if it changed.
         self.propagate_estimate();

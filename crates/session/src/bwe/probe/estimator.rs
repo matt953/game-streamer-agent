@@ -49,6 +49,9 @@ pub struct ProbeEstimator {
 
     /// Clusters that were updated in the last call to `update`.
     did_update: VecDeque<TwccClusterId>,
+
+    /// Clusters rejected for compressed arrivals (ratio guard).
+    clumped_probes: u32,
 }
 
 #[derive(Debug)]
@@ -87,6 +90,7 @@ impl ProbeEstimator {
         Self {
             states: VecDeque::new(),
             did_update: VecDeque::with_capacity(10),
+            clumped_probes: 0,
         }
     }
 
@@ -201,6 +205,7 @@ impl ProbeEstimator {
 
     /// Finalize probes that are ready.
     pub fn handle_timeout(&mut self, now: Instant) {
+        let clumped = &mut self.clumped_probes;
         self.states.retain(|s| {
             let do_keep = now < s.finalize_at;
             if do_keep {
@@ -208,15 +213,30 @@ impl ProbeEstimator {
             }
 
             let result = s.do_calculate_bitrate();
-            if let ProbeResult::Estimate(_) = result {
-                // Already logged in calculate_bitrate() during update().
-            } else {
-                // Log the final rejection reason for the probe.
-                trace!(%result, "Probe result");
+            match result {
+                ProbeResult::Estimate(_) => {
+                    // Already logged in calculate_bitrate() during update().
+                }
+                // Compressed arrivals: the cluster fit inside one radio
+                // aggregation burst. Only this failure mode means a longer
+                // cluster would have measured.
+                ProbeResult::InvalidSendReceiveRatio { .. } => {
+                    trace!(%result, "Probe result");
+                    *clumped += 1;
+                }
+                _ => {
+                    // Log the final rejection reason for the probe.
+                    trace!(%result, "Probe result");
+                }
             }
 
             false
         });
+    }
+
+    /// Probes rejected for compressed arrivals since the last call.
+    pub fn take_clumped_probes(&mut self) -> u32 {
+        std::mem::take(&mut self.clumped_probes)
     }
 
     /// Clear all active probes.

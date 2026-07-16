@@ -67,7 +67,9 @@ impl ProbeClusterConfig {
             target_bitrate,
             // Low-rate clusters stretch so enough packets span radio
             // aggregation windows; 15 ms of a 500 kb/s probe is one packet,
-            // which no validity gate can measure.
+            // which no validity gate can measure. Links whose clumping
+            // defeats even this get a longer span via the probe controller's
+            // adaptive duration floor.
             target_duration: {
                 let for_ten_packets =
                     Duration::from_secs_f64(10.0 * 1200.0 * 8.0 / target_bitrate.as_f64().max(1.0));
