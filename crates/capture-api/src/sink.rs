@@ -15,6 +15,7 @@ use crate::frame::GpuFrame;
 struct Shared {
     slot: Mutex<Option<GpuFrame>>,
     available: Condvar,
+    offered: AtomicU64,
     dropped: AtomicU64,
     closed: AtomicBool,
 }
@@ -46,12 +47,20 @@ pub fn frame_channel() -> (FrameSink, FrameReceiver) {
 impl FrameSink {
     /// Submit a frame. Replaces (drops) any frame not yet consumed.
     pub fn submit(&self, frame: GpuFrame) {
+        self.shared.offered.fetch_add(1, Ordering::Relaxed);
         let mut slot = self.shared.slot.lock().expect("sink lock");
         if slot.replace(frame).is_some() {
             self.shared.dropped.fetch_add(1, Ordering::Relaxed);
         }
         drop(slot);
         self.shared.available.notify_one();
+    }
+
+    /// Frames the source has offered the ring, dropped or not — the
+    /// capture-side frame rate (≈ the content's render rate when live).
+    #[must_use]
+    pub fn offered(&self) -> u64 {
+        self.shared.offered.load(Ordering::Relaxed)
     }
 
     /// Frames overwritten before the consumer took them.

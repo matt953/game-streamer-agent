@@ -158,6 +158,8 @@ pub struct PipelineHandle {
     /// Rolling emitted video bitrate (bps) on the send path — actual encoder
     /// output, pushed to the client.
     emitted_bitrate: Arc<AtomicU32>,
+    /// Producer half of the capture ring, kept for its counters.
+    sink: gsa_capture_api::FrameSink,
 }
 
 impl PipelineHandle {
@@ -190,6 +192,16 @@ impl PipelineHandle {
 
     /// The rolling emitted (actual encoder output) bitrate (bps), 0 until enough
     /// frames have been sent to measure it.
+    /// Frames the capture source has offered so far (≈ content render rate).
+    pub fn frames_offered(&self) -> u64 {
+        self.sink.offered()
+    }
+
+    /// Frames the capture ring dropped (encoder slower than capture).
+    pub fn frames_ring_dropped(&self) -> u64 {
+        self.sink.dropped()
+    }
+
     pub fn emitted_bitrate_bps(&self) -> u32 {
         self.emitted_bitrate.load(Ordering::Relaxed)
     }
@@ -218,6 +230,7 @@ pub fn start(
     clock: gsa_core::time::MediaClock,
 ) -> Result<PipelineHandle> {
     let (sink, rx) = frame_channel();
+    let sink_counters = sink.clone();
     encoder.open(EncodeConfig {
         codec,
         mode,
@@ -498,6 +511,7 @@ pub fn start(
         send_history,
         probe_tx,
         emitted_bitrate,
+        sink: sink_counters,
     })
 }
 

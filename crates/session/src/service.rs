@@ -204,7 +204,20 @@ async fn serve_inner(
                         a.pipeline
                             .set_bitrate(target.clamp(BITRATE_MIN_BPS, session_ceiling));
                     }
-                    if tick_count.is_multiple_of(4) {
+                    if tick_count.is_multiple_of(4)
+                    && let Some(a) = &active
+                {
+                    let offered = a.pipeline.frames_offered();
+                    let sent = a.pipeline.frames_sent.load(std::sync::atomic::Ordering::Relaxed);
+                    let ring_dropped = a.pipeline.frames_ring_dropped();
+                    tracing::debug!(
+                        offered,
+                        sent,
+                        ring_dropped,
+                        "capture"
+                    );
+                }
+                if tick_count.is_multiple_of(4) {
                         tracing::debug!(
                             est_mbps = f64::from(last_estimate_bps) / 1_000_000.0,
                             target_mbps = f64::from(a.pipeline.bitrate()) / 1_000_000.0,
