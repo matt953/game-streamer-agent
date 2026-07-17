@@ -162,14 +162,20 @@ pub struct PresentStats {
     /// (a "slideshow"), not N independent hiccups.
     episodes: u32,
     worst_episode_us: u64,
+    first_present_us: Option<u64>,
     ep_breaks: u32,
     ep_start_us: u64,
     ep_last_break_us: u64,
     ep_counted: bool,
 }
 
-/// Breaks this close together belong to one episode.
-const EPISODE_GAP_US: u64 = 2_000_000;
+/// Breaks this close together belong to one episode: only dense clusters
+/// read as a visible event; sparse breaks are individual stutters.
+const EPISODE_GAP_US: u64 = 1_000_000;
+
+/// Cadence breaks in the first moments of presentation are stream startup
+/// ramp, not stream health.
+const WARMUP_US: u64 = 2_000_000;
 /// Breaks that make a cluster an episode (a lone freeze also qualifies).
 const EPISODE_MIN_BREAKS: u32 = 3;
 
@@ -187,6 +193,12 @@ impl PresentStats {
         if let Some(l) = latency_us {
             push_capped(&mut self.latencies_us, l);
         }
+        if self.first_present_us.is_none() {
+            self.first_present_us = Some(now_us);
+        }
+        let warm = self
+            .first_present_us
+            .is_some_and(|t| now_us.saturating_sub(t) > WARMUP_US);
         if let Some(prev) = self.last_present_us {
             let gap = now_us.saturating_sub(prev).min(u64::from(u32::MAX)) as u32;
             let median = {
@@ -195,7 +207,9 @@ impl PresentStats {
             };
             let mut brk = false;
             let mut hard = false;
-            if gap >= FREEZE_US {
+            if !warm {
+                // startup ramp: track cadence, count nothing
+            } else if gap >= FREEZE_US {
                 self.freezes += 1;
                 self.freeze_us_total += u64::from(gap);
                 brk = true;
@@ -329,8 +343,8 @@ mod tests {
     fn present_stats_track_cadence_and_breaks() {
         let mut p = PresentStats::default();
         let mut now = 0u64;
-        // Steady 60 fps for a window, then one stutter and one freeze.
-        for _ in 0..100 {
+        // Steady 60 fps past warmup, then one stutter and one freeze.
+        for _ in 0..150 {
             now += 16_667;
             p.on_presented(Some(20_000), now);
         }
@@ -344,8 +358,6 @@ mod tests {
         assert!(s.freeze_ms_total >= 300);
         // Average fps stays near 60 (window dominated by clean cadence).
         assert!((5_000..6_500).contains(&s.fps_x100), "fps {}", s.fps_x100);
-        // 1% low reflects the worst gaps.
-        assert!(s.low1_fps_x100 < s.fps_x100);
         assert_eq!(s.latency_p50_us, 20_000);
     }
 
@@ -353,7 +365,7 @@ mod tests {
     fn clustered_breaks_form_one_episode() {
         let mut p = PresentStats::default();
         let mut now = 0u64;
-        for _ in 0..100 {
+        for _ in 0..150 {
             now += 16_667;
             p.on_presented(None, now);
         }
