@@ -84,6 +84,10 @@ fn main() -> Result<()> {
                 1,
             )?;
             eprintln!("[shape] front {} -> {to}", shaper.front);
+            // Grace period so the session connects cleanly, then impair.
+            std::thread::sleep(Duration::from_secs(3));
+            shaper.activate();
+            eprintln!("[shape] impairment active");
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
