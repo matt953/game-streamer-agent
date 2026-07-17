@@ -26,6 +26,8 @@ struct Report {
     /// Rolling received video goodput (Mb/s) — used by the chaos rig to check
     /// ABR converged under a shaped link.
     recv_mbps: Option<f64>,
+    /// Presentation health (fed at decode-complete in this harness).
+    present: gsa_client_core::stats::PresentSummary,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -94,6 +96,7 @@ pub async fn run(
                 .map_err(|e| anyhow::anyhow!("hw decode: {e}"))?;
             let Some(surface) = surface else { continue };
             decoded += 1;
+            client.frame_presented(enc.capture_ts_us);
             if let Some(w) = &mut ledger_file {
                 use std::io::Write as _;
                 let recv_us = enc.latency_us.unwrap_or(0);
@@ -147,6 +150,7 @@ pub async fn run(
                 bail!("connection closed after {decoded} frames");
             };
             decoded += 1;
+            client.frame_presented(out.capture_ts_us);
             // Ledger row: stage times as µs-from-capture, joined by frame id.
             if let Some(w) = &mut ledger_file {
                 use std::io::Write as _;
@@ -186,6 +190,7 @@ pub async fn run(
     }
 
     let stats = client.stats();
+    let present = client.present_stats();
     let report = Report {
         connect: addr.to_string(),
         mode: format!(
@@ -203,6 +208,7 @@ pub async fn run(
         latency_ms_p99: stats.latency_ms_p99,
         decode_ms_p50: stats.decode_ms_p50,
         recv_mbps: stats.recv_mbps,
+        present,
     };
 
     if json {

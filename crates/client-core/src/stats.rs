@@ -144,6 +144,100 @@ impl LatencyStats {
     }
 }
 
+/// Presentation-side health: fed by the embedder (or harness) each time a
+/// frame is handed to the display. Cadence gaps are the ground truth for
+/// smoothness — rates alone hide bad pacing.
+#[derive(Debug, Default)]
+pub struct PresentStats {
+    presented: u64,
+    last_present_us: Option<u64>,
+    /// Rolling inter-present gaps (µs), last `WINDOW` samples.
+    frametimes_us: VecDeque<u32>,
+    /// Rolling capture→present latency (µs), when clock sync allows it.
+    latencies_us: VecDeque<u32>,
+    stutters: u64,
+    freezes: u64,
+    freeze_us_total: u64,
+}
+
+/// A gap this many times the rolling median cadence counts as a stutter
+/// (a single missed beat at any frame rate).
+const STUTTER_FACTOR: u32 = 2;
+/// Gaps below this never count as stutters (high-fps noise floor).
+const STUTTER_MIN_US: u32 = 40_000;
+/// A gap this long is a freeze regardless of cadence.
+const FREEZE_US: u32 = 250_000;
+
+impl PresentStats {
+    pub fn on_presented(&mut self, latency_us: Option<u32>, now_us: u64) {
+        self.presented += 1;
+        if let Some(l) = latency_us {
+            push_capped(&mut self.latencies_us, l);
+        }
+        if let Some(prev) = self.last_present_us {
+            let gap = now_us.saturating_sub(prev).min(u64::from(u32::MAX)) as u32;
+            let median = {
+                let v: Vec<u32> = self.frametimes_us.iter().copied().collect();
+                percentile(&v, 50)
+            };
+            if gap >= FREEZE_US {
+                self.freezes += 1;
+                self.freeze_us_total += u64::from(gap);
+            } else if let Some(m) = median
+                && gap > m.saturating_mul(STUTTER_FACTOR)
+                && gap > STUTTER_MIN_US
+            {
+                self.stutters += 1;
+            }
+            push_capped(&mut self.frametimes_us, gap);
+        }
+        self.last_present_us = Some(now_us);
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> PresentSummary {
+        let gaps: Vec<u32> = self.frametimes_us.iter().copied().collect();
+        let sum: u64 = gaps.iter().map(|&g| u64::from(g)).sum();
+        let fps_x100 = if sum > 0 {
+            (gaps.len() as u64 * 100_000_000 / sum) as u32
+        } else {
+            0
+        };
+        // "1% low": the fps equivalent of the worst 1% of frame gaps.
+        let low1_fps_x100 = percentile(&gaps, 99)
+            .filter(|&p| p > 0)
+            .map_or(0, |p| (100_000_000u64 / u64::from(p)) as u32);
+        let lat: Vec<u32> = self.latencies_us.iter().copied().collect();
+        PresentSummary {
+            presented: self.presented,
+            fps_x100,
+            low1_fps_x100,
+            latency_p50_us: percentile(&lat, 50).unwrap_or(0),
+            latency_p95_us: percentile(&lat, 95).unwrap_or(0),
+            latency_p99_us: percentile(&lat, 99).unwrap_or(0),
+            stutters: self.stutters,
+            freezes: self.freezes,
+            freeze_ms_total: (self.freeze_us_total / 1000) as u32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PresentSummary {
+    pub presented: u64,
+    /// Average presented fps × 100 over the rolling window.
+    pub fps_x100: u32,
+    /// fps equivalent of the worst 1% of frame gaps, × 100.
+    pub low1_fps_x100: u32,
+    /// Capture→present latency percentiles (µs); 0 when unmeasured.
+    pub latency_p50_us: u32,
+    pub latency_p95_us: u32,
+    pub latency_p99_us: u32,
+    pub stutters: u64,
+    pub freezes: u64,
+    pub freeze_ms_total: u32,
+}
+
 /// The last `n` samples (all of them if fewer), oldest-first.
 fn tail(buf: &VecDeque<u32>, n: usize) -> Vec<u32> {
     buf.iter()
@@ -188,6 +282,47 @@ fn percentile(samples: &[u32], p: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn present_stats_track_cadence_and_breaks() {
+        let mut p = PresentStats::default();
+        let mut now = 0u64;
+        // Steady 60 fps for a window, then one stutter and one freeze.
+        for _ in 0..100 {
+            now += 16_667;
+            p.on_presented(Some(20_000), now);
+        }
+        now += 50_000; // ~3 missed beats
+        p.on_presented(Some(20_000), now);
+        now += 300_000; // freeze
+        p.on_presented(Some(20_000), now);
+        let s = p.summary();
+        assert_eq!(s.stutters, 1);
+        assert_eq!(s.freezes, 1);
+        assert!(s.freeze_ms_total >= 300);
+        // Average fps stays near 60 (window dominated by clean cadence).
+        assert!((5_000..6_500).contains(&s.fps_x100), "fps {}", s.fps_x100);
+        // 1% low reflects the worst gaps.
+        assert!(s.low1_fps_x100 < s.fps_x100);
+        assert_eq!(s.latency_p50_us, 20_000);
+    }
+
+    #[test]
+    fn present_stats_low1_matches_worst_gap_tail() {
+        let mut p = PresentStats::default();
+        let mut now = 0u64;
+        for i in 0..200 {
+            now += if i % 50 == 49 { 100_000 } else { 16_667 };
+            p.on_presented(None, now);
+        }
+        let s = p.summary();
+        // The worst-gap tail is the 100 ms hitches -> ~10 fps equivalent.
+        assert!(
+            (900..1_100).contains(&s.low1_fps_x100),
+            "low1 {}",
+            s.low1_fps_x100
+        );
+    }
 
     #[test]
     fn clock_sync_prefers_lowest_rtt() {

@@ -7,7 +7,7 @@
 mod audio;
 mod decode;
 mod reassembly;
-mod stats;
+pub mod stats;
 
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
@@ -92,6 +92,8 @@ pub async fn pair(
 pub struct FrameOutput {
     pub frame: DecodedFrame,
     pub frame_id: u32,
+    /// Agent-clock capture stamp (µs, wrapping) — echo to `frame_presented`.
+    pub capture_ts_us: u32,
     /// Estimated glass-to-glass-so-far: agent capture → decoded on client.
     pub latency_us: Option<u32>,
     pub decode_us: u32,
@@ -160,6 +162,23 @@ impl InputSender {
     }
 }
 
+/// Fire-and-forget presentation reporter, decoupled from the frame-receive
+/// loop: the embedder calls [`PresentedSink::presented`] from its display
+/// path each time a frame is handed to the screen; the client folds the
+/// samples into its health stats at report time.
+#[derive(Debug, Clone)]
+pub struct PresentedSink {
+    tx: tokio::sync::mpsc::UnboundedSender<(u32, std::time::Instant)>,
+}
+
+impl PresentedSink {
+    /// `capture_ts_us` is the frame's agent-clock capture stamp, echoed from
+    /// the video callback. Timestamped here so queueing costs nothing.
+    pub fn presented(&self, capture_ts_us: u32) {
+        let _ = self.tx.send((capture_ts_us, std::time::Instant::now()));
+    }
+}
+
 pub struct Client {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
@@ -173,6 +192,9 @@ pub struct Client {
     clock_sync: ClockSync,
     reassembler: Reassembler,
     stats: LatencyStats,
+    present: stats::PresentStats,
+    presented_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, std::time::Instant)>,
+    presented_tx: tokio::sync::mpsc::UnboundedSender<(u32, std::time::Instant)>,
     session: Option<SessionParams>,
     /// Frame id of the last frame handed to the decoder (gap detection).
     last_frame_id: Option<u32>,
@@ -252,6 +274,7 @@ impl Client {
         }
 
         let clock = MediaClock::new();
+        let presented_channel = tokio::sync::mpsc::unbounded_channel();
         let mut client = Self {
             endpoint,
             conn,
@@ -262,6 +285,9 @@ impl Client {
             clock_sync: ClockSync::default(),
             reassembler: Reassembler::new(),
             stats: LatencyStats::default(),
+            present: stats::PresentStats::default(),
+            presented_rx: presented_channel.1,
+            presented_tx: presented_channel.0,
             session: None,
             last_frame_id: None,
             last_keyframe_request_us: 0,
@@ -555,6 +581,7 @@ impl Client {
                     return Ok(Some(FrameOutput {
                         frame,
                         frame_id: header.frame_id,
+                        capture_ts_us: header.capture_ts_us,
                         latency_us,
                         decode_us,
                     }));
@@ -604,9 +631,14 @@ impl Client {
         if now.saturating_sub(self.last_stats_report_us) < INTERVAL_US {
             return;
         }
-        let Some(tx) = &self.control_tx else { return };
+        if self.control_tx.is_none() {
+            return;
+        }
         self.last_stats_report_us = now;
+        self.drain_presented();
+        let p = self.present.summary();
         let s = self.stats.summary(self.reassembler.frames_dropped());
+        let Some(tx) = &self.control_tx else { return };
         let _ = tx.send(C2A::StatsReport(gsa_protocol::control::ClientStats {
             frames_received: s.frames_complete,
             frames_complete: s.frames_complete,
@@ -614,6 +646,15 @@ impl Client {
             frames_decoded: s.frames_decoded,
             decode_us_p50: s.decode_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32),
             jitter_us: 0,
+            frames_presented: p.presented,
+            present_fps_x100: p.fps_x100,
+            low1_fps_x100: p.low1_fps_x100,
+            latency_p50_us: p.latency_p50_us,
+            latency_p95_us: p.latency_p95_us,
+            latency_p99_us: p.latency_p99_us,
+            stutters: p.stutters as u32,
+            freezes: p.freezes as u32,
+            freeze_ms_total: p.freeze_ms_total,
         }));
     }
 
@@ -672,9 +713,45 @@ impl Client {
         }
     }
 
+    /// Handle for the embedder's display path to report presented frames.
+    #[must_use]
+    pub fn presented_sink(&self) -> PresentedSink {
+        PresentedSink {
+            tx: self.presented_tx.clone(),
+        }
+    }
+
+    /// Direct form of [`PresentedSink::presented`] for harnesses that own
+    /// the client.
+    pub fn frame_presented(&mut self, capture_ts_us: u32) {
+        let now = self.clock.now_us();
+        let latency = self.clock_sync.frame_latency_us(now, capture_ts_us);
+        self.present.on_presented(latency, now);
+    }
+
+    /// Fold queued presentation reports (stamped on the display thread) into
+    /// the health stats.
+    fn drain_presented(&mut self) {
+        while let Ok((capture_ts, at)) = self.presented_rx.try_recv() {
+            let now = self
+                .clock
+                .now_us()
+                .saturating_sub(at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+            let latency = self.clock_sync.frame_latency_us(now, capture_ts);
+            self.present.on_presented(latency, now);
+        }
+    }
+
     #[must_use]
     pub fn stats(&self) -> StatsSummary {
         self.stats.summary(self.reassembler.frames_dropped())
+    }
+
+    /// Presentation-side health summary (fed by [`PresentedSink`]).
+    #[must_use]
+    pub fn present_stats(&mut self) -> stats::PresentSummary {
+        self.drain_presented();
+        self.present.summary()
     }
 
     /// Graceful shutdown: close the connection and flush the endpoint.

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use gsa_client_core::{
     Client, ControlEvent, DecodedFrame, GamepadInput, InputEvent, InputSender, PixelOrder,
-    ServerAuth, SourceKind, VideoDecoder,
+    PresentedSink, ServerAuth, SourceKind, VideoDecoder,
 };
 use gsa_core::id::SourceId;
 use gsa_core::media::{Codec, H264Profile};
@@ -205,6 +205,8 @@ pub struct GsaSession {
     /// Sync input sink (input events → reliable control stream). Present once
     /// the session is streaming; `None` if input couldn't be enabled.
     input: Option<InputSender>,
+    /// Presentation reporter for [`gsa_frame_presented`].
+    presented: PresentedSink,
     /// The negotiated codec (a `GSA_CODEC_*` flag), for `gsa_session_codec`.
     codec: u32,
 }
@@ -215,6 +217,7 @@ enum SessionReady {
     Failed,
     Streaming {
         input: Option<InputSender>,
+        presented: PresentedSink,
         codec: u32,
     },
 }
@@ -299,10 +302,15 @@ pub unsafe extern "C" fn gsa_session_start(
     });
 
     match ready_rx.recv() {
-        Ok(SessionReady::Streaming { input, codec }) => Box::into_raw(Box::new(GsaSession {
+        Ok(SessionReady::Streaming {
+            input,
+            presented,
+            codec,
+        }) => Box::into_raw(Box::new(GsaSession {
             stop,
             thread: Some(thread),
             input,
+            presented,
             codec,
         })),
         _ => {
@@ -359,6 +367,21 @@ pub unsafe extern "C" fn gsa_set_bitrate(session: *const GsaSession, bitrate_bps
     if let Some(input) = &unsafe { &*session }.input {
         input.set_bitrate(bitrate_bps);
     }
+}
+
+/// Report a frame handed to the display. `capture_ts_us` is the frame's
+/// capture stamp from the video callback; call from the presentation path
+/// (cheap, lock-free). Feeds presented-fps/stutter/latency health stats.
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`] (not yet stopped).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_frame_presented(session: *const GsaSession, capture_ts_us: u32) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract guarantees a live handle.
+    unsafe { &*session }.presented.presented(capture_ts_us);
 }
 
 /// The protocol's bitrate ceiling (bps) — the top of every bitrate control.
@@ -632,10 +655,15 @@ async fn session_loop(
     // Hand the sync input sink back with the ready signal; it also routes the
     // recv loop's keyframe requests through its background writer task.
     let input = client.take_input_sender();
+    let presented = client.presented_sink();
     let codec = client
         .negotiated_codec()
         .map_or(GSA_CODEC_H264, codec_to_flag);
-    let _ = ready_tx.send(SessionReady::Streaming { input, codec });
+    let _ = ready_tx.send(SessionReady::Streaming {
+        input,
+        presented,
+        codec,
+    });
 
     // Audio drains on its own thread: PCM must flow steadily even while the
     // receive loop is parked awaiting the next video frame. The channel closes

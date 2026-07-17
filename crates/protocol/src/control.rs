@@ -191,6 +191,19 @@ pub struct ClientStats {
     pub frames_decoded: u64,
     pub decode_us_p50: u32,
     pub jitter_us: u32,
+    /// Frames handed to the display, as reported by the embedder.
+    pub frames_presented: u64,
+    /// Presented fps ×100, average / worst-1%-of-gaps over a rolling window.
+    pub present_fps_x100: u32,
+    pub low1_fps_x100: u32,
+    /// Capture→present latency percentiles (µs); 0 when unmeasured.
+    pub latency_p50_us: u32,
+    pub latency_p95_us: u32,
+    pub latency_p99_us: u32,
+    /// Cadence breaks: gaps well past the rolling median / hard freezes.
+    pub stutters: u32,
+    pub freezes: u32,
+    pub freeze_ms_total: u32,
 }
 
 #[cfg(test)]
