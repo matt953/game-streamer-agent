@@ -6,6 +6,7 @@
 
 pub mod control;
 pub mod datagram;
+pub mod fec;
 pub mod grant;
 pub mod input;
 pub mod pairing;
