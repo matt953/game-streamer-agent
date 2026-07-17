@@ -8,8 +8,24 @@
 
 use std::collections::HashMap;
 
+use gsa_core::media::FrameKind;
 use gsa_protocol::datagram::{VideoDatagramHeader, total_shards};
 use gsa_protocol::fec;
+
+/// A frame ready for the decoder, released in id order.
+#[derive(Debug)]
+pub struct CompletedFrame {
+    pub frame_id: u32,
+    pub kind: FrameKind,
+    pub capture_ts_us: u32,
+    pub data: Vec<u8>,
+}
+
+/// Completed frames wait for at most this many newer completions while an
+/// older frame's recovery shards are still in flight. A P-frame is
+/// undecodable without its predecessor, so delivering it early buys nothing
+/// and forfeits the older frame's recovery.
+const HOLD_LIMIT: usize = 2;
 
 /// How many in-flight frame ids we track before pruning the oldest.
 /// Loopback/LAN never sees more than 2-3 concurrent; the window guards
@@ -66,12 +82,21 @@ impl Pending {
 #[derive(Debug, Default)]
 pub struct Reassembler {
     pending: HashMap<u32, Pending>,
+    /// Completed frames not yet released (oldest-first): held while an older
+    /// pending frame can still recover.
+    held: Vec<CompletedFrame>,
     /// Frames discarded incomplete (stats / future NACK trigger).
     dropped: u64,
     /// Frames completed only thanks to parity reconstruction (stats).
     recovered: u64,
-    /// Highest frame id completed (drop-older policy).
-    latest_completed: Option<u32>,
+    /// Highest frame id delivered (drop-older policy).
+    latest_delivered: Option<u32>,
+}
+
+/// Wrap-aware "a is older than b".
+fn older(a: u32, b: u32) -> bool {
+    let age = b.wrapping_sub(a);
+    age > 0 && age < u32::MAX / 2
 }
 
 impl Reassembler {
@@ -82,15 +107,19 @@ impl Reassembler {
 
     /// Insert one shard; returns the full frame bytes when the frame
     /// completes — directly, or via parity reconstruction.
-    pub fn push(&mut self, header: VideoDatagramHeader, payload: &[u8]) -> Option<Vec<u8>> {
+    pub fn push(&mut self, header: VideoDatagramHeader, payload: &[u8]) -> Vec<CompletedFrame> {
         // Shards at or older than the last delivered frame are stale: drop.
         // `age == 0` matters — every frame carries parity, so shards routinely
-        // trail their frame's completion and must not re-open it.
-        if let Some(latest) = self.latest_completed {
+        // trail their frame's completion and must not re-open it. Held frames
+        // are complete too: their trailing shards are equally stale.
+        if let Some(latest) = self.latest_delivered {
             let age = latest.wrapping_sub(header.frame_id);
             if age < u32::MAX / 2 {
-                return None;
+                return Vec::new();
             }
+        }
+        if self.held.iter().any(|h| h.frame_id == header.frame_id) {
+            return Vec::new();
         }
 
         let entry = self
@@ -117,31 +146,63 @@ impl Reassembler {
             if self.pending.len() > MAX_PENDING {
                 self.prune_oldest();
             }
-            return None;
+            return self.drain();
         }
 
         let done = self
             .pending
             .remove(&header.frame_id)
             .expect("just inserted");
-        let frame = if complete_direct {
-            assemble_data(&done)
+        let data = if complete_direct {
+            Some(assemble_data(&done))
         } else {
             match reconstruct(done) {
                 Some(f) => {
                     self.recovered += 1;
-                    f
+                    Some(f)
                 }
                 None => {
                     // Malformed shard geometry (attacker or bug): count and drop.
                     self.dropped += 1;
-                    return None;
+                    None
                 }
             }
         };
-        self.latest_completed = Some(header.frame_id);
-        self.prune_older_than(header.frame_id);
-        Some(frame)
+        if let Some(data) = data {
+            let frame = CompletedFrame {
+                frame_id: header.frame_id,
+                kind: header.kind,
+                capture_ts_us: header.capture_ts_us,
+                data,
+            };
+            let at = self
+                .held
+                .iter()
+                .position(|h| older(frame.frame_id, h.frame_id))
+                .unwrap_or(self.held.len());
+            self.held.insert(at, frame);
+        }
+        self.drain()
+    }
+
+    /// Release held frames in order. A frame waits while an older pending
+    /// frame can still recover; it goes out once nothing older is pending,
+    /// it is an IDR (the reference chain resets anyway), or the hold limit
+    /// is reached (the recovery window has passed — give up on the blocker).
+    fn drain(&mut self) -> Vec<CompletedFrame> {
+        let mut out = Vec::new();
+        while let Some(head) = self.held.first() {
+            let blocked = self.pending.keys().any(|&id| older(id, head.frame_id));
+            let force = head.kind == FrameKind::Idr || self.held.len() > HOLD_LIMIT;
+            if blocked && !force {
+                break;
+            }
+            let frame = self.held.remove(0);
+            self.latest_delivered = Some(frame.frame_id);
+            self.prune_older_than(frame.frame_id);
+            out.push(frame);
+        }
+        out
     }
 
     #[must_use]
@@ -267,6 +328,11 @@ fn reconstruct(done: Pending) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Expectation helper: the data payloads of released frames.
+    fn datas(v: Vec<CompletedFrame>) -> Vec<Vec<u8>> {
+        v.into_iter().map(|f| f.data).collect()
+    }
     use gsa_core::media::FrameKind;
     use gsa_protocol::datagram::chunk_video_frame;
 
@@ -287,33 +353,40 @@ mod tests {
     #[test]
     fn single_chunk_completes_immediately() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(hdr(1, 0, 1), b"abc"), Some(b"abc".to_vec()));
+        assert_eq!(datas(r.push(hdr(1, 0, 1), b"abc")), vec![b"abc".to_vec()]);
     }
 
     #[test]
     fn multi_chunk_out_of_order() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(hdr(2, 1, 3), b"BB"), None);
-        assert_eq!(r.push(hdr(2, 0, 3), b"AA"), None);
-        assert_eq!(r.push(hdr(2, 2, 3), b"CC"), Some(b"AABBCC".to_vec()));
+        assert_eq!(datas(r.push(hdr(2, 1, 3), b"BB")), Vec::<Vec<u8>>::new());
+        assert_eq!(datas(r.push(hdr(2, 0, 3), b"AA")), Vec::<Vec<u8>>::new());
+        assert_eq!(datas(r.push(hdr(2, 2, 3), b"CC")), vec![b"AABBCC".to_vec()]);
     }
 
     #[test]
     fn duplicate_chunks_ignored() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(hdr(3, 0, 2), b"xx"), None);
-        assert_eq!(r.push(hdr(3, 0, 2), b"xx"), None);
-        assert_eq!(r.push(hdr(3, 1, 2), b"yy"), Some(b"xxyy".to_vec()));
+        assert_eq!(datas(r.push(hdr(3, 0, 2), b"xx")), Vec::<Vec<u8>>::new());
+        assert_eq!(datas(r.push(hdr(3, 0, 2), b"xx")), Vec::<Vec<u8>>::new());
+        assert_eq!(datas(r.push(hdr(3, 1, 2), b"yy")), vec![b"xxyy".to_vec()]);
     }
 
     #[test]
     fn stale_frames_dropped_after_newer_completes() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(hdr(5, 0, 2), b"old"), None); // incomplete
-        assert_eq!(r.push(hdr(6, 0, 1), b"new"), Some(b"new".to_vec()));
+        assert_eq!(datas(r.push(hdr(5, 0, 2), b"old")), Vec::<Vec<u8>>::new()); // incomplete
+        // Newer completions hold briefly (frame 5 could still recover)...
+        assert_eq!(datas(r.push(hdr(6, 0, 1), b"a")), Vec::<Vec<u8>>::new());
+        assert_eq!(datas(r.push(hdr(7, 0, 1), b"b")), Vec::<Vec<u8>>::new());
+        // ...until the hold limit passes: everything releases, 5 is dropped.
+        assert_eq!(
+            datas(r.push(hdr(8, 0, 1), b"c")),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
         assert_eq!(r.frames_dropped(), 1);
         // Late chunk of the stale frame is ignored.
-        assert_eq!(r.push(hdr(5, 1, 2), b"old"), None);
+        assert_eq!(datas(r.push(hdr(5, 1, 2), b"old")), Vec::<Vec<u8>>::new());
     }
 
     #[test]
@@ -349,8 +422,8 @@ mod tests {
                 continue; // lose three data shards, incl. the short last one
             }
             let (h, payload) = VideoDatagramHeader::parse(d).unwrap();
-            if let Some(f) = r.push(h, payload) {
-                out = Some(f);
+            if let Some(f) = r.push(h, payload).pop() {
+                out = Some(f.data);
             }
         }
         assert_eq!(out, Some(frame));
@@ -384,8 +457,8 @@ mod tests {
                 continue;
             }
             let (h, payload) = VideoDatagramHeader::parse(d).unwrap();
-            if let Some(f) = r.push(h, payload) {
-                out = Some(f);
+            if let Some(f) = r.push(h, payload).pop() {
+                out = Some(f.data);
             }
         }
         assert_eq!(out, Some(frame));
@@ -411,10 +484,20 @@ mod tests {
                 continue;
             }
             let (h, payload) = VideoDatagramHeader::parse(d).unwrap();
-            assert_eq!(r.push(h, payload), None, "shard {i} must not complete");
+            assert_eq!(
+                datas(r.push(h, payload)),
+                Vec::<Vec<u8>>::new(),
+                "shard {i} must not complete"
+            );
         }
-        // A newer frame completes and prunes the dead one.
-        assert_eq!(r.push(hdr(21, 0, 1), b"next"), Some(b"next".to_vec()));
+        // Newer frames complete; once the hold window passes, the dead frame
+        // is pruned and the queue releases.
+        assert_eq!(datas(r.push(hdr(21, 0, 1), b"next")), Vec::<Vec<u8>>::new());
+        assert_eq!(datas(r.push(hdr(22, 0, 1), b"more")), Vec::<Vec<u8>>::new());
+        assert_eq!(
+            datas(r.push(hdr(23, 0, 1), b"go")),
+            vec![b"next".to_vec(), b"more".to_vec(), b"go".to_vec()]
+        );
         assert_eq!(r.frames_dropped(), 1);
     }
 
@@ -470,7 +553,51 @@ mod tests {
                 continue;
             }
             let (h, payload) = VideoDatagramHeader::parse(d).unwrap();
-            assert_eq!(r.push(h, payload), None);
+            assert_eq!(datas(r.push(h, payload)), Vec::<Vec<u8>>::new());
         }
+    }
+    #[test]
+    fn late_parity_survives_a_newer_frame_completing() {
+        // Frame 10: 5 data + 1 parity, one data shard lost, parity delayed.
+        let frame: Vec<u8> = (0..5_000).map(|i| (i * 7 % 251) as u8).collect();
+        let dgs = chunk_video_frame(
+            hdr(10, 0, 0),
+            &frame,
+            1000 + gsa_protocol::datagram::VIDEO_HEADER_LEN,
+            200,
+        )
+        .unwrap();
+        let mut r = Reassembler::new();
+        // Deliver frame 10's data minus shard 2, no parity yet.
+        for (i, d) in dgs.iter().enumerate() {
+            if i == 2 || i == 5 {
+                continue; // shard 2 lost; parity (index 5) still in flight
+            }
+            let (h, p) = VideoDatagramHeader::parse(d).unwrap();
+            assert_eq!(datas(r.push(h, p)), Vec::<Vec<u8>>::new());
+        }
+        // Frame 11 completes fully in the meantime.
+        let f11: Vec<u8> = vec![9; 800];
+        for d in chunk_video_frame(
+            hdr(11, 0, 0),
+            &f11,
+            1000 + gsa_protocol::datagram::VIDEO_HEADER_LEN,
+            200,
+        )
+        .unwrap()
+        .iter()
+        {
+            let (h, p) = VideoDatagramHeader::parse(d).unwrap();
+            let _ = r.push(h, p);
+        }
+        // Frame 10's parity finally arrives: 10 recovers and 11 releases
+        // right behind it, in order.
+        let (h, p) = VideoDatagramHeader::parse(&dgs[5]).unwrap();
+        let out = r.push(h, p);
+        assert_eq!(out.len(), 2, "recovered frame and its held successor");
+        assert_eq!(out[0].frame_id, 10);
+        assert_eq!(out[0].data, frame, "late parity must still recover");
+        assert_eq!(out[1].frame_id, 11);
+        assert_eq!(r.frames_recovered(), 1);
     }
 }

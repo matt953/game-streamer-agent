@@ -191,6 +191,9 @@ pub struct Client {
     clock: MediaClock,
     clock_sync: ClockSync,
     reassembler: Reassembler,
+    /// Frames released by the reassembler, awaiting the gate (drained one
+    /// per `next_gated_frame` call).
+    completed: std::collections::VecDeque<reassembly::CompletedFrame>,
     stats: LatencyStats,
     present: stats::PresentStats,
     presented_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, std::time::Instant)>,
@@ -284,6 +287,7 @@ impl Client {
             clock,
             clock_sync: ClockSync::default(),
             reassembler: Reassembler::new(),
+            completed: std::collections::VecDeque::new(),
             stats: LatencyStats::default(),
             present: stats::PresentStats::default(),
             presented_rx: presented_channel.1,
@@ -476,6 +480,12 @@ impl Client {
     /// (decode path) and `recv_encoded` (embedder passthrough path).
     async fn next_gated_frame(&mut self) -> Result<Option<(VideoDatagramHeader, Vec<u8>)>> {
         loop {
+            if let Some(f) = self.completed.pop_front() {
+                if let Some(out) = self.gate(f).await? {
+                    return Ok(Some(out));
+                }
+                continue;
+            }
             let datagram = match self.conn.read_datagram().await {
                 Ok(d) => d,
                 Err(quinn::ConnectionError::ApplicationClosed(_))
@@ -514,50 +524,61 @@ impl Client {
                     continue;
                 }
             };
-            let Some(frame_data) = self.reassembler.push(header, payload) else {
-                continue;
-            };
-            self.stats
-                .on_frame_complete(frame_data.len(), self.clock.now_us());
-
-            // Loss recovery (spec 04): on a reference-chain break (lost frame),
-            // hold the last good frame and skip P-frames until a keyframe
-            // resyncs — decoding a P-frame against a stale reference corrupts
-            // output. Request the keyframe immediately.
-            let is_idr = header.kind == gsa_core::media::FrameKind::Idr;
-            if is_idr {
-                self.awaiting_idr = false;
-            }
-            if let Some(last) = self.last_frame_id {
-                let delta = header.frame_id.wrapping_sub(last);
-                if delta == 0 || delta > u32::MAX / 2 {
-                    // Reassembler drops stale frames, so this should be
-                    // unreachable; if it fires, ordering is broken upstream.
-                    tracing::warn!(last, got = header.frame_id, "OUT-OF-ORDER frame gated");
-                } else if delta != 1 && !is_idr && !self.awaiting_idr {
-                    tracing::debug!(
-                        gap_after = last,
-                        got = header.frame_id,
-                        "frame gap; freezing"
-                    );
-                    self.awaiting_idr = true;
-                    self.request_keyframe_throttled().await?;
-                }
-            }
-
-            // Frozen: skip P-frames (a broken reference is the corruption).
-            // Advance the id so we don't re-flag the gap; keep asking for a key.
-            if self.awaiting_idr && !is_idr {
-                self.last_frame_id = Some(header.frame_id);
-                self.request_keyframe_throttled().await?;
-                continue;
-            }
-
-            // The frame is consumed regardless of what the caller does with it;
-            // advance so the next frame isn't misread as another gap.
-            self.last_frame_id = Some(header.frame_id);
-            return Ok(Some((header, frame_data)));
+            self.completed
+                .extend(self.reassembler.push(header, payload));
         }
+    }
+
+    /// Reference-chain gate for one released frame (spec 04): on a break
+    /// (lost frame), hold the last good picture and skip P-frames until a
+    /// keyframe resyncs — decoding a P-frame against a stale reference
+    /// corrupts output. Requests the keyframe immediately.
+    async fn gate(
+        &mut self,
+        f: reassembly::CompletedFrame,
+    ) -> Result<Option<(VideoDatagramHeader, Vec<u8>)>> {
+        self.stats
+            .on_frame_complete(f.data.len(), self.clock.now_us());
+        let is_idr = f.kind == gsa_core::media::FrameKind::Idr;
+        if is_idr {
+            self.awaiting_idr = false;
+        }
+        if let Some(last) = self.last_frame_id {
+            let delta = f.frame_id.wrapping_sub(last);
+            if delta == 0 || delta > u32::MAX / 2 {
+                // Reassembler releases in order, so this should be
+                // unreachable; if it fires, ordering is broken upstream.
+                tracing::warn!(last, got = f.frame_id, "OUT-OF-ORDER frame gated");
+            } else if delta != 1 && !is_idr && !self.awaiting_idr {
+                tracing::debug!(gap_after = last, got = f.frame_id, "frame gap; freezing");
+                self.awaiting_idr = true;
+                self.request_keyframe_throttled().await?;
+            }
+        }
+
+        // Frozen: skip P-frames (a broken reference is the corruption).
+        // Advance the id so we don't re-flag the gap; keep asking for a key.
+        if self.awaiting_idr && !is_idr {
+            self.last_frame_id = Some(f.frame_id);
+            self.request_keyframe_throttled().await?;
+            return Ok(None);
+        }
+
+        // The frame is consumed regardless of what the caller does with it;
+        // advance so the next frame isn't misread as another gap.
+        self.last_frame_id = Some(f.frame_id);
+        let header = VideoDatagramHeader {
+            seq: 0,
+            session_epoch: 0,
+            frame_id: f.frame_id,
+            kind: f.kind,
+            chunk_index: 0,
+            chunk_count: 1,
+            parity_count: 0,
+            frame_len: 0,
+            capture_ts_us: f.capture_ts_us,
+        };
+        Ok(Some((header, f.data)))
     }
 
     /// Receive datagrams until the next complete frame decodes.
