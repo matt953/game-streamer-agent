@@ -1,7 +1,8 @@
 //! Dev log collector: listens for the log streams the agent (`GSA_LOG_SINK`)
 //! and debug-build clients (auto-discovered via `SessionParams.log_sink`)
 //! push, prefixing each line with its stream label on stdout and teeing to
-//! per-stream files under `target/devlogs/`.
+//! per-stream files under `devlogs/` (repo root — deliberately outside
+//! `target/` so `cargo clean` cannot destroy session evidence).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -13,7 +14,7 @@ use anyhow::{Context, Result};
 static CONN_SEQ: AtomicU32 = AtomicU32::new(0);
 
 pub fn logs(listen: &str) -> Result<()> {
-    let dir = PathBuf::from("target/devlogs");
+    let dir = PathBuf::from("devlogs");
     std::fs::create_dir_all(&dir)?;
     let listener = TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;
     println!(
