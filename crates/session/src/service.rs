@@ -19,6 +19,12 @@ use gsa_transport::{recv_msg, send_msg};
 use crate::pipeline;
 use crate::state::{AgentState, SessionEntry};
 
+/// Adaptive FEC bounds: parity never exceeds a quarter of the data rate.
+const FEC_CAP_PERMILLE: u32 = 250;
+fn gsa_session_fec_floor() -> u32 {
+    crate::pipeline::FEC_FLOOR_PERMILLE
+}
+
 /// Where ABR opens the encoder when the ceiling is higher — below the ceiling so
 /// the encoder fills the target and the delivered-rate estimate can engage.
 const ABR_START_BPS: u32 = 8_000_000; // 8 Mbps
@@ -121,6 +127,7 @@ async fn serve_inner(
     let mut session_ceiling: u32 = BITRATE_MAX_BPS;
     let mut last_estimate_bps: u32 = 0;
     let mut abr_enabled = false;
+    let mut fec_permille: u32 = crate::pipeline::FEC_FLOOR_PERMILLE;
     let mut helloed = false;
     // Client's max decodable H.264 profile (from Hello), negotiated at session start.
     let mut client_h264_profile = gsa_core::media::H264Profile::ConstrainedBaseline;
@@ -198,9 +205,22 @@ async fn serve_inner(
                     if let Some(est) = d.estimate_bps() {
                         last_estimate_bps = est.min(u64::from(u32::MAX)) as u32;
                     }
+                    // Adaptive FEC: parity tracks observed datagram loss
+                    // (4x headroom over the instantaneous rate), decays
+                    // slowly after bursts, and never drops below the floor
+                    // that covers reaction latency.
+                    let loss_permille = (loss * 1000.0) as u32;
+                    fec_permille = (fec_permille * 9 / 10)
+                        .max(loss_permille.saturating_mul(4))
+                        .clamp(gsa_session_fec_floor(), FEC_CAP_PERMILLE);
+                    a.pipeline.set_fec_permille(fec_permille);
                     if abr_enabled && last_estimate_bps > 0 {
-                        // 90% of measured: headroom for audio and overhead.
-                        let target = (u64::from(last_estimate_bps) * 90 / 100) as u32;
+                        // 90% of measured, minus what parity will add on the
+                        // wire: encoder + FEC together fit the estimate.
+                        let target = (u64::from(last_estimate_bps) * 90 / 100
+                            * 1000
+                            / (1000 + u64::from(fec_permille)))
+                            as u32;
                         a.pipeline
                             .set_bitrate(target.clamp(BITRATE_MIN_BPS, session_ceiling));
                     }

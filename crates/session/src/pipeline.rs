@@ -14,6 +14,10 @@ use gsa_core::{Error, Result};
 use gsa_encode_api::{EncodeConfig, Encoder, FrameDirectives};
 use gsa_protocol::datagram::{VideoDatagramHeader, chunk_video_frame};
 
+/// Always-on FEC parity floor (permille of data shards): covers the
+/// reaction latency between a loss burst and the adaptive ratio catching up.
+pub const FEC_FLOOR_PERMILLE: u32 = 30;
+
 /// Fallback when quinn hasn't discovered the path MTU yet.
 const DEFAULT_MAX_DATAGRAM: usize = 1200;
 
@@ -160,6 +164,9 @@ pub struct PipelineHandle {
     emitted_bitrate: Arc<AtomicU32>,
     /// Producer half of the capture ring, kept for its counters.
     sink: gsa_capture_api::FrameSink,
+    /// Live FEC parity ratio (permille of data shards), driven by the
+    /// session layer from observed loss.
+    fec_permille: Arc<AtomicU32>,
 }
 
 impl PipelineHandle {
@@ -192,6 +199,11 @@ impl PipelineHandle {
 
     /// The rolling emitted (actual encoder output) bitrate (bps), 0 until enough
     /// frames have been sent to measure it.
+    /// Set the FEC parity ratio (permille) for subsequent frames.
+    pub fn set_fec_permille(&self, permille: u32) {
+        self.fec_permille.store(permille, Ordering::Relaxed);
+    }
+
     /// Frames the capture source has offered so far (≈ content render rate).
     pub fn frames_offered(&self) -> u64 {
         self.sink.offered()
@@ -231,6 +243,8 @@ pub fn start(
 ) -> Result<PipelineHandle> {
     let (sink, rx) = frame_channel();
     let sink_counters = sink.clone();
+    let fec_permille = Arc::new(AtomicU32::new(FEC_FLOOR_PERMILLE));
+    let fec_send = fec_permille.clone();
     encoder.open(EncodeConfig {
         codec,
         mode,
@@ -382,9 +396,12 @@ pub fn start(
                 kind: chunk.kind,
                 chunk_index: 0,
                 chunk_count: 1,
+                parity_count: 0,
+                frame_len: 0,
                 capture_ts_us: wire_ts(chunk.capture_ts_us),
             };
-            let datagrams = match chunk_video_frame(header, &chunk.data, max) {
+            let fec = fec_send.load(Ordering::Relaxed);
+            let datagrams = match chunk_video_frame(header, &chunk.data, max, fec) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::error!(error = %e, "packetize failed");
@@ -512,6 +529,7 @@ pub fn start(
         probe_tx,
         emitted_bitrate,
         sink: sink_counters,
+        fec_permille,
     })
 }
 
