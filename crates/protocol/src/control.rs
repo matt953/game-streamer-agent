@@ -188,6 +188,8 @@ pub struct ClientStats {
     pub frames_received: u64,
     pub frames_complete: u64,
     pub frames_dropped_incomplete: u64,
+    /// Frames completed only thanks to FEC parity reconstruction.
+    pub frames_recovered: u32,
     pub frames_decoded: u64,
     pub decode_us_p50: u32,
     pub jitter_us: u32,

@@ -125,7 +125,7 @@ impl LatencyStats {
     }
 
     #[must_use]
-    pub fn summary(&self, frames_dropped: u64) -> StatsSummary {
+    pub fn summary(&self, frames_dropped: u64, frames_recovered: u64) -> StatsSummary {
         let latencies: Vec<u32> = self.latencies_us.iter().copied().collect();
         let decodes: Vec<u32> = self.decode_us.iter().copied().collect();
         let recent: Vec<u32> = tail(&self.latencies_us, RECENT);
@@ -133,6 +133,7 @@ impl LatencyStats {
             frames_complete: self.frames_complete,
             frames_decoded: self.frames_decoded,
             frames_dropped_incomplete: frames_dropped,
+            frames_recovered,
             latency_ms_p50: percentile(&latencies, 50).map(us_to_ms),
             latency_ms_p95: percentile(&latencies, 95).map(us_to_ms),
             latency_ms_p99: percentile(&latencies, 99).map(us_to_ms),
@@ -308,6 +309,9 @@ pub struct StatsSummary {
     pub frames_complete: u64,
     pub frames_decoded: u64,
     pub frames_dropped_incomplete: u64,
+    /// Frames completed only thanks to FEC parity reconstruction.
+    #[serde(default)]
+    pub frames_recovered: u64,
     pub latency_ms_p50: Option<f64>,
     pub latency_ms_p95: Option<f64>,
     pub latency_ms_p99: Option<f64>,
@@ -442,7 +446,7 @@ mod tests {
         for i in 0..20u64 {
             s.on_frame_complete(25_000, i * 50_000);
         }
-        let mbps = s.summary(0).recv_mbps.unwrap();
+        let mbps = s.summary(0, 0).recv_mbps.unwrap();
         assert!((3.6..=4.4).contains(&mbps), "recv_mbps {mbps}");
     }
 
@@ -454,7 +458,7 @@ mod tests {
         for i in 0..10u64 {
             s.on_frame_complete(25_000, i * 10_000);
         }
-        let mbps = s.summary(0).recv_mbps.unwrap();
+        let mbps = s.summary(0, 0).recv_mbps.unwrap();
         assert!(mbps < 5.0, "clustered arrivals inflated recv_mbps {mbps}");
     }
 
@@ -465,7 +469,7 @@ mod tests {
         s.on_frame_complete(25_000, 5_000_000); // 5 s later
         s.on_frame_complete(25_000, 5_010_000);
         // The 1 MB spike is >1 s old, so it doesn't inflate the rate.
-        let mbps = s.summary(0).recv_mbps.unwrap();
+        let mbps = s.summary(0, 0).recv_mbps.unwrap();
         assert!(mbps < 25.0, "stale sample leaked: {mbps}");
     }
 
@@ -478,7 +482,7 @@ mod tests {
         for _ in 0..RECENT {
             s.on_frame_decoded(Some(100_000), 1000); // 100 ms recent spike
         }
-        let sum = s.summary(0);
+        let sum = s.summary(0, 0);
         // Full window is still dominated by the 1000 fast frames.
         assert!(sum.latency_ms_p50.unwrap() < 20.0);
         // The short window sees only the spike.

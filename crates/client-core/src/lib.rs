@@ -637,12 +637,16 @@ impl Client {
         self.last_stats_report_us = now;
         self.drain_presented();
         let p = self.present.summary();
-        let s = self.stats.summary(self.reassembler.frames_dropped());
+        let s = self.stats.summary(
+            self.reassembler.frames_dropped(),
+            self.reassembler.frames_recovered(),
+        );
         let Some(tx) = &self.control_tx else { return };
         let _ = tx.send(C2A::StatsReport(gsa_protocol::control::ClientStats {
             frames_received: s.frames_complete,
             frames_complete: s.frames_complete,
             frames_dropped_incomplete: s.frames_dropped_incomplete,
+            frames_recovered: s.frames_recovered as u32,
             frames_decoded: s.frames_decoded,
             decode_us_p50: s.decode_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32),
             jitter_us: 0,
@@ -746,7 +750,10 @@ impl Client {
 
     #[must_use]
     pub fn stats(&self) -> StatsSummary {
-        self.stats.summary(self.reassembler.frames_dropped())
+        self.stats.summary(
+            self.reassembler.frames_dropped(),
+            self.reassembler.frames_recovered(),
+        )
     }
 
     /// Presentation-side health summary (fed by [`PresentedSink`]).
