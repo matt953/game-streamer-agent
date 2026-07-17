@@ -204,6 +204,10 @@ pub struct ClientStats {
     pub stutters: u32,
     pub freezes: u32,
     pub freeze_ms_total: u32,
+    /// Clustered cadence breaks (visible degradation events) and the
+    /// longest one's duration.
+    pub episodes: u32,
+    pub worst_episode_ms: u32,
 }
 
 #[cfg(test)]

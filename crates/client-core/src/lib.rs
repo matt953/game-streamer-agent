@@ -655,6 +655,8 @@ impl Client {
             stutters: p.stutters as u32,
             freezes: p.freezes as u32,
             freeze_ms_total: p.freeze_ms_total,
+            episodes: p.episodes,
+            worst_episode_ms: p.worst_episode_ms,
         }));
     }
 

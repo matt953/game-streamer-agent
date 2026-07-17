@@ -158,7 +158,20 @@ pub struct PresentStats {
     stutters: u64,
     freezes: u64,
     freeze_us_total: u64,
+    /// Episode tracking: clustered cadence breaks are one visible event
+    /// (a "slideshow"), not N independent hiccups.
+    episodes: u32,
+    worst_episode_us: u64,
+    ep_breaks: u32,
+    ep_start_us: u64,
+    ep_last_break_us: u64,
+    ep_counted: bool,
 }
+
+/// Breaks this close together belong to one episode.
+const EPISODE_GAP_US: u64 = 2_000_000;
+/// Breaks that make a cluster an episode (a lone freeze also qualifies).
+const EPISODE_MIN_BREAKS: u32 = 3;
 
 /// A gap this many times the rolling median cadence counts as a stutter
 /// (a single missed beat at any frame rate).
@@ -180,14 +193,37 @@ impl PresentStats {
                 let v: Vec<u32> = self.frametimes_us.iter().copied().collect();
                 percentile(&v, 50)
             };
+            let mut brk = false;
+            let mut hard = false;
             if gap >= FREEZE_US {
                 self.freezes += 1;
                 self.freeze_us_total += u64::from(gap);
+                brk = true;
+                hard = true;
             } else if let Some(m) = median
                 && gap > m.saturating_mul(STUTTER_FACTOR)
                 && gap > STUTTER_MIN_US
             {
                 self.stutters += 1;
+                brk = true;
+            }
+            if brk {
+                if now_us.saturating_sub(self.ep_last_break_us) > EPISODE_GAP_US {
+                    self.ep_breaks = 0;
+                    self.ep_start_us = prev;
+                    self.ep_counted = false;
+                }
+                self.ep_breaks += 1;
+                self.ep_last_break_us = now_us;
+                if (self.ep_breaks >= EPISODE_MIN_BREAKS || hard) && !self.ep_counted {
+                    self.episodes += 1;
+                    self.ep_counted = true;
+                }
+                if self.ep_counted {
+                    self.worst_episode_us = self
+                        .worst_episode_us
+                        .max(now_us.saturating_sub(self.ep_start_us));
+                }
             }
             push_capped(&mut self.frametimes_us, gap);
         }
@@ -218,6 +254,8 @@ impl PresentStats {
             stutters: self.stutters,
             freezes: self.freezes,
             freeze_ms_total: (self.freeze_us_total / 1000) as u32,
+            episodes: self.episodes,
+            worst_episode_ms: (self.worst_episode_us / 1000) as u32,
         }
     }
 }
@@ -236,6 +274,10 @@ pub struct PresentSummary {
     pub stutters: u64,
     pub freezes: u64,
     pub freeze_ms_total: u32,
+    /// Clustered cadence breaks (a visible degradation event) and the
+    /// longest one's duration.
+    pub episodes: u32,
+    pub worst_episode_ms: u32,
 }
 
 /// The last `n` samples (all of them if fewer), oldest-first.
@@ -305,6 +347,36 @@ mod tests {
         // 1% low reflects the worst gaps.
         assert!(s.low1_fps_x100 < s.fps_x100);
         assert_eq!(s.latency_p50_us, 20_000);
+    }
+
+    #[test]
+    fn clustered_breaks_form_one_episode() {
+        let mut p = PresentStats::default();
+        let mut now = 0u64;
+        for _ in 0..100 {
+            now += 16_667;
+            p.on_presented(None, now);
+        }
+        // A 3-second slideshow: repeated ~150 ms gaps.
+        for _ in 0..20 {
+            now += 150_000;
+            p.on_presented(None, now);
+        }
+        for _ in 0..100 {
+            now += 16_667;
+            p.on_presented(None, now);
+        }
+        let s = p.summary();
+        assert_eq!(s.episodes, 1, "one episode, not many");
+        assert!(s.worst_episode_ms >= 2_500, "worst {}", s.worst_episode_ms);
+        // An isolated hiccup well after the cluster is not an episode.
+        for _ in 0..300 {
+            now += 16_667;
+            p.on_presented(None, now);
+        }
+        now += 60_000;
+        p.on_presented(None, now);
+        assert_eq!(p.summary().episodes, 1);
     }
 
     #[test]
