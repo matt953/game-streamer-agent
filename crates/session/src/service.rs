@@ -164,7 +164,24 @@ async fn serve_inner(
     });
 
     let result = loop {
+        // A pending recovery point outranks the tick: announce immediately.
+        let recovery_ready = active
+            .as_ref()
+            .map(|a| a.pipeline.recovery_ready())
+            .unwrap_or_default();
         let msg: C2A = tokio::select! {
+            _ = recovery_ready.notified() => {
+                let first_safe = active.as_ref().and_then(|a| a.pipeline.take_recovery_point());
+                if let Some(first_safe) = first_safe {
+                    let ev = A2C::SessionEvent(control::SessionEvent::RecoveryPoint {
+                        first_safe_frame_id: first_safe,
+                    });
+                    if let Err(e) = send_msg(&mut send, &ev).await {
+                        break Err(e);
+                    }
+                }
+                continue;
+            }
             r = msg_rx.recv() => match r {
                 Some(Ok(m)) => m,
                 Some(Err(_)) if conn.close_reason().is_some() => break Ok(()),
@@ -411,6 +428,11 @@ async fn serve_inner(
                 if let Some(a) = &active {
                     a.pipeline.request_keyframe();
                     tracing::debug!(peer, session = a.id, "keyframe requested by client");
+                }
+            }
+            C2A::Nack { seqs } => {
+                if let Some(a) = &active {
+                    a.pipeline.retransmit(seqs);
                 }
             }
             C2A::RequestRecovery { last_good_frame_id } => {

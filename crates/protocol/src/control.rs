@@ -48,6 +48,12 @@ pub enum C2A {
     RequestRecovery {
         last_good_frame_id: u32,
     },
+    /// Retransmit request for lost datagrams (transport seqs). The agent
+    /// resends what its retention ring still holds and ignores the rest;
+    /// below one RTT of loss this beats any parity ratio.
+    Nack {
+        seqs: Vec<u32>,
+    },
 }
 
 /// Agent → Client.

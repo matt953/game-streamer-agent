@@ -162,6 +162,8 @@ pub struct PipelineHandle {
     pub send_history: Arc<SendHistory>,
     /// Queue of probe bursts for the sender task.
     probe_tx: tokio::sync::mpsc::UnboundedSender<ProbeJob>,
+    /// Retransmit requests (transport seqs) for the sender's retention ring.
+    nack_tx: tokio::sync::mpsc::UnboundedSender<Vec<u32>>,
     /// Rolling emitted video bitrate (bps) on the send path — actual encoder
     /// output, pushed to the client.
     emitted_bitrate: Arc<AtomicU32>,
@@ -176,6 +178,9 @@ pub struct PipelineHandle {
     /// First frame id encoded with cleaned references + 1 (0 = none), set by
     /// the encode thread for the session layer to announce.
     recovery_point: Arc<AtomicU64>,
+    /// Wakes the session loop the moment a recovery point is ready — the
+    /// announcement must not wait out a tick.
+    recovery_ready: Arc<tokio::sync::Notify>,
 }
 
 impl PipelineHandle {
@@ -218,11 +223,22 @@ impl PipelineHandle {
         self.fec_permille.store(permille, Ordering::Relaxed);
     }
 
+    /// Retransmit the requested datagrams if the retention ring still holds
+    /// them (fire-and-forget).
+    pub fn retransmit(&self, seqs: Vec<u32>) {
+        let _ = self.nack_tx.send(seqs);
+    }
+
     /// Client lost frames after `last_good_wire`: clean the reference chain
     /// (or fall back to an IDR) starting at the next encoded frame.
     pub fn request_recovery(&self, last_good_wire: u32) {
         self.recovery_request
             .store(u64::from(last_good_wire) + 1, Ordering::Release);
+    }
+
+    /// Await the next recovery-point readiness signal.
+    pub fn recovery_ready(&self) -> Arc<tokio::sync::Notify> {
+        self.recovery_ready.clone()
     }
 
     /// First frame encoded after the last recovery request was applied.
@@ -294,6 +310,8 @@ pub fn start(
     let force_idr = Arc::new(AtomicBool::new(false));
     let recovery_request = Arc::new(AtomicU64::new(0));
     let recovery_point = Arc::new(AtomicU64::new(0));
+    let recovery_ready = Arc::new(tokio::sync::Notify::new());
+    let recovery_ready_enc = recovery_ready.clone();
     let recovery_request_enc = recovery_request.clone();
     let recovery_point_enc = recovery_point.clone();
     let bitrate = Arc::new(AtomicU32::new(bitrate_bps));
@@ -369,6 +387,7 @@ pub fn start(
                             announce_recovery = false;
                             recovery_point_enc
                                 .store(u64::from(chunk.frame_id.wire()) + 1, Ordering::Release);
+                            recovery_ready_enc.notify_one();
                         }
                         if chunk_tx.send((chunk, encode_in_us)).is_err() {
                             return; // sender task gone (connection closed)
@@ -403,6 +422,7 @@ pub fn start(
     let history_send = send_history.clone();
     let mut next_seq: u32 = 0;
     let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeJob>();
+    let (nack_tx, mut nack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u32>>();
     let emitted_bitrate = Arc::new(AtomicU32::new(0));
     let emitted_send = emitted_bitrate.clone();
     tokio::spawn(async move {
@@ -412,9 +432,23 @@ pub fn start(
         let mut emit_window: VecDeque<(Instant, u64)> = VecDeque::new();
         let mut emit_bytes = 0u64;
         let mut ledger_rows = 0u32;
+        // Retention ring for NACK retransmits: the last ~2 s of stamped
+        // video datagrams, addressable by transport seq.
+        const RING_CAP: usize = 2048;
+        let mut ring: VecDeque<(u32, Vec<u8>)> = VecDeque::with_capacity(RING_CAP);
         loop {
             let (chunk, encode_in_us) = tokio::select! {
                 biased;
+                seqs = nack_rx.recv() => {
+                    let Some(seqs) = seqs else { break };
+                    // Retransmits jump the pacer: they are already late.
+                    for seq in seqs {
+                        if let Some((_, bytes)) = ring.iter().find(|(s, _)| *s == seq) {
+                            let _ = conn.send_datagram(bytes.clone().into());
+                        }
+                    }
+                    continue;
+                }
                 job = probe_rx.recv() => {
                     let Some(job) = job else { break };
                     run_probe(&conn, &history_send, &clock, &mut next_seq, job).await;
@@ -495,6 +529,10 @@ pub fn start(
                     }
                 }
                 deadline += Duration::from_secs_f64(d.len() as f64 / rate);
+                if ring.len() == RING_CAP {
+                    ring.pop_front();
+                }
+                ring.push_back((next_seq.wrapping_sub(1), d.clone()));
                 if let Err(e) = conn.send_datagram(bytes::Bytes::from(d)) {
                     match e {
                         quinn::SendDatagramError::ConnectionLost(_) => {
@@ -581,11 +619,13 @@ pub fn start(
         path_clean,
         send_history,
         probe_tx,
+        nack_tx,
         emitted_bitrate,
         sink: sink_counters,
         fec_permille,
         recovery_request,
         recovery_point,
+        recovery_ready,
         link_rate,
     })
 }

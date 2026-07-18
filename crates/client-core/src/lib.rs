@@ -213,6 +213,10 @@ pub struct Client {
     /// `PacketFeedback` batch (~20 Hz).
     feedback_batch: Vec<(u32, u64)>,
     last_feedback_us: u64,
+    /// Highest transport seq seen (NACK gap detection).
+    highest_seq: Option<u32>,
+    /// Recently NACKed seqs — each is requested exactly once.
+    nacked: std::collections::VecDeque<u32>,
     /// True while the P-frame reference chain is broken (lost/undecodable
     /// frame); we skip P-frames until a keyframe — or an agent-announced
     /// recovery point — resyncs the decoder (spec 04).
@@ -223,6 +227,15 @@ pub struct Client {
     /// Set by the embedder when its decoder rejected a delivered frame: the
     /// reference chain is broken in ways delivery tracking cannot see.
     decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Adaptive de-jitter (default on): early frames align to the source
+    /// cadence only while measured jitter is high; late frames never wait.
+    dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Recent capture-ts deltas (µs) — the source cadence.
+    cadence_win: std::collections::VecDeque<u32>,
+    /// Recent capture→arrival latencies (µs) — their spread is the jitter.
+    jitter_win: std::collections::VecDeque<u32>,
+    last_release_us: u64,
+    cadence_prev_ts: Option<u32>,
     /// Audio receive+decode, present once the embedder takes the audio output
     /// ([`Client::take_audio_output`]); `None` means audio datagrams are dropped.
     audio: Option<audio::AudioReceive>,
@@ -309,12 +322,19 @@ impl Client {
             last_keyframe_request_us: 0,
             last_stats_report_us: 0,
             feedback_batch: Vec::new(),
+            highest_seq: None,
+            nacked: std::collections::VecDeque::new(),
             last_feedback_us: 0,
             // Until the first keyframe, the decoder has no reference; skip any
             // P-frames that arrive ahead of it.
             awaiting_idr: true,
             recovery_point: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decode_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dejitter: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cadence_win: std::collections::VecDeque::new(),
+            jitter_win: std::collections::VecDeque::new(),
+            last_release_us: 0,
+            cadence_prev_ts: None,
             audio: None,
         };
         client.sync_clock(5).await?;
@@ -615,6 +635,7 @@ impl Client {
         // advance so the next frame isn't misread as another gap.
         self.last_frame_id = Some(f.frame_id);
         self.last_delivered_id = Some(f.frame_id);
+        self.dejitter_release(f.capture_ts_us).await;
         let header = VideoDatagramHeader {
             seq: 0,
             session_epoch: 0,
@@ -744,6 +765,34 @@ impl Client {
         };
         let now = self.clock.now_us();
         self.feedback_batch.push((seq, now));
+        // Gap in send order = loss (or reordering): re-request immediately.
+        // One RTT beats any parity ratio, and a spurious NACK for a merely
+        // reordered datagram costs one duplicate the reassembler ignores.
+        if let Some(high) = self.highest_seq {
+            let ahead = seq.wrapping_sub(high);
+            if ahead > 1 && ahead <= 64 {
+                let missing: Vec<u32> = (1..ahead)
+                    .map(|i| high.wrapping_add(i))
+                    .filter(|s| !self.nacked.contains(s))
+                    .collect();
+                if !missing.is_empty() {
+                    for &m in &missing {
+                        if self.nacked.len() == 512 {
+                            self.nacked.pop_front();
+                        }
+                        self.nacked.push_back(m);
+                    }
+                    if let Some(tx) = &self.control_tx {
+                        let _ = tx.send(C2A::Nack { seqs: missing });
+                    }
+                }
+            }
+            if (1..u32::MAX / 2).contains(&ahead) {
+                self.highest_seq = Some(seq);
+            }
+        } else {
+            self.highest_seq = Some(seq);
+        }
         if self.feedback_batch.len() < MAX_BATCH
             && now.saturating_sub(self.last_feedback_us) < FEEDBACK_INTERVAL_US
         {
@@ -793,6 +842,65 @@ impl Client {
         } else {
             Ok(())
         }
+    }
+
+    /// Shared de-jitter switch for the embedder (default enabled).
+    #[must_use]
+    pub fn dejitter_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.dejitter.clone()
+    }
+
+    /// Cadence-align an early frame while jitter is high. Never delays a
+    /// late frame, holds at most [`DEJITTER_MAX_US`], and is a no-op on a
+    /// clean link — latency is only spent where jitter already ruined it.
+    async fn dejitter_release(&mut self, capture_ts_us: u32) {
+        const WIN: usize = 32;
+        const JITTER_ON_US: u32 = 12_000;
+        const DEJITTER_MAX_US: u64 = 33_000;
+        let now = self.clock.now_us();
+        if let Some(prev) = self.cadence_prev_ts {
+            let d = capture_ts_us.wrapping_sub(prev);
+            if d > 0 && d < 250_000 {
+                if self.cadence_win.len() == WIN {
+                    self.cadence_win.pop_front();
+                }
+                self.cadence_win.push_back(d);
+            }
+        }
+        self.cadence_prev_ts = Some(capture_ts_us);
+        if let Some(lat) = self.clock_sync.frame_latency_us(now, capture_ts_us) {
+            if self.jitter_win.len() == WIN {
+                self.jitter_win.pop_front();
+            }
+            self.jitter_win.push_back(lat);
+        }
+        let ordered = |w: &std::collections::VecDeque<u32>| {
+            let mut v: Vec<u32> = w.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        let release = 'release: {
+            if !self.dejitter.load(std::sync::atomic::Ordering::Relaxed)
+                || self.jitter_win.len() < WIN / 2
+            {
+                break 'release now;
+            }
+            let lat = ordered(&self.jitter_win);
+            let jitter = lat[lat.len() * 9 / 10] - lat[lat.len() / 10];
+            if jitter < JITTER_ON_US {
+                break 'release now;
+            }
+            let cadence = if self.cadence_win.is_empty() {
+                16_667
+            } else {
+                u64::from(ordered(&self.cadence_win)[self.cadence_win.len() / 2])
+            };
+            (self.last_release_us + cadence).min(now + DEJITTER_MAX_US)
+        };
+        if release > now {
+            tokio::time::sleep(std::time::Duration::from_micros(release - now)).await;
+        }
+        self.last_release_us = self.clock.now_us();
     }
 
     /// Shared flag the embedder sets when its decoder rejects a frame; the
