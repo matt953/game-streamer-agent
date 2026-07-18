@@ -201,6 +201,10 @@ pub struct Client {
     session: Option<SessionParams>,
     /// Frame id of the last frame handed to the decoder (gap detection).
     last_frame_id: Option<u32>,
+    /// Last frame actually DELIVERED for decoding — recovery requests must
+    /// cite a frame the decoder truly has; frames skipped while awaiting
+    /// resync were never decoded and are unusable as references.
+    last_delivered_id: Option<u32>,
     /// Client-clock µs of the last keyframe request (rate limiting).
     last_keyframe_request_us: u64,
     /// Client-clock µs of the last `StatsReport` sent (ABR signal, ~2 Hz).
@@ -298,6 +302,7 @@ impl Client {
             presented_tx: presented_channel.0,
             session: None,
             last_frame_id: None,
+            last_delivered_id: None,
             last_keyframe_request_us: 0,
             last_stats_report_us: 0,
             feedback_batch: Vec::new(),
@@ -594,6 +599,7 @@ impl Client {
         // The frame is consumed regardless of what the caller does with it;
         // advance so the next frame isn't misread as another gap.
         self.last_frame_id = Some(f.frame_id);
+        self.last_delivered_id = Some(f.frame_id);
         let header = VideoDatagramHeader {
             seq: 0,
             session_epoch: 0,
@@ -760,7 +766,7 @@ impl Client {
     async fn send_keyframe_request(&mut self) -> Result<()> {
         // With a known-good frame the agent can clean references instead of
         // resetting the world with an IDR (spec 04 rung 2).
-        let msg = match self.last_frame_id {
+        let msg = match self.last_delivered_id {
             Some(last_good_frame_id) => C2A::RequestRecovery { last_good_frame_id },
             None => C2A::RequestKeyframe,
         };
