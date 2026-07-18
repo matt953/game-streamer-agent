@@ -211,7 +211,9 @@ fn ci_storm(frames: u32) -> Result<()> {
         &shaper::Shaping {
             rate_kbit: 30_000,
             delay_ms: 20,
-            jitter_ms: 3,
+            // Above the de-jitter engage threshold: the pacing path must be
+            // exercised, not just the loss ladder.
+            jitter_ms: 15,
             loss_pct: 2.0,
             burst_ms: 150,
             burst_interval_ms: 2_000,
