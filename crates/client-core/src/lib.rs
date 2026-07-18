@@ -237,6 +237,7 @@ pub struct Client {
     last_release_us: u64,
     cadence_prev_ts: Option<u32>,
     dejitter_active: bool,
+    first_gate_us: Option<u64>,
     /// Audio receive+decode, present once the embedder takes the audio output
     /// ([`Client::take_audio_output`]); `None` means audio datagrams are dropped.
     audio: Option<audio::AudioReceive>,
@@ -337,6 +338,7 @@ impl Client {
             last_release_us: 0,
             cadence_prev_ts: None,
             dejitter_active: false,
+            first_gate_us: None,
             audio: None,
         };
         client.sync_clock(5).await?;
@@ -637,7 +639,8 @@ impl Client {
         // advance so the next frame isn't misread as another gap.
         self.last_frame_id = Some(f.frame_id);
         self.last_delivered_id = Some(f.frame_id);
-        self.dejitter_release(f.capture_ts_us).await;
+        let backlog = !self.completed.is_empty();
+        self.dejitter_release(f.capture_ts_us, backlog).await;
         let header = VideoDatagramHeader {
             seq: 0,
             session_epoch: 0,
@@ -856,11 +859,15 @@ impl Client {
     /// Cadence-align an early frame while jitter is high. Never delays a
     /// late frame, holds at most [`DEJITTER_MAX_US`], and is a no-op on a
     /// clean link — latency is only spent where jitter already ruined it.
-    async fn dejitter_release(&mut self, capture_ts_us: u32) {
+    async fn dejitter_release(&mut self, capture_ts_us: u32, backlog: bool) {
         const WIN: usize = 32;
         const JITTER_ON_US: u32 = 12_000;
         const DEJITTER_MAX_US: u64 = 33_000;
+        /// Startup transient (clock sync settling, burst catch-up) must not
+        /// read as jitter.
+        const WARMUP_US: u64 = 2_000_000;
         let now = self.clock.now_us();
+        self.first_gate_us.get_or_insert(now);
         if let Some(prev) = self.cadence_prev_ts {
             let d = capture_ts_us.wrapping_sub(prev);
             if d > 0 && d < 250_000 {
@@ -883,9 +890,17 @@ impl Client {
             v
         };
         let release = 'release: {
-            if !self.dejitter.load(std::sync::atomic::Ordering::Relaxed)
+            // Pacing is only sound at the queue head with nothing waiting:
+            // holding a frame while more are already queued builds a standing
+            // backlog that can never drain — the opposite of smoothing.
+            if backlog
+                || !self.dejitter.load(std::sync::atomic::Ordering::Relaxed)
                 || self.jitter_win.len() < WIN / 2
             {
+                break 'release now;
+            }
+            let age = now.saturating_sub(self.first_gate_us.unwrap_or(now));
+            if age < WARMUP_US {
                 break 'release now;
             }
             let lat = ordered(&self.jitter_win);
