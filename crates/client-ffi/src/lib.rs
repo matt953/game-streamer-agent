@@ -209,6 +209,8 @@ pub struct GsaSession {
     presented: PresentedSink,
     /// Decoder-failure latch for [`gsa_frame_undecodable`].
     decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Adaptive de-jitter switch for [`gsa_set_dejitter`].
+    dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The negotiated codec (a `GSA_CODEC_*` flag), for `gsa_session_codec`.
     codec: u32,
 }
@@ -221,6 +223,7 @@ enum SessionReady {
         input: Option<InputSender>,
         presented: PresentedSink,
         decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
         codec: u32,
     },
 }
@@ -309,6 +312,7 @@ pub unsafe extern "C" fn gsa_session_start(
             input,
             presented,
             decode_error,
+            dejitter,
             codec,
         }) => Box::into_raw(Box::new(GsaSession {
             stop,
@@ -316,6 +320,7 @@ pub unsafe extern "C" fn gsa_session_start(
             input,
             presented,
             decode_error,
+            dejitter,
             codec,
         })),
         _ => {
@@ -404,6 +409,23 @@ pub unsafe extern "C" fn gsa_frame_undecodable(session: *const GsaSession) {
     unsafe { &*session }
         .decode_error
         .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Enable/disable adaptive presentation de-jitter (default on). It aligns
+/// early frames to the source cadence only while measured jitter is high;
+/// late frames are never delayed.
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`] (not yet stopped).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_set_dejitter(session: *const GsaSession, enabled: bool) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract guarantees a live handle.
+    unsafe { &*session }
+        .dejitter
+        .store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The protocol's bitrate ceiling (bps) — the top of every bitrate control.
@@ -679,6 +701,7 @@ async fn session_loop(
     let input = client.take_input_sender();
     let presented = client.presented_sink();
     let decode_error = client.decode_error_flag();
+    let dejitter = client.dejitter_flag();
     let codec = client
         .negotiated_codec()
         .map_or(GSA_CODEC_H264, codec_to_flag);
@@ -686,6 +709,7 @@ async fn session_loop(
         input,
         presented,
         decode_error,
+        dejitter,
         codec,
     });
 

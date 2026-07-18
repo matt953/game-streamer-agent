@@ -25,7 +25,7 @@ pub struct CompletedFrame {
 /// older frame's recovery shards are still in flight. A P-frame is
 /// undecodable without its predecessor, so delivering it early buys nothing
 /// and forfeits the older frame's recovery.
-const HOLD_LIMIT: usize = 2;
+const HOLD_LIMIT: usize = 3;
 
 /// How many in-flight frame ids we track before pruning the oldest.
 /// Loopback/LAN never sees more than 2-3 concurrent; the window guards
@@ -379,10 +379,11 @@ mod tests {
         // Newer completions hold briefly (frame 5 could still recover)...
         assert_eq!(datas(r.push(hdr(6, 0, 1), b"a")), Vec::<Vec<u8>>::new());
         assert_eq!(datas(r.push(hdr(7, 0, 1), b"b")), Vec::<Vec<u8>>::new());
+        assert_eq!(datas(r.push(hdr(8, 0, 1), b"c")), Vec::<Vec<u8>>::new());
         // ...until the hold limit passes: everything releases, 5 is dropped.
         assert_eq!(
-            datas(r.push(hdr(8, 0, 1), b"c")),
-            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+            datas(r.push(hdr(9, 0, 1), b"d")),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
         );
         assert_eq!(r.frames_dropped(), 1);
         // Late chunk of the stale frame is ignored.
@@ -494,9 +495,15 @@ mod tests {
         // is pruned and the queue releases.
         assert_eq!(datas(r.push(hdr(21, 0, 1), b"next")), Vec::<Vec<u8>>::new());
         assert_eq!(datas(r.push(hdr(22, 0, 1), b"more")), Vec::<Vec<u8>>::new());
+        assert_eq!(datas(r.push(hdr(23, 0, 1), b"go")), Vec::<Vec<u8>>::new());
         assert_eq!(
-            datas(r.push(hdr(23, 0, 1), b"go")),
-            vec![b"next".to_vec(), b"more".to_vec(), b"go".to_vec()]
+            datas(r.push(hdr(24, 0, 1), b"on")),
+            vec![
+                b"next".to_vec(),
+                b"more".to_vec(),
+                b"go".to_vec(),
+                b"on".to_vec()
+            ]
         );
         assert_eq!(r.frames_dropped(), 1);
     }
