@@ -218,6 +218,8 @@ pub struct ClientStats {
     pub latency_p99_us: u32,
     /// Cadence breaks: gaps well past the rolling median / hard freezes.
     pub stutters: u32,
+    /// Cadence breaks already present in the source (game hitches).
+    pub src_stutters: u32,
     pub freezes: u32,
     pub freeze_ms_total: u32,
     /// Clustered cadence breaks (visible degradation events) and the

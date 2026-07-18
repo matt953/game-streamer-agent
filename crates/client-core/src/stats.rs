@@ -157,6 +157,10 @@ pub struct PresentStats {
     /// Rolling capture→present latency (µs), when clock sync allows it.
     latencies_us: VecDeque<u32>,
     stutters: u64,
+    /// Cadence breaks already present in the SOURCE (capture-ts gaps): the
+    /// game hitched; the stream merely carried it.
+    src_stutters: u64,
+    last_capture_ts: Option<u32>,
     freezes: u64,
     freeze_us_total: u64,
     /// Episode tracking: clustered cadence breaks are one visible event
@@ -189,7 +193,14 @@ const STUTTER_MIN_US: u32 = 40_000;
 const FREEZE_US: u32 = 250_000;
 
 impl PresentStats {
-    pub fn on_presented(&mut self, latency_us: Option<u32>, now_us: u64) {
+    pub fn on_presented(&mut self, latency_us: Option<u32>, capture_ts_us: u32, now_us: u64) {
+        if let Some(prev_ts) = self.last_capture_ts {
+            let src_gap = capture_ts_us.wrapping_sub(prev_ts);
+            if src_gap > STUTTER_MIN_US && src_gap < 10_000_000 {
+                self.src_stutters += 1;
+            }
+        }
+        self.last_capture_ts = Some(capture_ts_us);
         self.presented += 1;
         if let Some(l) = latency_us {
             push_capped(&mut self.latencies_us, l);
@@ -267,6 +278,7 @@ impl PresentStats {
             latency_p95_us: percentile(&lat, 95).unwrap_or(0),
             latency_p99_us: percentile(&lat, 99).unwrap_or(0),
             stutters: self.stutters,
+            src_stutters: self.src_stutters,
             freezes: self.freezes,
             freeze_ms_total: (self.freeze_us_total / 1000) as u32,
             episodes: self.episodes,
@@ -287,6 +299,8 @@ pub struct PresentSummary {
     pub latency_p95_us: u32,
     pub latency_p99_us: u32,
     pub stutters: u64,
+    /// Cadence breaks already present in the source (game hitches).
+    pub src_stutters: u64,
     pub freezes: u64,
     pub freeze_ms_total: u32,
     /// Clustered cadence breaks (a visible degradation event) and the
@@ -350,12 +364,12 @@ mod tests {
         // Steady 60 fps past warmup, then one stutter and one freeze.
         for _ in 0..150 {
             now += 16_667;
-            p.on_presented(Some(20_000), now);
+            p.on_presented(Some(20_000), (now % 4_000_000_000) as u32, now);
         }
         now += 50_000; // ~3 missed beats
-        p.on_presented(Some(20_000), now);
+        p.on_presented(Some(20_000), (now % 4_000_000_000) as u32, now);
         now += 300_000; // freeze
-        p.on_presented(Some(20_000), now);
+        p.on_presented(Some(20_000), (now % 4_000_000_000) as u32, now);
         let s = p.summary();
         assert_eq!(s.stutters, 1);
         assert_eq!(s.freezes, 1);
@@ -371,16 +385,16 @@ mod tests {
         let mut now = 0u64;
         for _ in 0..150 {
             now += 16_667;
-            p.on_presented(None, now);
+            p.on_presented(None, (now % 4_000_000_000) as u32, now);
         }
         // A 3-second slideshow: repeated ~150 ms gaps.
         for _ in 0..20 {
             now += 150_000;
-            p.on_presented(None, now);
+            p.on_presented(None, (now % 4_000_000_000) as u32, now);
         }
         for _ in 0..100 {
             now += 16_667;
-            p.on_presented(None, now);
+            p.on_presented(None, (now % 4_000_000_000) as u32, now);
         }
         let s = p.summary();
         assert_eq!(s.episodes, 1, "one episode, not many");
@@ -388,10 +402,10 @@ mod tests {
         // An isolated hiccup well after the cluster is not an episode.
         for _ in 0..300 {
             now += 16_667;
-            p.on_presented(None, now);
+            p.on_presented(None, (now % 4_000_000_000) as u32, now);
         }
         now += 60_000;
-        p.on_presented(None, now);
+        p.on_presented(None, (now % 4_000_000_000) as u32, now);
         assert_eq!(p.summary().episodes, 1);
     }
 
@@ -401,7 +415,7 @@ mod tests {
         let mut now = 0u64;
         for i in 0..200 {
             now += if i % 50 == 49 { 100_000 } else { 16_667 };
-            p.on_presented(None, now);
+            p.on_presented(None, (now % 4_000_000_000) as u32, now);
         }
         let s = p.summary();
         // The worst-gap tail is the 100 ms hitches -> ~10 fps equivalent.

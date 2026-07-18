@@ -705,6 +705,7 @@ impl Client {
             latency_p95_us: p.latency_p95_us,
             latency_p99_us: p.latency_p99_us,
             stutters: p.stutters as u32,
+            src_stutters: p.src_stutters as u32,
             freezes: p.freezes as u32,
             freeze_ms_total: p.freeze_ms_total,
             episodes: p.episodes,
@@ -786,7 +787,7 @@ impl Client {
     pub fn frame_presented(&mut self, capture_ts_us: u32) {
         let now = self.clock.now_us();
         let latency = self.clock_sync.frame_latency_us(now, capture_ts_us);
-        self.present.on_presented(latency, now);
+        self.present.on_presented(latency, capture_ts_us, now);
     }
 
     /// Fold queued presentation reports (stamped on the display thread) into
@@ -798,7 +799,7 @@ impl Client {
                 .now_us()
                 .saturating_sub(at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
             let latency = self.clock_sync.frame_latency_us(now, capture_ts);
-            self.present.on_presented(latency, now);
+            self.present.on_presented(latency, capture_ts, now);
         }
     }
 
