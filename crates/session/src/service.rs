@@ -215,6 +215,7 @@ async fn serve_inner(
                         .max(loss_permille.saturating_mul(4))
                         .clamp(gsa_session_fec_floor(), FEC_CAP_PERMILLE);
                     a.pipeline.set_fec_permille(fec_permille);
+                    a.pipeline.set_link_rate(last_estimate_bps);
                     if abr_enabled && last_estimate_bps > 0 {
                         // 90% of measured, minus what parity will add on the
                         // wire: encoder + FEC together fit the estimate.

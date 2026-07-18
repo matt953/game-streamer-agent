@@ -155,6 +155,9 @@ pub struct PipelineHandle {
     /// Whether the path currently shows no congestion signals (session layer
     /// updates it): gates the latency-budget burst.
     path_clean: Arc<AtomicBool>,
+    /// Measured link rate (bps, the transport estimate): bounds the burst —
+    /// sending faster than the path drains only builds queue jitter there.
+    link_rate: Arc<AtomicU32>,
     /// Send-side bookkeeping for the per-packet feedback join.
     pub send_history: Arc<SendHistory>,
     /// Queue of probe bursts for the sender task.
@@ -190,6 +193,11 @@ impl PipelineHandle {
     /// Report whether the path is free of congestion signals (loss, delay).
     pub fn set_path_clean(&self, clean: bool) {
         self.path_clean.store(clean, Ordering::Relaxed);
+    }
+
+    /// Update the measured link rate (bps) bounding the pacer's burst.
+    pub fn set_link_rate(&self, bps: u32) {
+        self.link_rate.store(bps, Ordering::Relaxed);
     }
 
     /// Queue a padding probe burst; the sender executes it promptly, media
@@ -389,6 +397,8 @@ pub fn start(
     let bitrate_pace = bitrate.clone();
     let path_clean = Arc::new(AtomicBool::new(true));
     let path_clean_pace = path_clean.clone();
+    let link_rate = Arc::new(AtomicU32::new(0));
+    let link_rate_pace = link_rate.clone();
     let send_history = Arc::new(SendHistory::default());
     let history_send = send_history.clone();
     let mut next_seq: u32 = 0;
@@ -451,7 +461,12 @@ pub fn start(
             let br = f64::from(bitrate_pace.load(Ordering::Relaxed));
             let total_len: usize = datagrams.iter().map(Vec::len).sum();
             let budget_rate = if path_clean_pace.load(Ordering::Relaxed) {
-                (total_len as f64 / PACING_MAX_SPREAD.as_secs_f64()).min(br)
+                // Burst no faster than the path drains: overdriving a slow
+                // link parks the excess in its queue and returns as arrival
+                // jitter. Unmeasured links keep the legacy 8x-target cap.
+                let link = f64::from(link_rate_pace.load(Ordering::Relaxed));
+                let cap = if link > 0.0 { link * 1.2 / 8.0 } else { br };
+                (total_len as f64 / PACING_MAX_SPREAD.as_secs_f64()).min(cap)
             } else {
                 0.0 // congestion signals present: smooth spread only
             };
@@ -571,6 +586,7 @@ pub fn start(
         fec_permille,
         recovery_request,
         recovery_point,
+        link_rate,
     })
 }
 
