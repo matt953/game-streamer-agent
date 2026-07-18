@@ -220,6 +220,9 @@ pub struct Client {
     /// Agent-announced first-safe frame id + 1 (0 = none), written by the
     /// control reader task on [`SessionEvent::RecoveryPoint`].
     recovery_point: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set by the embedder when its decoder rejected a delivered frame: the
+    /// reference chain is broken in ways delivery tracking cannot see.
+    decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Audio receive+decode, present once the embedder takes the audio output
     /// ([`Client::take_audio_output`]); `None` means audio datagrams are dropped.
     audio: Option<audio::AudioReceive>,
@@ -311,6 +314,7 @@ impl Client {
             // P-frames that arrive ahead of it.
             awaiting_idr: true,
             recovery_point: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            decode_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             audio: None,
         };
         client.sync_clock(5).await?;
@@ -558,6 +562,17 @@ impl Client {
     ) -> Result<Option<(VideoDatagramHeader, Vec<u8>)>> {
         self.stats
             .on_frame_complete(f.data.len(), self.clock.now_us());
+        // A decoder-rejected frame breaks the chain even though delivery
+        // looked clean: freeze and request recovery like any gap.
+        if self
+            .decode_error
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            && !self.awaiting_idr
+        {
+            tracing::debug!("embedder reported decode error; freezing");
+            self.awaiting_idr = true;
+            self.request_keyframe_throttled().await?;
+        }
         let is_idr = f.kind == gsa_core::media::FrameKind::Idr;
         if is_idr {
             self.awaiting_idr = false;
@@ -778,6 +793,13 @@ impl Client {
         } else {
             Ok(())
         }
+    }
+
+    /// Shared flag the embedder sets when its decoder rejects a frame; the
+    /// gate treats it as a reference break and requests recovery.
+    #[must_use]
+    pub fn decode_error_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.decode_error.clone()
     }
 
     /// Handle for the embedder's display path to report presented frames.

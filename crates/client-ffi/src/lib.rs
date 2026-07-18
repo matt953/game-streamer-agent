@@ -207,6 +207,8 @@ pub struct GsaSession {
     input: Option<InputSender>,
     /// Presentation reporter for [`gsa_frame_presented`].
     presented: PresentedSink,
+    /// Decoder-failure latch for [`gsa_frame_undecodable`].
+    decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The negotiated codec (a `GSA_CODEC_*` flag), for `gsa_session_codec`.
     codec: u32,
 }
@@ -218,6 +220,7 @@ enum SessionReady {
     Streaming {
         input: Option<InputSender>,
         presented: PresentedSink,
+        decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         codec: u32,
     },
 }
@@ -305,12 +308,14 @@ pub unsafe extern "C" fn gsa_session_start(
         Ok(SessionReady::Streaming {
             input,
             presented,
+            decode_error,
             codec,
         }) => Box::into_raw(Box::new(GsaSession {
             stop,
             thread: Some(thread),
             input,
             presented,
+            decode_error,
             codec,
         })),
         _ => {
@@ -382,6 +387,23 @@ pub unsafe extern "C" fn gsa_frame_presented(session: *const GsaSession, capture
     }
     // SAFETY: caller contract guarantees a live handle.
     unsafe { &*session }.presented.presented(capture_ts_us);
+}
+
+/// Report that the embedder's decoder rejected a delivered frame (bad
+/// reference, corrupt bitstream): the session freezes P-frames and asks the
+/// agent for recovery, exactly as for a lost frame.
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`] (not yet stopped).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_frame_undecodable(session: *const GsaSession) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract guarantees a live handle.
+    unsafe { &*session }
+        .decode_error
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// The protocol's bitrate ceiling (bps) — the top of every bitrate control.
@@ -656,12 +678,14 @@ async fn session_loop(
     // recv loop's keyframe requests through its background writer task.
     let input = client.take_input_sender();
     let presented = client.presented_sink();
+    let decode_error = client.decode_error_flag();
     let codec = client
         .negotiated_codec()
         .map_or(GSA_CODEC_H264, codec_to_flag);
     let _ = ready_tx.send(SessionReady::Streaming {
         input,
         presented,
+        decode_error,
         codec,
     });
 

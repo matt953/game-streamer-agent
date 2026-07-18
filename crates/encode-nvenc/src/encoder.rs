@@ -234,8 +234,18 @@ impl Encoder for NvencEncoder {
         };
         let current = self.next_frame_id.wire();
         let lost = current.wrapping_sub(last_good_wire).saturating_sub(1);
-        // Beyond the DPB there is nothing left to invalidate selectively.
-        if lost == 0 || lost > 16 {
+        // Selective invalidation is only sound while `last_good` itself is
+        // certainly still resident in the DPB; a wide window risks frames
+        // referencing evicted pictures — silent corruption, not an error.
+        // Half the nominal DPB is the conservative bound; beyond it an IDR
+        // is the only safe recovery.
+        if lost == 0 || lost > 8 {
+            tracing::debug!(
+                last_good_wire,
+                current,
+                lost,
+                "invalidation window unsafe; IDR"
+            );
             return false;
         }
         for i in 1..=lost {
