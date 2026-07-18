@@ -173,6 +173,7 @@ async fn serve_inner(
             _ = recovery_ready.notified() => {
                 let first_safe = active.as_ref().and_then(|a| a.pipeline.take_recovery_point());
                 if let Some(first_safe) = first_safe {
+                    tracing::debug!(first_safe, "recovery point announced");
                     let ev = A2C::SessionEvent(control::SessionEvent::RecoveryPoint {
                         first_safe_frame_id: first_safe,
                     });

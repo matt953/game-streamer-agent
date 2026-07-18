@@ -436,6 +436,7 @@ pub fn start(
         // video datagrams, addressable by transport seq.
         const RING_CAP: usize = 2048;
         let mut ring: VecDeque<(u32, Vec<u8>)> = VecDeque::with_capacity(RING_CAP);
+        let mut nacks_resent = 0u64;
         loop {
             let (chunk, encode_in_us) = tokio::select! {
                 biased;
@@ -445,6 +446,7 @@ pub fn start(
                     for seq in seqs {
                         if let Some((_, bytes)) = ring.iter().find(|(s, _)| *s == seq) {
                             let _ = conn.send_datagram(bytes.clone().into());
+                            nacks_resent += 1;
                         }
                     }
                     continue;
@@ -601,6 +603,7 @@ pub fn start(
                     send_spread_ms = frame_start.elapsed().as_secs_f64() * 1000.0,
                     queue = chunk_rx.len(),
                     dropped = frames_dropped,
+                    nacks_resent,
                     "pipeline sample"
                 );
             }

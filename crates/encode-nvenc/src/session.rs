@@ -158,6 +158,7 @@ impl Session {
                 hevc.bitfields |= sys::HEVC_ENABLE_INTRA_REFRESH;
                 hevc.intraRefreshPeriod = 240;
                 hevc.intraRefreshCnt = 8;
+                tracing::info!("intra refresh enabled (hevc, period 240, cnt 8)");
             }
             _ => {
                 // SAFETY: the preset was fetched for the H.264 codec GUID, so
@@ -168,6 +169,7 @@ impl Session {
                 h264.bitfields |= sys::H264_ENABLE_INTRA_REFRESH;
                 h264.intraRefreshPeriod = 240;
                 h264.intraRefreshCnt = 8;
+                tracing::info!("intra refresh enabled (h264, period 240, cnt 8)");
                 // Baseline forbids CABAC; picking the wrong one silently
                 // produces a stream the client cannot decode.
                 h264.entropyCodingMode = match profile {

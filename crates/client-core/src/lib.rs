@@ -236,6 +236,7 @@ pub struct Client {
     jitter_win: std::collections::VecDeque<u32>,
     last_release_us: u64,
     cadence_prev_ts: Option<u32>,
+    dejitter_active: bool,
     /// Audio receive+decode, present once the embedder takes the audio output
     /// ([`Client::take_audio_output`]); `None` means audio datagrams are dropped.
     audio: Option<audio::AudioReceive>,
@@ -335,6 +336,7 @@ impl Client {
             jitter_win: std::collections::VecDeque::new(),
             last_release_us: 0,
             cadence_prev_ts: None,
+            dejitter_active: false,
             audio: None,
         };
         client.sync_clock(5).await?;
@@ -776,6 +778,7 @@ impl Client {
                     .filter(|s| !self.nacked.contains(s))
                     .collect();
                 if !missing.is_empty() {
+                    tracing::debug!(count = missing.len(), first = missing[0], "nack sent");
                     for &m in &missing {
                         if self.nacked.len() == 512 {
                             self.nacked.pop_front();
@@ -887,7 +890,12 @@ impl Client {
             }
             let lat = ordered(&self.jitter_win);
             let jitter = lat[lat.len() * 9 / 10] - lat[lat.len() / 10];
-            if jitter < JITTER_ON_US {
+            let high = jitter >= JITTER_ON_US;
+            if high != self.dejitter_active {
+                self.dejitter_active = high;
+                tracing::debug!(jitter_us = jitter, active = high, "dejitter mode");
+            }
+            if !high {
                 break 'release now;
             }
             let cadence = if self.cadence_win.is_empty() {
