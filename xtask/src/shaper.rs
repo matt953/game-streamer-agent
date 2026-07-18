@@ -22,6 +22,10 @@ pub(crate) struct Shaping {
     /// Delay jitter (±), applied per packet.
     pub(crate) jitter_ms: u32,
     pub(crate) loss_pct: f64,
+    /// Storm model: drop everything for `burst_ms` every `burst_interval_ms`
+    /// once active (0 disables). Models cellular loss bursts.
+    pub(crate) burst_ms: u64,
+    pub(crate) burst_interval_ms: u64,
     /// Tail-drop past this many queued packets (the bottleneck buffer).
     pub(crate) buffer_pkts: Option<u32>,
 }
@@ -116,11 +120,14 @@ impl Shaper {
             delay,
             jitter,
             loss,
+            burst: None,
+            burst_t0: None,
             active: active.clone(),
             stop: stop.clone(),
             rng: Rng::new(seed),
         };
         // Downlink agent→client: the shaped bottleneck (rate + buffer + delay).
+        let down_burst = (sh.burst_ms > 0).then_some((sh.burst_interval_ms.max(1), sh.burst_ms));
         let down = Direction {
             recv: back,
             send: front,
@@ -132,6 +139,8 @@ impl Shaper {
             delay,
             jitter,
             loss,
+            burst: down_burst,
+            burst_t0: None,
             active: active.clone(),
             stop: stop.clone(),
             rng: Rng::new(seed ^ 0x9E37_79B9),
@@ -204,6 +213,10 @@ struct Direction {
     rate_bytes: Option<Arc<AtomicU64>>,
     /// Tail-drop past this many queued packets.
     buffer: Option<u32>,
+    /// Storm bursts: (interval_ms, burst_ms); everything drops inside the
+    /// burst window. `burst_t0` anchors the schedule at activation.
+    burst: Option<(u64, u64)>,
+    burst_t0: Option<Instant>,
     delay: f64,
     jitter: f64,
     loss: f64,
@@ -231,7 +244,12 @@ impl Direction {
                     *l.lock().unwrap() = Some(from);
                 }
                 let on = self.active.load(Ordering::Relaxed);
-                let drop_random = on && self.rng.unit() < self.loss;
+                let in_burst = on
+                    && self.burst.is_some_and(|(interval_ms, burst_ms)| {
+                        let t0 = *self.burst_t0.get_or_insert_with(Instant::now);
+                        t0.elapsed().as_millis() as u64 % interval_ms < burst_ms
+                    });
+                let drop_random = on && (in_burst || self.rng.unit() < self.loss);
                 let over_buffer = on && self.buffer.is_some_and(|b| queue.len() as u32 >= b);
                 if !drop_random && !over_buffer {
                     let hold = if on {

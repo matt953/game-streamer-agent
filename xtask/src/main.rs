@@ -22,6 +22,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Storm gate: e2e through the shaper with cellular-style loss bursts;
+    /// asserts the recovery ladder (NACK+FEC+hold) keeps frames alive.
+    CiStorm {
+        /// Frames to stream.
+        #[arg(long, default_value_t = 600)]
+        frames: u32,
+    },
     /// End-to-end loopback test: agent + headless client, assertions,
     /// latency report artifact.
     CiE2e {
@@ -53,6 +60,11 @@ enum Cmd {
         jitter_ms: u32,
         #[arg(long, default_value_t = 0.0)]
         loss_pct: f64,
+        /// Storm mode: drop everything for this many ms per interval.
+        #[arg(long, default_value_t = 0)]
+        burst_ms: u64,
+        #[arg(long, default_value_t = 2000)]
+        burst_interval_ms: u64,
     },
     DevSign {
         /// Signing identity (default: the first Apple Development identity).
@@ -64,6 +76,7 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::CiE2e { frames, report } => ci_e2e(frames, &report),
+        Cmd::CiStorm { frames } => ci_storm(frames),
         Cmd::Logs { listen } => logs::logs(&listen),
         Cmd::Shape {
             to,
@@ -71,6 +84,8 @@ fn main() -> Result<()> {
             delay_ms,
             jitter_ms,
             loss_pct,
+            burst_ms,
+            burst_interval_ms,
         } => {
             let shaper = shaper::Shaper::start(
                 to,
@@ -79,6 +94,8 @@ fn main() -> Result<()> {
                     delay_ms,
                     jitter_ms,
                     loss_pct,
+                    burst_ms,
+                    burst_interval_ms,
                     buffer_pkts: Some(2048),
                 },
                 1,
@@ -152,6 +169,105 @@ impl Drop for KillOnDrop {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+fn ci_storm(frames: u32) -> Result<()> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    eprintln!("[ci-storm] building agent + client...");
+    let status = Command::new(&cargo)
+        .args(["build", "-p", "gsa-agent", "-p", "gsa-client-dev"])
+        .status()
+        .context("cargo build")?;
+    if !status.success() {
+        bail!("build failed");
+    }
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let addr = format!("127.0.0.1:{port}");
+    let socket = control_socket_for_test(port);
+    let exe = |name: &str| {
+        let mut p = PathBuf::from("target/debug").join(name);
+        if cfg!(windows) {
+            p.set_extension("exe");
+        }
+        p
+    };
+    eprintln!("[ci-storm] starting agent on {addr}...");
+    let agent = KillOnDrop(
+        Command::new(exe("gsa"))
+            .args(["run", "--listen", &addr, "--control-socket", &socket])
+            .env("RUST_LOG", "info")
+            .env("GSA_DEV_OPEN", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("spawn agent")?,
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Cellular-style link: 30 Mb/s, 20 ms, storms of 150 ms every 2 s plus
+    // 2% background loss. The recovery ladder must keep frames alive.
+    let shaper = shaper::Shaper::start(
+        addr.parse()?,
+        &shaper::Shaping {
+            rate_kbit: 30_000,
+            delay_ms: 20,
+            jitter_ms: 3,
+            loss_pct: 2.0,
+            burst_ms: 150,
+            burst_interval_ms: 2_000,
+            buffer_pkts: Some(2048),
+        },
+        7,
+    )?;
+    let front = shaper.front;
+    let sh_activate = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        shaper.activate();
+        eprintln!("[ci-storm] storm active");
+        shaper
+    });
+
+    eprintln!("[ci-storm] streaming {frames} frames through {front}...");
+    let out = Command::new(exe("gsa-client-dev"))
+        .args([
+            "--connect",
+            &front.to_string(),
+            "--headless",
+            "--json",
+            "--frames",
+            &frames.to_string(),
+        ])
+        .env("GSA_DEV_OPEN", "1")
+        .stderr(Stdio::inherit())
+        .output()
+        .context("run client")?;
+    let _shaper = sh_activate.join().expect("shaper thread");
+    drop(agent);
+    if !out.status.success() {
+        bail!("client failed with {}", out.status);
+    }
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parse client JSON")?;
+    let decoded = report["frames_decoded"].as_u64().unwrap_or(0);
+    let dropped = report["frames_dropped_incomplete"]
+        .as_u64()
+        .unwrap_or(u64::MAX);
+    let recovered = report["frames_recovered"].as_u64().unwrap_or(0);
+    let regressions = report["marker_regressions"].as_u64().unwrap_or(u64::MAX);
+    eprintln!(
+        "[ci-storm] decoded {decoded} dropped {dropped} recovered {recovered} regressions {regressions}"
+    );
+    if decoded < u64::from(frames) {
+        bail!("decoded {decoded} < requested {frames}");
+    }
+    if dropped > u64::from(frames) / 50 {
+        bail!("storm dropped {dropped} frames (> 2%)");
+    }
+    if regressions > 0 {
+        bail!("marker regressions under storm: {regressions}");
+    }
+    eprintln!("[ci-storm] OK — dropped {dropped}, recovered {recovered}");
+    Ok(())
 }
 
 fn ci_e2e(frames: u32, report_path: &PathBuf) -> Result<()> {
