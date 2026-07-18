@@ -189,7 +189,7 @@ impl Encoder for SwEncoder {
         self.force_idr = true;
     }
 
-    fn invalidate_refs(&mut self, _older_than: FrameId) -> bool {
+    fn invalidate_refs(&mut self, _last_good_wire: u32) -> bool {
         false // unsupported: session layer falls back to force_idr (spec 04)
     }
 

@@ -85,9 +85,10 @@ pub trait Encoder: Send {
     /// Request an IDR on the next submitted frame.
     fn force_idr(&mut self);
 
-    /// Invalidate references older than `older_than`. Returns `false` when
-    /// unsupported — caller must `force_idr` instead (spec 04 ladder).
-    fn invalidate_refs(&mut self, older_than: FrameId) -> bool;
+    /// Loss recovery (spec 04): frames newer than `last_good_wire` never
+    /// reached the client — later frames must not reference them. Returns
+    /// `false` when unsupported — caller must `force_idr` instead.
+    fn invalidate_refs(&mut self, last_good_wire: u32) -> bool;
 
     fn close(&mut self);
 }

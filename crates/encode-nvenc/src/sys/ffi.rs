@@ -524,7 +524,8 @@ pub struct NvEncodeApiFunctionList {
         Option<unsafe extern "system" fn(*mut c_void, *mut NvEncMapInputResource) -> NvencStatus>,
     pub nvEncUnmapInputResource: Fn2,
     pub nvEncDestroyEncoder: Fn1,
-    pub nvEncInvalidateRefFrames: Fn2,
+    pub nvEncInvalidateRefFrames:
+        Option<unsafe extern "system" fn(*mut c_void, u64) -> NvencStatus>,
     pub nvEncOpenEncodeSessionEx: Option<
         unsafe extern "system" fn(
             *mut NvEncOpenEncodeSessionExParams,

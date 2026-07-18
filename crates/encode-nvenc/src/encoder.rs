@@ -228,8 +228,25 @@ impl Encoder for NvencEncoder {
         self.force_idr = true;
     }
 
-    fn invalidate_refs(&mut self, _older_than: FrameId) -> bool {
-        false // session layer falls back to force_idr (spec 04)
+    fn invalidate_refs(&mut self, last_good_wire: u32) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let current = self.next_frame_id.wire();
+        let lost = current.wrapping_sub(last_good_wire).saturating_sub(1);
+        // Beyond the DPB there is nothing left to invalidate selectively.
+        if lost == 0 || lost > 16 {
+            return false;
+        }
+        for i in 1..=lost {
+            let ts = u64::from(last_good_wire.wrapping_add(i));
+            if let Err(e) = session.invalidate_ref(ts) {
+                tracing::warn!(error = %e, "ref invalidation failed; falling back to IDR");
+                return false;
+            }
+        }
+        tracing::debug!(last_good_wire, lost, "references invalidated");
+        true
     }
 
     fn close(&mut self) {

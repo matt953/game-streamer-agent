@@ -302,6 +302,22 @@ impl Session {
 
     /// Register and map a texture for one encode. The returned guard releases
     /// both in the right order.
+    /// Tell the rate controller a reference frame never reached the client:
+    /// later frames must not predict from it (`inputTimeStamp` keys it).
+    pub(crate) fn invalidate_ref(&self, timestamp: u64) -> Result<()> {
+        let f = self
+            .nvenc
+            .functions()
+            .nvEncInvalidateRefFrames
+            .ok_or_else(|| Error::Encode("nvEncInvalidateRefFrames missing".into()))?;
+        // SAFETY: live encoder handle; the call only reads it.
+        let st = unsafe { f(self.encoder, timestamp) };
+        if st != 0 {
+            return Err(Error::Encode(format!("nvEncInvalidateRefFrames: {st}")));
+        }
+        Ok(())
+    }
+
     pub(crate) fn map(
         &self,
         texture: &ID3D11Texture2D,
