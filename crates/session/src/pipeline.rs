@@ -16,7 +16,7 @@ use gsa_protocol::datagram::{VideoDatagramHeader, chunk_video_frame};
 
 /// Always-on FEC parity floor (permille of data shards): covers the
 /// reaction latency between a loss burst and the adaptive ratio catching up.
-pub const FEC_FLOOR_PERMILLE: u32 = 30;
+pub const FEC_FLOOR_PERMILLE: u32 = 60;
 
 /// Fallback when quinn hasn't discovered the path MTU yet.
 const DEFAULT_MAX_DATAGRAM: usize = 1200;
@@ -167,6 +167,12 @@ pub struct PipelineHandle {
     /// Live FEC parity ratio (permille of data shards), driven by the
     /// session layer from observed loss.
     fec_permille: Arc<AtomicU32>,
+    /// Pending reference-invalidation request: client's last good frame id
+    /// + 1 (0 = none), consumed by the encode thread.
+    recovery_request: Arc<AtomicU64>,
+    /// First frame id encoded with cleaned references + 1 (0 = none), set by
+    /// the encode thread for the session layer to announce.
+    recovery_point: Arc<AtomicU64>,
 }
 
 impl PipelineHandle {
@@ -202,6 +208,19 @@ impl PipelineHandle {
     /// Set the FEC parity ratio (permille) for subsequent frames.
     pub fn set_fec_permille(&self, permille: u32) {
         self.fec_permille.store(permille, Ordering::Relaxed);
+    }
+
+    /// Client lost frames after `last_good_wire`: clean the reference chain
+    /// (or fall back to an IDR) starting at the next encoded frame.
+    pub fn request_recovery(&self, last_good_wire: u32) {
+        self.recovery_request
+            .store(u64::from(last_good_wire) + 1, Ordering::Release);
+    }
+
+    /// First frame encoded after the last recovery request was applied.
+    pub fn take_recovery_point(&self) -> Option<u32> {
+        let v = self.recovery_point.swap(0, Ordering::AcqRel);
+        (v > 0).then(|| (v - 1) as u32)
     }
 
     /// Frames the capture source has offered so far (≈ content render rate).
@@ -265,6 +284,10 @@ pub fn start(
     let stop = Arc::new(AtomicBool::new(false));
     let frames_sent = Arc::new(AtomicU64::new(0));
     let force_idr = Arc::new(AtomicBool::new(false));
+    let recovery_request = Arc::new(AtomicU64::new(0));
+    let recovery_point = Arc::new(AtomicU64::new(0));
+    let recovery_request_enc = recovery_request.clone();
+    let recovery_point_enc = recovery_point.clone();
     let bitrate = Arc::new(AtomicU32::new(bitrate_bps));
     // Channel carries (chunk, encode_in agent-µs) so the ledger can split the
     // capture→encode wait from the encode itself.
@@ -285,6 +308,7 @@ pub fn start(
         .spawn(move || {
             // Applied vs. target bitrate: re-arm the encoder only when the
             // live target changes (an `update_rate` may cost one IDR, spec 03).
+            let mut announce_recovery = false;
             let mut applied_bitrate = bitrate_bps;
             // Encode only real captures — never re-encode a held frame to
             // synthesize a keyframe. Capture backends recycle their pooled
@@ -308,6 +332,16 @@ pub fn start(
                         Err(e) => tracing::warn!(error = %e, "update_rate failed"),
                     }
                 }
+                // Reference invalidation (spec 04): clean the chain before
+                // this frame; unsupported encoders get an IDR instead.
+                let recovery = recovery_request_enc.swap(0, Ordering::AcqRel);
+                if recovery > 0 {
+                    let last_good = (recovery - 1) as u32;
+                    if !encoder.invalidate_refs(last_good) {
+                        force_idr_enc.store(true, Ordering::Release);
+                    }
+                    announce_recovery = true;
+                }
                 let directives = FrameDirectives {
                     idr: force_idr_enc.swap(false, Ordering::AcqRel),
                     ..Default::default()
@@ -323,6 +357,11 @@ pub fn start(
                 // The bound only trips on a genuinely dropped/failed frame.
                 match encoder.next_chunk(DRAIN_TIMEOUT) {
                     Ok(Some(chunk)) => {
+                        if announce_recovery {
+                            announce_recovery = false;
+                            recovery_point_enc
+                                .store(u64::from(chunk.frame_id.wire()) + 1, Ordering::Release);
+                        }
                         if chunk_tx.send((chunk, encode_in_us)).is_err() {
                             return; // sender task gone (connection closed)
                         }
@@ -530,6 +569,8 @@ pub fn start(
         emitted_bitrate,
         sink: sink_counters,
         fec_permille,
+        recovery_request,
+        recovery_point,
     })
 }
 

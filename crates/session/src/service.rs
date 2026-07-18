@@ -128,6 +128,7 @@ async fn serve_inner(
     let mut last_estimate_bps: u32 = 0;
     let mut abr_enabled = false;
     let mut fec_permille: u32 = crate::pipeline::FEC_FLOOR_PERMILLE;
+    let mut recovery_announce: Option<u32> = None;
     let mut helloed = false;
     // Client's max decodable H.264 profile (from Hello), negotiated at session start.
     let mut client_h264_profile = gsa_core::media::H264Profile::ConstrainedBaseline;
@@ -224,6 +225,7 @@ async fn serve_inner(
                         a.pipeline
                             .set_bitrate(target.clamp(BITRATE_MIN_BPS, session_ceiling));
                     }
+                    recovery_announce = a.pipeline.take_recovery_point();
                     if tick_count.is_multiple_of(4)
                     && let Some(a) = &active
                 {
@@ -247,6 +249,14 @@ async fn serve_inner(
                             abr = abr_enabled,
                             "bwe"
                         );
+                    }
+                }
+                if let Some(first_safe) = recovery_announce.take() {
+                    let ev = A2C::SessionEvent(control::SessionEvent::RecoveryPoint {
+                        first_safe_frame_id: first_safe,
+                    });
+                    if let Err(e) = send_msg(&mut send, &ev).await {
+                        break Err(e);
                     }
                 }
                 if tick_count.is_multiple_of(4)
@@ -400,6 +410,17 @@ async fn serve_inner(
                 if let Some(a) = &active {
                     a.pipeline.request_keyframe();
                     tracing::debug!(peer, session = a.id, "keyframe requested by client");
+                }
+            }
+            C2A::RequestRecovery { last_good_frame_id } => {
+                if let Some(a) = &active {
+                    a.pipeline.request_recovery(last_good_frame_id);
+                    tracing::debug!(
+                        peer,
+                        session = a.id,
+                        last_good_frame_id,
+                        "reference recovery requested by client"
+                    );
                 }
             }
             C2A::SetBitrate { bitrate_bps } => {
