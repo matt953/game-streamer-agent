@@ -210,8 +210,12 @@ pub struct Client {
     feedback_batch: Vec<(u32, u64)>,
     last_feedback_us: u64,
     /// True while the P-frame reference chain is broken (lost/undecodable
-    /// frame); we skip P-frames until a keyframe resyncs the decoder (spec 04).
+    /// frame); we skip P-frames until a keyframe — or an agent-announced
+    /// recovery point — resyncs the decoder (spec 04).
     awaiting_idr: bool,
+    /// Agent-announced first-safe frame id + 1 (0 = none), written by the
+    /// control reader task on [`SessionEvent::RecoveryPoint`].
+    recovery_point: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Audio receive+decode, present once the embedder takes the audio output
     /// ([`Client::take_audio_output`]); `None` means audio datagrams are dropped.
     audio: Option<audio::AudioReceive>,
@@ -301,6 +305,7 @@ impl Client {
             // Until the first keyframe, the decoder has no reference; skip any
             // P-frames that arrive ahead of it.
             awaiting_idr: true,
+            recovery_point: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio: None,
         };
         client.sync_clock(5).await?;
@@ -354,6 +359,7 @@ impl Client {
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<ControlEvent>> {
         let mut recv = self.control_recv.take()?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let recovery_point = self.recovery_point.clone();
         tokio::spawn(async move {
             loop {
                 match recv_msg::<A2C>(&mut recv).await {
@@ -385,6 +391,14 @@ impl Client {
                         {
                             break;
                         }
+                    }
+                    Ok(A2C::SessionEvent(gsa_protocol::control::SessionEvent::RecoveryPoint {
+                        first_safe_frame_id,
+                    })) => {
+                        recovery_point.store(
+                            u64::from(first_safe_frame_id) + 1,
+                            std::sync::atomic::Ordering::Release,
+                        );
                     }
                     // Other A2C during streaming (SessionEvent, stray replies):
                     // nothing acts on them yet, so drain and continue.
@@ -556,12 +570,25 @@ impl Client {
             }
         }
 
-        // Frozen: skip P-frames (a broken reference is the corruption).
-        // Advance the id so we don't re-flag the gap; keep asking for a key.
+        // Frozen: an agent-announced recovery point resumes decoding without
+        // a keyframe — frames from it on reference nothing we're missing.
         if self.awaiting_idr && !is_idr {
-            self.last_frame_id = Some(f.frame_id);
-            self.request_keyframe_throttled().await?;
-            return Ok(None);
+            let rp = self
+                .recovery_point
+                .load(std::sync::atomic::Ordering::Acquire);
+            let safe = rp > 0 && {
+                let first_safe = (rp - 1) as u32;
+                f.frame_id.wrapping_sub(first_safe) < u32::MAX / 2
+            };
+            if safe {
+                self.awaiting_idr = false;
+            } else {
+                // Skip P-frames (a broken reference is the corruption);
+                // advance the id so the gap isn't re-flagged, keep asking.
+                self.last_frame_id = Some(f.frame_id);
+                self.request_keyframe_throttled().await?;
+                return Ok(None);
+            }
         }
 
         // The frame is consumed regardless of what the caller does with it;
@@ -730,11 +757,17 @@ impl Client {
     }
 
     async fn send_keyframe_request(&mut self) -> Result<()> {
+        // With a known-good frame the agent can clean references instead of
+        // resetting the world with an IDR (spec 04 rung 2).
+        let msg = match self.last_frame_id {
+            Some(last_good_frame_id) => C2A::RequestRecovery { last_good_frame_id },
+            None => C2A::RequestKeyframe,
+        };
         if let Some(tx) = &self.control_tx {
-            let _ = tx.send(C2A::RequestKeyframe);
+            let _ = tx.send(msg);
             Ok(())
         } else if let Some(stream) = self.control_send.as_mut() {
-            send_msg(stream, &C2A::RequestKeyframe).await
+            send_msg(stream, &msg).await
         } else {
             Ok(())
         }

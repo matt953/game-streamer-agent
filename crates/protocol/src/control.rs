@@ -41,6 +41,13 @@ pub enum C2A {
     Ping {
         client_ts_us: u64,
     },
+    /// Loss recovery (spec 04 rung 2): the client's reference chain broke;
+    /// `last_good_frame_id` is the newest frame it decoded. The agent
+    /// invalidates newer references (or falls back to an IDR) and answers
+    /// with [`SessionEvent::RecoveryPoint`].
+    RequestRecovery {
+        last_good_frame_id: u32,
+    },
 }
 
 /// Agent → Client.
@@ -162,7 +169,14 @@ pub enum SourceKind {
 pub enum SessionEvent {
     EncoderReset,
     ModeChanged(VideoMode),
-    SourceEnded { reason: String },
+    SourceEnded {
+        reason: String,
+    },
+    /// Frames from `first_safe_frame_id` on reference nothing the client is
+    /// missing: decoding may resume there without a keyframe.
+    RecoveryPoint {
+        first_safe_frame_id: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
