@@ -194,6 +194,17 @@ pub struct NvEncConfigH264Vui {
     pub reserved: [u32; 12],
 }
 
+/// `NV_ENC_CONFIG_H264.enableIntraRefresh` — bit 10 of the leading bitfield
+/// word (after enableTemporalSVC, enableStereoMVC, hierarchicalPFrames,
+/// hierarchicalBFrames, the three SEI/AUD outputs, disableSPSPPS,
+/// outputFramePackingSEI, outputRecoveryPointSEI — SDK header order).
+pub const H264_ENABLE_INTRA_REFRESH: u32 = 1 << 10;
+
+/// `NV_ENC_CONFIG_HEVC.enableIntraRefresh` — bit 8 of its bitfield word
+/// (after useConstrainedIntraPred, disableDeblockAcrossSliceBoundary, the
+/// two SEI outputs, outputAUD, enableLTR, disableSPSPPS, repeatSPSPPS).
+pub const HEVC_ENABLE_INTRA_REFRESH: u32 = 1 << 8;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NvEncConfigH264 {

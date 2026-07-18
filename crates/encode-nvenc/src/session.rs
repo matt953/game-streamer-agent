@@ -153,12 +153,21 @@ impl Session {
                 // the union's HEVC arm is the initialized one.
                 let hevc = unsafe { &mut config.encodeCodecConfig.hevcConfig };
                 hevc.idrPeriod = sys::NVENC_INFINITE_GOPLENGTH;
+                // Rolling intra refresh: corruption self-heals within the
+                // wave and the stream never pays IDR-sized bitrate spikes.
+                hevc.bitfields |= sys::HEVC_ENABLE_INTRA_REFRESH;
+                hevc.intraRefreshPeriod = 240;
+                hevc.intraRefreshCnt = 8;
             }
             _ => {
                 // SAFETY: the preset was fetched for the H.264 codec GUID, so
                 // the union's H.264 arm is the initialized one.
                 let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
                 h264.idrPeriod = sys::NVENC_INFINITE_GOPLENGTH;
+                // Rolling intra refresh (see the HEVC arm).
+                h264.bitfields |= sys::H264_ENABLE_INTRA_REFRESH;
+                h264.intraRefreshPeriod = 240;
+                h264.intraRefreshCnt = 8;
                 // Baseline forbids CABAC; picking the wrong one silently
                 // produces a stream the client cannot decode.
                 h264.entropyCodingMode = match profile {
