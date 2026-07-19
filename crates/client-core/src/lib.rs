@@ -862,6 +862,9 @@ impl Client {
     async fn dejitter_release(&mut self, capture_ts_us: u32, backlog: bool) {
         const WIN: usize = 32;
         const JITTER_ON_US: u32 = 12_000;
+        /// Hysteresis: a link hovering at the engage threshold must not flap
+        /// the mode (and its log line) every few frames.
+        const JITTER_OFF_US: u32 = 8_000;
         const DEJITTER_MAX_US: u64 = 33_000;
         /// Startup transient (clock sync settling, burst catch-up) must not
         /// read as jitter.
@@ -905,7 +908,11 @@ impl Client {
             }
             let lat = ordered(&self.jitter_win);
             let jitter = lat[lat.len() * 9 / 10] - lat[lat.len() / 10];
-            let high = jitter >= JITTER_ON_US;
+            let high = if self.dejitter_active {
+                jitter >= JITTER_OFF_US
+            } else {
+                jitter >= JITTER_ON_US
+            };
             if high != self.dejitter_active {
                 self.dejitter_active = high;
                 tracing::debug!(jitter_us = jitter, active = high, "dejitter mode");
