@@ -119,10 +119,31 @@ pub(crate) fn create_device(luid: Option<i64>) -> Result<(ID3D11Device, ID3D11De
     }
     .map_err(|e| Error::Capture(format!("D3D11CreateDevice: {e}")))?;
     match (device, context) {
-        (Some(device), Some(context)) => Ok((device, context)),
+        (Some(device), Some(context)) => {
+            raise_gpu_priority(&device);
+            Ok((device, context))
+        }
         _ => Err(Error::Capture(
             "D3D11CreateDevice returned no device".into(),
         )),
+    }
+}
+
+/// Ask WDDM to schedule this device's work ahead of other applications'.
+///
+/// A game saturating the GPU otherwise queues tens of milliseconds of work
+/// ahead of our per-frame copy, and the WGC pool buffer stays busy until the
+/// copy executes — throttling capture to the game's queue-drain pace. Our GPU
+/// footprint is a handful of copies per frame, so preempting costs the game
+/// nothing measurable.
+fn raise_gpu_priority(device: &ID3D11Device) {
+    let Ok(dxgi) = device.cast::<IDXGIDevice>() else {
+        return;
+    };
+    // SAFETY: `dxgi` is live; 7 is the documented maximum priority.
+    match unsafe { dxgi.SetGPUThreadPriority(7) } {
+        Ok(()) => tracing::info!("gpu thread priority raised to 7"),
+        Err(e) => tracing::warn!(error = %e, "SetGPUThreadPriority failed"),
     }
 }
 
