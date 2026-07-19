@@ -541,6 +541,7 @@ impl Client {
             last_feedback_us: 0,
             highest_seq: None,
             nacked: std::collections::VecDeque::new(),
+            nack_window: (0, 0),
         };
         self.frames_rx = Some(rx);
         tokio::spawn(task.run());
@@ -937,6 +938,8 @@ struct ReceiveTask {
     highest_seq: Option<u32>,
     /// Recently NACKed seqs — each is requested exactly once.
     nacked: std::collections::VecDeque<u32>,
+    /// NACK budget window: (window start µs, seqs requested this window).
+    nack_window: (u64, usize),
 }
 
 impl ReceiveTask {
@@ -1010,13 +1013,23 @@ impl ReceiveTask {
         // Gap in send order = loss (or reordering): re-request immediately.
         // One RTT beats any parity ratio, and a spurious NACK for a merely
         // reordered datagram costs one duplicate the reassembler ignores.
+        // Mass loss is congestion, not sporadic drops: NACKing thousands of
+        // seqs asks the sender to pile retransmits onto an already-collapsing
+        // path. Beyond the budget, FEC and the recovery ladder take over.
+        const NACK_BUDGET_PER_SEC: usize = 150;
         if let Some(high) = self.highest_seq {
             let ahead = seq.wrapping_sub(high);
             if ahead > 1 && ahead <= 64 {
+                if now.saturating_sub(self.nack_window.0) >= 1_000_000 {
+                    self.nack_window = (now, 0);
+                }
+                let budget = NACK_BUDGET_PER_SEC.saturating_sub(self.nack_window.1);
                 let missing: Vec<u32> = (1..ahead)
                     .map(|i| high.wrapping_add(i))
                     .filter(|s| !self.nacked.contains(s))
+                    .take(budget)
                     .collect();
+                self.nack_window.1 += missing.len();
                 if !missing.is_empty() {
                     tracing::debug!(count = missing.len(), first = missing[0], "nack sent");
                     for &m in &missing {
