@@ -79,19 +79,6 @@ fn resolve_bitrates(requested: Option<u32>, abr: bool, host_cap: Option<u32>) ->
     }
 }
 
-/// Bitrate above which the codec stops gaining quality at a given pixel
-/// rate. Past this plateau, extra bits buy nothing visible and only stress
-/// the client's receive and decode path — a clean link will otherwise carry
-/// the estimate (and the encoder) far beyond what a phone can ingest.
-fn quality_ceiling_bps(mode: gsa_core::media::VideoMode, codec: Codec) -> u32 {
-    let bpp = match codec {
-        Codec::Hevc => 0.25,
-        _ => 0.4,
-    };
-    let pixel_rate = f64::from(mode.width) * f64::from(mode.height) * f64::from(mode.fps.max(30));
-    (pixel_rate * bpp) as u32
-}
-
 /// Pick the codec for a session: the encoder's most-preferred (its caps order)
 /// that the client can also decode, falling back to H.264.
 fn negotiate_codec(client_decodes: &[Codec], encoder_emits: &[Codec]) -> Codec {
@@ -586,16 +573,6 @@ fn start_session(
         .unwrap_or(state.config.video.mode);
     let (bitrate, ceiling) =
         resolve_bitrates(req.bitrate_bps, req.abr, state.config.video.bitrate_bps);
-    let quality_cap = quality_ceiling_bps(mode, codec);
-    let ceiling = ceiling.min(quality_cap);
-    let bitrate = bitrate.min(ceiling);
-    if quality_cap == ceiling {
-        tracing::info!(
-            ceiling_mbps = quality_cap as f64 / 1e6,
-            ?codec,
-            "quality ceiling caps the session bitrate"
-        );
-    }
 
     // Desktop / virtual displays inject at the OS level; emulators consume
     // input in-process and get no OS injector.
