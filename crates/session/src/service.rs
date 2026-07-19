@@ -61,20 +61,21 @@ pub trait EncoderFactory: Send + Sync {
 /// Resolve a session's (opening bitrate, ABR ceiling) from the client's request
 /// and the agent's configured bitrate.
 ///
-/// - **ABR on**: config is the ceiling; the request (or [`ABR_START_BPS`]) is
-///   the ramp start, clamped to the ceiling.
+/// - **ABR on**: the request is the client's ceiling ("up to", matching the
+///   live `SetBitrate` semantics), bounded by the authoritative host cap; the
+///   ramp always starts at [`ABR_START_BPS`].
 /// - **ABR off**: the request (or config) is both the fixed rate and the cap.
 fn resolve_bitrates(requested: Option<u32>, abr: bool, host_cap: Option<u32>) -> (u32, u32) {
-    let ceiling = host_cap.map_or(BITRATE_MAX_BPS, |c| {
+    let host = host_cap.map_or(BITRATE_MAX_BPS, |c| {
         c.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS)
     });
     if abr {
-        let start = requested
-            .map_or(ABR_START_BPS, |b| b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS))
-            .min(ceiling);
-        (start, ceiling)
+        let ceiling = requested.map_or(host, |b| {
+            b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS).min(host)
+        });
+        (ABR_START_BPS.min(ceiling), ceiling)
     } else {
-        let rate = requested.map_or(ceiling, |b| b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS));
+        let rate = requested.map_or(host, |b| b.clamp(BITRATE_MIN_BPS, BITRATE_MAX_BPS));
         (rate, rate)
     }
 }
@@ -650,12 +651,12 @@ mod tests {
     }
 
     #[test]
-    fn abr_uses_config_as_ceiling_and_request_as_start() {
-        // The convergence-CI case: agent config 8, client requests a 2 Mb/s
-        // start. Ceiling must stay 8 (else ABR can't ramp) and start must be 2.
+    fn abr_request_is_the_clients_ceiling() {
+        // The apps' Auto-with-cap case: the request bounds the ramp ("up to"),
+        // exactly like a live SetBitrate would.
         assert_eq!(
             resolve_bitrates(Some(2_000_000), true, Some(CONFIG)),
-            (2_000_000, CONFIG)
+            (2_000_000, 2_000_000)
         );
     }
 
