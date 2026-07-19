@@ -185,15 +185,18 @@ pub struct Client {
     control_send: Option<quinn::SendStream>,
     /// `None` once [`Client::take_control_events`] moves it into a reader task.
     control_recv: Option<quinn::RecvStream>,
-    /// Present once the background control writer is running (windowed
-    /// client); `recv_frame` sends keyframe requests through it.
-    control_tx: Option<tokio::sync::mpsc::UnboundedSender<C2A>>,
+    /// Set once the background control writer is running (windowed client);
+    /// shared with the receive task, which sends NACKs and feedback through it.
+    control_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<C2A>>>>,
     clock: MediaClock,
     clock_sync: ClockSync,
-    reassembler: Reassembler,
-    /// Frames released by the reassembler, awaiting the gate (drained one
-    /// per `next_gated_frame` call).
-    completed: std::collections::VecDeque<reassembly::CompletedFrame>,
+    /// Moves into the receive task when it spawns.
+    reassembler: Option<Reassembler>,
+    /// Completed frames from the receive task, awaiting the gate.
+    frames_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ArrivedFrame>>,
+    /// Reassembler drop/recovery counters, mirrored out of the receive task.
+    reassembly_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    reassembly_recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats: LatencyStats,
     present: stats::PresentStats,
     presented_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, std::time::Instant)>,
@@ -209,14 +212,6 @@ pub struct Client {
     last_keyframe_request_us: u64,
     /// Client-clock µs of the last `StatsReport` sent (ABR signal, ~2 Hz).
     last_stats_report_us: u64,
-    /// Pending per-packet arrival samples (seq, arrival µs) for the next
-    /// `PacketFeedback` batch (~20 Hz).
-    feedback_batch: Vec<(u32, u64)>,
-    last_feedback_us: u64,
-    /// Highest transport seq seen (NACK gap detection).
-    highest_seq: Option<u32>,
-    /// Recently NACKed seqs — each is requested exactly once.
-    nacked: std::collections::VecDeque<u32>,
     /// True while the P-frame reference chain is broken (lost/undecodable
     /// frame); we skip P-frames until a keyframe — or an agent-announced
     /// recovery point — resyncs the decoder (spec 04).
@@ -227,20 +222,26 @@ pub struct Client {
     /// Set by the embedder when its decoder rejected a delivered frame: the
     /// reference chain is broken in ways delivery tracking cannot see.
     decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Adaptive de-jitter (default on): early frames align to the source
-    /// cadence only while measured jitter is high; late frames never wait.
+    /// Adaptive de-jitter (default on): early frames are held to a
+    /// capture-anchored latency target only while measured jitter is high;
+    /// late frames never wait.
     dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Recent capture-ts deltas (µs) — the source cadence.
-    cadence_win: std::collections::VecDeque<u32>,
     /// Recent capture→arrival latencies (µs) — their spread is the jitter.
     jitter_win: std::collections::VecDeque<u32>,
-    last_release_us: u64,
-    cadence_prev_ts: Option<u32>,
+    /// Last measured p90−p10 latency spread (µs), for the stats report.
+    last_jitter_us: u32,
     dejitter_active: bool,
     first_gate_us: Option<u64>,
-    /// Audio receive+decode, present once the embedder takes the audio output
-    /// ([`Client::take_audio_output`]); `None` means audio datagrams are dropped.
-    audio: Option<audio::AudioReceive>,
+    /// Audio receive+decode, set by [`Client::take_audio_output`] and read by
+    /// the receive task; `None` means audio datagrams are dropped.
+    audio: std::sync::Arc<std::sync::Mutex<Option<audio::AudioReceive>>>,
+}
+
+/// One reassembled frame plus its true arrival time, sent from the receive
+/// task to the gate.
+struct ArrivedFrame {
+    frame: reassembly::CompletedFrame,
+    arrival_us: u64,
 }
 
 impl std::fmt::Debug for Client {
@@ -309,11 +310,13 @@ impl Client {
             conn,
             control_send: Some(control_send),
             control_recv: Some(control_recv),
-            control_tx: None,
+            control_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
             clock,
             clock_sync: ClockSync::default(),
-            reassembler: Reassembler::new(),
-            completed: std::collections::VecDeque::new(),
+            reassembler: Some(Reassembler::new()),
+            frames_rx: None,
+            reassembly_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reassembly_recovered: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stats: LatencyStats::default(),
             present: stats::PresentStats::default(),
             presented_rx: presented_channel.1,
@@ -323,23 +326,17 @@ impl Client {
             last_delivered_id: None,
             last_keyframe_request_us: 0,
             last_stats_report_us: 0,
-            feedback_batch: Vec::new(),
-            highest_seq: None,
-            nacked: std::collections::VecDeque::new(),
-            last_feedback_us: 0,
             // Until the first keyframe, the decoder has no reference; skip any
             // P-frames that arrive ahead of it.
             awaiting_idr: true,
             recovery_point: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decode_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dejitter: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            cadence_win: std::collections::VecDeque::new(),
             jitter_win: std::collections::VecDeque::new(),
-            last_release_us: 0,
-            cadence_prev_ts: None,
+            last_jitter_us: 0,
             dejitter_active: false,
             first_gate_us: None,
-            audio: None,
+            audio: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         client.sync_clock(5).await?;
         Ok(client)
@@ -457,8 +454,8 @@ impl Client {
                 }
             }
         });
-        // Keep a clone so recv_frame can send keyframe requests too.
-        self.control_tx = Some(tx.clone());
+        // Keep a clone so recv_frame and the receive task can send too.
+        *self.control_tx.lock().expect("control tx") = Some(tx.clone());
         Some(InputSender { tx })
     }
 
@@ -466,11 +463,12 @@ impl Client {
     /// embedder to play. Enables audio decode (until called, audio datagrams
     /// are dropped). Call once.
     pub fn take_audio_output(&mut self) -> Result<std::sync::mpsc::Receiver<Vec<i16>>> {
-        if self.audio.is_some() {
+        let mut slot = self.audio.lock().expect("audio slot");
+        if slot.is_some() {
             return Err(Error::Session("audio output already taken".into()));
         }
         let (recv, rx) = audio::AudioReceive::new()?;
-        self.audio = Some(recv);
+        *slot = Some(recv);
         Ok(rx)
     }
 
@@ -521,58 +519,51 @@ impl Client {
         self.session.as_ref().map(|p| p.codec)
     }
 
-    /// Receive datagrams until a video frame passes the loss-recovery gate,
-    /// returning its header and reassembled access unit. Audio decodes+plays as
-    /// a side effect. `None` when the connection closes. Shared by `recv_frame`
-    /// (decode path) and `recv_encoded` (embedder passthrough path).
+    /// Spawn the datagram receive task on first use. Reception must never
+    /// wait on the release side: arrival timestamps feed the agent's
+    /// delay-based estimator, and a paced present must not read as path
+    /// congestion. NACKs and feedback also fire at true arrival time.
+    fn ensure_receiver(&mut self) {
+        if self.frames_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = ReceiveTask {
+            conn: self.conn.clone(),
+            clock: self.clock.clone(),
+            reassembler: self.reassembler.take().expect("receiver spawned once"),
+            control_tx: self.control_tx.clone(),
+            audio: self.audio.clone(),
+            frames_tx: tx,
+            dropped: self.reassembly_dropped.clone(),
+            recovered: self.reassembly_recovered.clone(),
+            feedback_batch: Vec::new(),
+            last_feedback_us: 0,
+            highest_seq: None,
+            nacked: std::collections::VecDeque::new(),
+        };
+        self.frames_rx = Some(rx);
+        tokio::spawn(task.run());
+    }
+
+    /// Next video frame past the loss-recovery gate, with its header and
+    /// reassembled access unit. `None` when the connection closes. Shared by
+    /// `recv_frame` (decode path) and `recv_encoded` (embedder passthrough).
     async fn next_gated_frame(&mut self) -> Result<Option<(VideoDatagramHeader, Vec<u8>)>> {
+        self.ensure_receiver();
         loop {
-            if let Some(f) = self.completed.pop_front() {
-                if let Some(out) = self.gate(f).await? {
-                    return Ok(Some(out));
-                }
-                continue;
-            }
-            let datagram = match self.conn.read_datagram().await {
-                Ok(d) => d,
-                Err(quinn::ConnectionError::ApplicationClosed(_))
-                | Err(quinn::ConnectionError::LocallyClosed) => return Ok(None),
-                Err(e) => return Err(Error::Transport(format!("read datagram: {e}"))),
+            let rx = self.frames_rx.as_mut().expect("receiver running");
+            let Some(af) = rx.recv().await else {
+                return Ok(None);
             };
-            // Route by datagram type: audio is decoded+played as a side effect;
-            // this only returns on a completed video frame.
-            match datagram
-                .first()
-                .copied()
-                .map(gsa_protocol::DatagramType::from_wire)
-            {
-                Some(Ok(gsa_protocol::DatagramType::Padding)) => {
-                    self.record_arrival(&datagram);
-                    continue;
-                }
-                Some(Ok(gsa_protocol::DatagramType::Audio)) => {
-                    if let Some(a) = &mut self.audio {
-                        a.handle(&datagram);
-                    }
-                    continue;
-                }
-                Some(Ok(gsa_protocol::DatagramType::Video)) => {
-                    self.record_arrival(&datagram);
-                }
-                _ => {
-                    tracing::warn!("unknown datagram dropped");
-                    continue;
-                }
+            let backlog = !self
+                .frames_rx
+                .as_ref()
+                .expect("receiver running")
+                .is_empty();
+            if let Some(out) = self.gate(af, backlog).await? {
+                return Ok(Some(out));
             }
-            let (header, payload) = match VideoDatagramHeader::parse(&datagram) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "bad datagram dropped");
-                    continue;
-                }
-            };
-            self.completed
-                .extend(self.reassembler.push(header, payload));
         }
     }
 
@@ -582,10 +573,14 @@ impl Client {
     /// corrupts output. Requests the keyframe immediately.
     async fn gate(
         &mut self,
-        f: reassembly::CompletedFrame,
+        f: ArrivedFrame,
+        backlog: bool,
     ) -> Result<Option<(VideoDatagramHeader, Vec<u8>)>> {
-        self.stats
-            .on_frame_complete(f.data.len(), self.clock.now_us());
+        let ArrivedFrame {
+            frame: f,
+            arrival_us,
+        } = f;
+        self.stats.on_frame_complete(f.data.len(), arrival_us);
         // A decoder-rejected frame breaks the chain even though delivery
         // looked clean: freeze and request recovery like any gap.
         if self
@@ -639,8 +634,8 @@ impl Client {
         // advance so the next frame isn't misread as another gap.
         self.last_frame_id = Some(f.frame_id);
         self.last_delivered_id = Some(f.frame_id);
-        let backlog = !self.completed.is_empty();
-        self.dejitter_release(f.capture_ts_us, backlog).await;
+        self.dejitter_release(f.capture_ts_us, arrival_us, backlog)
+            .await;
         let header = VideoDatagramHeader {
             seq: 0,
             session_epoch: 0,
@@ -726,17 +721,18 @@ impl Client {
         if now.saturating_sub(self.last_stats_report_us) < INTERVAL_US {
             return;
         }
-        if self.control_tx.is_none() {
+        let Some(tx) = self.control_tx.lock().expect("control tx").clone() else {
             return;
-        }
+        };
         self.last_stats_report_us = now;
         self.drain_presented();
         let p = self.present.summary();
         let s = self.stats.summary(
-            self.reassembler.frames_dropped(),
-            self.reassembler.frames_recovered(),
+            self.reassembly_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.reassembly_recovered
+                .load(std::sync::atomic::Ordering::Relaxed),
         );
-        let Some(tx) = &self.control_tx else { return };
         let _ = tx.send(C2A::StatsReport(gsa_protocol::control::ClientStats {
             frames_received: s.frames_complete,
             frames_complete: s.frames_complete,
@@ -744,7 +740,7 @@ impl Client {
             frames_recovered: s.frames_recovered as u32,
             frames_decoded: s.frames_decoded,
             decode_us_p50: s.decode_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32),
-            jitter_us: 0,
+            jitter_us: self.last_jitter_us,
             frames_presented: p.presented,
             present_fps_x100: p.fps_x100,
             low1_fps_x100: p.low1_fps_x100,
@@ -757,67 +753,6 @@ impl Client {
             freeze_ms_total: p.freeze_ms_total,
             episodes: p.episodes,
             worst_episode_ms: p.worst_episode_ms,
-        }));
-    }
-
-    /// Record one sequenced datagram's arrival and flush the feedback batch
-    /// at ~20 Hz (or when full). Fire-and-forget like the stats report.
-    fn record_arrival(&mut self, datagram: &[u8]) {
-        const FEEDBACK_INTERVAL_US: u64 = 50_000;
-        const MAX_BATCH: usize = 512;
-        let Ok(seq) = gsa_protocol::datagram::read_seq(datagram) else {
-            return;
-        };
-        let now = self.clock.now_us();
-        self.feedback_batch.push((seq, now));
-        // Gap in send order = loss (or reordering): re-request immediately.
-        // One RTT beats any parity ratio, and a spurious NACK for a merely
-        // reordered datagram costs one duplicate the reassembler ignores.
-        if let Some(high) = self.highest_seq {
-            let ahead = seq.wrapping_sub(high);
-            if ahead > 1 && ahead <= 64 {
-                let missing: Vec<u32> = (1..ahead)
-                    .map(|i| high.wrapping_add(i))
-                    .filter(|s| !self.nacked.contains(s))
-                    .collect();
-                if !missing.is_empty() {
-                    tracing::debug!(count = missing.len(), first = missing[0], "nack sent");
-                    for &m in &missing {
-                        if self.nacked.len() == 512 {
-                            self.nacked.pop_front();
-                        }
-                        self.nacked.push_back(m);
-                    }
-                    if let Some(tx) = &self.control_tx {
-                        let _ = tx.send(C2A::Nack { seqs: missing });
-                    }
-                }
-            }
-            if (1..u32::MAX / 2).contains(&ahead) {
-                self.highest_seq = Some(seq);
-            }
-        } else {
-            self.highest_seq = Some(seq);
-        }
-        if self.feedback_batch.len() < MAX_BATCH
-            && now.saturating_sub(self.last_feedback_us) < FEEDBACK_INTERVAL_US
-        {
-            return;
-        }
-        self.last_feedback_us = now;
-        let Some(tx) = &self.control_tx else {
-            self.feedback_batch.clear();
-            return;
-        };
-        let base = self.feedback_batch.first().map_or(now, |&(_, t)| t);
-        let samples = self
-            .feedback_batch
-            .drain(..)
-            .map(|(seq, t)| (seq, t.saturating_sub(base) as u32))
-            .collect();
-        let _ = tx.send(C2A::PacketFeedback(gsa_protocol::control::PacketFeedback {
-            base_arrival_us: base,
-            samples,
         }));
     }
 
@@ -840,7 +775,8 @@ impl Client {
             Some(last_good_frame_id) => C2A::RequestRecovery { last_good_frame_id },
             None => C2A::RequestKeyframe,
         };
-        if let Some(tx) = &self.control_tx {
+        let tx = self.control_tx.lock().expect("control tx").clone();
+        if let Some(tx) = tx {
             let _ = tx.send(msg);
             Ok(())
         } else if let Some(stream) = self.control_send.as_mut() {
@@ -856,81 +792,68 @@ impl Client {
         self.dejitter.clone()
     }
 
-    /// Cadence-align an early frame while jitter is high. Never delays a
-    /// late frame, holds at most [`DEJITTER_MAX_US`], and is a no-op on a
-    /// clean link — latency is only spent where jitter already ruined it.
-    async fn dejitter_release(&mut self, capture_ts_us: u32, backlog: bool) {
+    /// Absorb delay variance by holding early frames to a capture-anchored
+    /// latency target — the window's p90 — so the spread is spent waiting,
+    /// not stuttering. Anchoring to capture time (never to the previous
+    /// release) makes drift structurally impossible: the release rate equals
+    /// the capture rate. Late frames never wait, a backlog is drained
+    /// unpaced, and a clean link pays nothing.
+    async fn dejitter_release(&mut self, capture_ts_us: u32, arrival_us: u64, backlog: bool) {
         const WIN: usize = 32;
         const JITTER_ON_US: u32 = 12_000;
         /// Hysteresis: a link hovering at the engage threshold must not flap
         /// the mode (and its log line) every few frames.
         const JITTER_OFF_US: u32 = 8_000;
-        const DEJITTER_MAX_US: u64 = 33_000;
+        const DEJITTER_MAX_US: u32 = 33_000;
         /// Startup transient (clock sync settling, burst catch-up) must not
         /// read as jitter.
         const WARMUP_US: u64 = 2_000_000;
         let now = self.clock.now_us();
         self.first_gate_us.get_or_insert(now);
-        if let Some(prev) = self.cadence_prev_ts {
-            let d = capture_ts_us.wrapping_sub(prev);
-            if d > 0 && d < 250_000 {
-                if self.cadence_win.len() == WIN {
-                    self.cadence_win.pop_front();
-                }
-                self.cadence_win.push_back(d);
-            }
-        }
-        self.cadence_prev_ts = Some(capture_ts_us);
-        if let Some(lat) = self.clock_sync.frame_latency_us(now, capture_ts_us) {
+        if let Some(lat) = self.clock_sync.frame_latency_us(arrival_us, capture_ts_us) {
             if self.jitter_win.len() == WIN {
                 self.jitter_win.pop_front();
             }
             self.jitter_win.push_back(lat);
         }
-        let ordered = |w: &std::collections::VecDeque<u32>| {
-            let mut v: Vec<u32> = w.iter().copied().collect();
-            v.sort_unstable();
-            v
-        };
-        let release = 'release: {
-            // Pacing is only sound at the queue head with nothing waiting:
-            // holding a frame while more are already queued builds a standing
-            // backlog that can never drain — the opposite of smoothing.
-            if backlog
-                || !self.dejitter.load(std::sync::atomic::Ordering::Relaxed)
-                || self.jitter_win.len() < WIN / 2
-            {
-                break 'release now;
-            }
-            let age = now.saturating_sub(self.first_gate_us.unwrap_or(now));
-            if age < WARMUP_US {
-                break 'release now;
-            }
-            let lat = ordered(&self.jitter_win);
-            let jitter = lat[lat.len() * 9 / 10] - lat[lat.len() / 10];
-            let high = if self.dejitter_active {
-                jitter >= JITTER_OFF_US
-            } else {
-                jitter >= JITTER_ON_US
-            };
-            if high != self.dejitter_active {
-                self.dejitter_active = high;
-                tracing::debug!(jitter_us = jitter, active = high, "dejitter mode");
-            }
-            if !high {
-                break 'release now;
-            }
-            let cadence = if self.cadence_win.is_empty() {
-                16_667
-            } else {
-                u64::from(ordered(&self.cadence_win)[self.cadence_win.len() / 2])
-            };
-            (self.last_release_us + cadence).min(now + DEJITTER_MAX_US)
-        };
-        if release > now {
-            tokio::time::sleep(std::time::Duration::from_micros(release - now)).await;
+        if self.jitter_win.len() < WIN / 2 {
+            return;
         }
-        self.last_release_us = self.clock.now_us();
+        let mut lat: Vec<u32> = self.jitter_win.iter().copied().collect();
+        lat.sort_unstable();
+        let (p10, p90) = (lat[lat.len() / 10], lat[lat.len() * 9 / 10]);
+        let jitter = p90 - p10;
+        self.last_jitter_us = jitter;
+        // Pacing is only sound at the queue head with nothing waiting:
+        // holding a frame while more are already queued builds a standing
+        // backlog that can never drain — the opposite of smoothing.
+        if backlog || !self.dejitter.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let age = now.saturating_sub(self.first_gate_us.unwrap_or(now));
+        if age < WARMUP_US {
+            return;
+        }
+        let high = if self.dejitter_active {
+            jitter >= JITTER_OFF_US
+        } else {
+            jitter >= JITTER_ON_US
+        };
+        if high != self.dejitter_active {
+            self.dejitter_active = high;
+            tracing::debug!(jitter_us = jitter, active = high, "dejitter mode");
+        }
+        if !high {
+            return;
+        }
+        let Some(lat_now) = self.clock_sync.frame_latency_us(now, capture_ts_us) else {
+            return;
+        };
+        let target = p90.min(p10.saturating_add(DEJITTER_MAX_US));
+        if lat_now < target {
+            let wait = u64::from((target - lat_now).min(DEJITTER_MAX_US));
+            tokio::time::sleep(std::time::Duration::from_micros(wait)).await;
+        }
     }
 
     /// Shared flag the embedder sets when its decoder rejects a frame; the
@@ -972,8 +895,10 @@ impl Client {
     #[must_use]
     pub fn stats(&self) -> StatsSummary {
         self.stats.summary(
-            self.reassembler.frames_dropped(),
-            self.reassembler.frames_recovered(),
+            self.reassembly_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.reassembly_recovered
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -988,5 +913,148 @@ impl Client {
     pub async fn close(self) {
         self.conn.close(0u32.into(), b"client done");
         self.endpoint.wait_idle().await;
+    }
+}
+
+/// Owns the datagram read loop, decoupled from frame release: arrivals are
+/// stamped, acknowledged, and reassembled the moment they land, regardless
+/// of what the present side is doing. Exits when the connection closes or
+/// the [`Client`] is dropped; audio decodes+plays here as a side effect.
+struct ReceiveTask {
+    conn: quinn::Connection,
+    clock: MediaClock,
+    reassembler: Reassembler,
+    control_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<C2A>>>>,
+    audio: std::sync::Arc<std::sync::Mutex<Option<audio::AudioReceive>>>,
+    frames_tx: tokio::sync::mpsc::UnboundedSender<ArrivedFrame>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Pending per-packet arrival samples (seq, arrival µs) for the next
+    /// `PacketFeedback` batch (~20 Hz).
+    feedback_batch: Vec<(u32, u64)>,
+    last_feedback_us: u64,
+    /// Highest transport seq seen (NACK gap detection).
+    highest_seq: Option<u32>,
+    /// Recently NACKed seqs — each is requested exactly once.
+    nacked: std::collections::VecDeque<u32>,
+}
+
+impl ReceiveTask {
+    async fn run(mut self) {
+        loop {
+            let datagram = match self.conn.read_datagram().await {
+                Ok(d) => d,
+                Err(quinn::ConnectionError::ApplicationClosed(_))
+                | Err(quinn::ConnectionError::LocallyClosed) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "datagram receive stopped");
+                    break;
+                }
+            };
+            match datagram
+                .first()
+                .copied()
+                .map(gsa_protocol::DatagramType::from_wire)
+            {
+                Some(Ok(gsa_protocol::DatagramType::Padding)) => {
+                    self.record_arrival(&datagram);
+                }
+                Some(Ok(gsa_protocol::DatagramType::Audio)) => {
+                    if let Some(a) = self.audio.lock().expect("audio slot").as_mut() {
+                        a.handle(&datagram);
+                    }
+                }
+                Some(Ok(gsa_protocol::DatagramType::Video)) => {
+                    self.record_arrival(&datagram);
+                    let (header, payload) = match VideoDatagramHeader::parse(&datagram) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "bad datagram dropped");
+                            continue;
+                        }
+                    };
+                    let arrival_us = self.clock.now_us();
+                    for frame in self.reassembler.push(header, payload) {
+                        if self
+                            .frames_tx
+                            .send(ArrivedFrame { frame, arrival_us })
+                            .is_err()
+                        {
+                            return; // client gone
+                        }
+                    }
+                    self.dropped.store(
+                        self.reassembler.frames_dropped(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.recovered.store(
+                        self.reassembler.frames_recovered(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                _ => tracing::warn!("unknown datagram dropped"),
+            }
+        }
+    }
+
+    /// Record one sequenced datagram's arrival and flush the feedback batch
+    /// at ~20 Hz (or when full). Fire-and-forget like the stats report.
+    fn record_arrival(&mut self, datagram: &[u8]) {
+        const FEEDBACK_INTERVAL_US: u64 = 50_000;
+        const MAX_BATCH: usize = 512;
+        let Ok(seq) = gsa_protocol::datagram::read_seq(datagram) else {
+            return;
+        };
+        let now = self.clock.now_us();
+        self.feedback_batch.push((seq, now));
+        // Gap in send order = loss (or reordering): re-request immediately.
+        // One RTT beats any parity ratio, and a spurious NACK for a merely
+        // reordered datagram costs one duplicate the reassembler ignores.
+        if let Some(high) = self.highest_seq {
+            let ahead = seq.wrapping_sub(high);
+            if ahead > 1 && ahead <= 64 {
+                let missing: Vec<u32> = (1..ahead)
+                    .map(|i| high.wrapping_add(i))
+                    .filter(|s| !self.nacked.contains(s))
+                    .collect();
+                if !missing.is_empty() {
+                    tracing::debug!(count = missing.len(), first = missing[0], "nack sent");
+                    for &m in &missing {
+                        if self.nacked.len() == 512 {
+                            self.nacked.pop_front();
+                        }
+                        self.nacked.push_back(m);
+                    }
+                    if let Some(tx) = self.control_tx.lock().expect("control tx").as_ref() {
+                        let _ = tx.send(C2A::Nack { seqs: missing });
+                    }
+                }
+            }
+            if (1..u32::MAX / 2).contains(&ahead) {
+                self.highest_seq = Some(seq);
+            }
+        } else {
+            self.highest_seq = Some(seq);
+        }
+        if self.feedback_batch.len() < MAX_BATCH
+            && now.saturating_sub(self.last_feedback_us) < FEEDBACK_INTERVAL_US
+        {
+            return;
+        }
+        self.last_feedback_us = now;
+        let Some(tx) = self.control_tx.lock().expect("control tx").clone() else {
+            self.feedback_batch.clear();
+            return;
+        };
+        let base = self.feedback_batch.first().map_or(now, |&(_, t)| t);
+        let samples = self
+            .feedback_batch
+            .drain(..)
+            .map(|(seq, t)| (seq, t.saturating_sub(base) as u32))
+            .collect();
+        let _ = tx.send(C2A::PacketFeedback(gsa_protocol::control::PacketFeedback {
+            base_arrival_us: base,
+            samples,
+        }));
     }
 }
