@@ -216,6 +216,7 @@ impl RenderSource for DesktopCapture {
             winrt_device,
             size,
             buffers: sink_mode,
+            ring_saturated: 0,
         }));
         let clock = self.clock.clone();
         let frame_sink = sink.clone();
@@ -310,6 +311,9 @@ struct D3dState {
     winrt_device: IDirect3DDevice,
     size: SizeInt32,
     buffers: Buffers,
+    /// Frames dropped because every ring texture was still referenced
+    /// downstream — a saturated encoder shows up here, not in the sink stats.
+    ring_saturated: u64,
 }
 
 impl std::fmt::Debug for D3dState {
@@ -438,7 +442,10 @@ impl D3dState {
         let Some(slot) = self.free_slot() else {
             // Every ring texture is still referenced downstream. Dropping this
             // frame is exactly what the depth-1 sink would have done anyway.
-            tracing::trace!("gpu ring saturated; frame dropped");
+            self.ring_saturated += 1;
+            if self.ring_saturated.is_multiple_of(30) {
+                tracing::debug!(dropped = self.ring_saturated, "gpu ring saturated");
+            }
             return Ok(());
         };
         // SAFETY: both textures are the same size and format; `slot` is a

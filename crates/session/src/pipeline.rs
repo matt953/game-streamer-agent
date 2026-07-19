@@ -593,11 +593,15 @@ pub fn start(
             // Sampled latency span (spec 01: "where did the milliseconds go").
             if sent - logged >= 120 {
                 logged = sent;
-                let encode_ms =
-                    (chunk.encode_done_ts_us.saturating_sub(chunk.capture_ts_us)) as f64 / 1000.0;
+                // Split so the log names the stall site: `wait_ms` is
+                // capture→encode-thread pickup (WGC delivery + ring dwell),
+                // `enc_ms` is submit→bitstream (map/copy stall + hardware).
+                let wait_ms = (encode_in_us.saturating_sub(chunk.capture_ts_us)) as f64 / 1000.0;
+                let enc_ms = (chunk.encode_done_ts_us.saturating_sub(encode_in_us)) as f64 / 1000.0;
                 tracing::debug!(
                     frames = sent,
-                    encode_ms,
+                    wait_ms,
+                    enc_ms,
                     size = chunk.data.len(),
                     pace_mbps = rate * 8.0 / 1_000_000.0,
                     send_spread_ms = frame_start.elapsed().as_secs_f64() * 1000.0,

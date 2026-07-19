@@ -13,6 +13,8 @@
 #[cfg(windows)]
 mod encoder;
 #[cfg(windows)]
+mod nvml;
+#[cfg(windows)]
 mod session;
 #[cfg(windows)]
 mod sys;

@@ -59,6 +59,7 @@ pub struct NvencEncoder {
     next_frame_id: FrameId,
     pending: Option<EncodedChunk>,
     force_idr: bool,
+    frames_submitted: u64,
 }
 
 impl std::fmt::Debug for NvencEncoder {
@@ -80,6 +81,7 @@ impl NvencEncoder {
             next_frame_id: FrameId::ZERO,
             pending: None,
             force_idr: false,
+            frames_submitted: 0,
         }
     }
 
@@ -171,10 +173,32 @@ impl Encoder for NvencEncoder {
         let capture_ts_us = frame.capture_ts_us;
 
         let session = self.session(d3d.device())?;
+        // Phase timings answer "who is slow": `map` blocks behind the GPU's
+        // 3D queue (a busy game lands here), `lock` blocks on the encode ASIC.
+        let t0 = std::time::Instant::now();
         let mapped = session.map(d3d.texture(), mode.width, mode.height)?;
+        let t_map = t0.elapsed();
         session.encode(&mapped, mode, frame_id.wire(), idr)?;
+        let t_enc = t0.elapsed() - t_map;
         let (data, was_idr) = session.take_bitstream()?;
+        let t_lock = t0.elapsed() - t_map - t_enc;
         drop(mapped);
+
+        self.frames_submitted += 1;
+        if self.frames_submitted.is_multiple_of(120) {
+            let gpu = crate::nvml::Nvml::get().map(crate::nvml::Nvml::sample);
+            tracing::debug!(
+                map_ms = t_map.as_secs_f64() * 1000.0,
+                enc_ms = t_enc.as_secs_f64() * 1000.0,
+                lock_ms = t_lock.as_secs_f64() * 1000.0,
+                gpu_util = gpu.and_then(|s| s.gpu_util),
+                enc_util = gpu.and_then(|s| s.encoder_util),
+                sm_mhz = gpu.and_then(|s| s.sm_mhz),
+                temp_c = gpu.and_then(|s| s.temp_c),
+                throttle = gpu.map(|s| s.throttle_names()).as_deref(),
+                "nvenc health"
+            );
+        }
 
         self.force_idr = false;
         self.next_frame_id = frame_id.next();
