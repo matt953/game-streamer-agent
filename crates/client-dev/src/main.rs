@@ -84,6 +84,12 @@ struct Cli {
     /// physical hardware.
     #[arg(long)]
     moonlight_synthetic_pad: bool,
+    /// Announce the pad as this family instead of what it really is. Hosts
+    /// build a different virtual device per family and support different
+    /// feedback on each, so this isolates "the host will not send X" from
+    /// "the host will not send X *to this kind of pad*".
+    #[arg(long, value_parser = ["auto", "xbox", "dualsense", "dualshock", "generic"])]
+    moonlight_pad_kind: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -111,6 +117,7 @@ fn main() -> Result<()> {
             cli.sw_decode,
             cli.moonlight_seconds,
             cli.moonlight_synthetic_pad,
+            cli.moonlight_pad_kind.as_deref(),
         );
     }
 

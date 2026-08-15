@@ -228,6 +228,7 @@ impl Drop for SyntheticPad {
 /// from a different protocol, and everything after — the reference gate,
 /// de-jitter release, decode, and presentation — is the same code the gsa
 /// backend runs. A picture here is evidence the seam holds.
+#[allow(clippy::too_many_arguments, reason = "dev harness flags, not an API")]
 pub fn run_moonlight(
     addr: std::net::SocketAddr,
     app_id: u32,
@@ -235,6 +236,7 @@ pub fn run_moonlight(
     force_sw: bool,
     seconds: u64,
     synthetic_pad: bool,
+    pad_kind: Option<&str>,
 ) -> Result<()> {
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -253,9 +255,25 @@ pub fn run_moonlight(
             )
         })?;
 
-    let mut app = App::default();
+    let mut app = App {
+        pad_kind_override: pad_kind.and_then(parse_pad_kind),
+        ..App::default()
+    };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// A pad family named on the command line, for announcing something other than
+/// what is really plugged in.
+fn parse_pad_kind(name: &str) -> Option<gsa_client_core::PadKind> {
+    match name {
+        "xbox" => Some(gsa_client_core::PadKind::Xbox),
+        "dualsense" => Some(gsa_client_core::PadKind::DualSense),
+        "dualshock" => Some(gsa_client_core::PadKind::DualShock4),
+        "generic" => Some(gsa_client_core::PadKind::Generic),
+        // "auto", and anything unrecognised, announces the pad as it is.
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments, reason = "dev harness flags, not an API")]
@@ -548,6 +566,8 @@ struct App {
     pad_announced: bool,
     /// Non-zero once the host asks for motion.
     motion_hz: u16,
+    /// Announce this family rather than the pad's own, for interop testing.
+    pad_kind_override: Option<gsa_client_core::PadKind>,
     /// How long to wait for the platform framework to find the controller
     /// before falling back to the portable path. `None` once the window is up.
     portable_pad_after: Option<std::time::Instant>,
@@ -631,7 +651,23 @@ impl ApplicationHandler<AppEvent> for App {
                 // Announce before anything else: a host that has not been told
                 // what the pad is builds a plain one and then drops motion,
                 // touch and battery for it without complaint.
-                input.announce_pad(0, pad.profile());
+                let mut profile = pad.profile();
+                if let Some(kind) = self.pad_kind_override {
+                    profile.kind = kind;
+                    // Capabilities have to move with the family. Hosts promote
+                    // any pad advertising motion or a touchpad to a
+                    // PlayStation-style device *whatever* family it claims,
+                    // because those features need somewhere to go — so an
+                    // Xbox pad that still advertises them is not a test of
+                    // anything.
+                    if !matches!(
+                        kind,
+                        gsa_client_core::PadKind::DualSense | gsa_client_core::PadKind::DualShock4
+                    ) {
+                        profile.caps = gsa_client_core::PadCaps::RUMBLE;
+                    }
+                }
+                input.announce_pad(0, profile);
                 self.pad_announced = true;
             }
             let events = pad.poll(self.motion_hz > 0);
