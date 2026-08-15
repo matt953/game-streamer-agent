@@ -29,7 +29,10 @@ async fn main() {
     let addr: std::net::SocketAddr = addr.parse().expect("host:port");
     let app_id: u32 = app.parse().expect("app id");
     let seconds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(15);
-    let client_id = "0123456789ABCDEF";
+    // Overridable so a wedged host can be probed with a fresh session slot.
+    let client_id_owned =
+        std::env::var("GSA_CLIENT_ID").unwrap_or_else(|_| "0123456789ABCDEF".into());
+    let client_id: &str = &client_id_owned;
 
     let identity = ClientIdentity::from_key_pem(
         &std::fs::read_to_string(store("gsa-moonlight-dev-key.pem")).expect("paired identity"),
@@ -40,7 +43,7 @@ async fn main() {
     let info = gsa_backend_moonlight::probe(addr, client_id)
         .await
         .expect("probe");
-    let session = PairedSession::new(
+    let mut session = PairedSession::new(
         std::net::SocketAddr::new(addr.ip(), info.https_port),
         host_cert,
         identity,
@@ -49,7 +52,7 @@ async fn main() {
 
     let mode = StreamMode::default();
     let mut stream =
-        match gsa_backend_moonlight::start(&session, addr.ip(), app_id, mode, 10_000).await {
+        match gsa_backend_moonlight::start(&mut session, addr.ip(), app_id, mode, 10_000).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("could not start: {e}");

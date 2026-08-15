@@ -103,6 +103,24 @@ impl PairedSession {
         xml_field(&body, "cancel").map(|_| ())
     }
 
+    /// Start using a freshly generated session id.
+    ///
+    /// Recovery only. A host keeps per-session state keyed to this id, and a
+    /// client that died without tearing down leaves a dead session behind
+    /// that a later launch silently inherits. Nothing else clears it, so
+    /// moving to a new id is how a client heals itself. Permissions follow
+    /// the certificate, not this id, so a rotated client stays authorised.
+    pub fn rotate_session_id(&mut self) {
+        self.client_id = crate::hex::encode(&crate::pair::random_16()[..8]);
+        tracing::info!(client_id = %self.client_id, "rotated session id to clear a dead session");
+    }
+
+    /// The id this session is currently using.
+    #[must_use]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
     async fn get(&self, path_and_query: &str) -> Result<Vec<u8>> {
         tls::get(
             self.tls_addr,

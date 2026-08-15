@@ -86,7 +86,11 @@ async fn main() {
                         n.control_v2()
                     );
                     println!("    ref invalidation: {}", n.reference_invalidation);
-                    println!("    ping payload: {}", n.ping_payload.is_some());
+                    println!(
+                        "    ping payload: {:?}",
+                        n.ping_payload
+                            .map(|p| String::from_utf8_lossy(&p).to_string())
+                    );
                     println!("    connect data: {:?}", n.connect_data);
 
                     // Bring up the control channel. This is the real test of

@@ -54,6 +54,10 @@ pub struct MoonlightStream {
     pub dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Frames rebuilt from parity — loss that cost nothing visible.
     pub recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Video datagrams seen. Used to tell "the host is streaming" from "the
+    /// handshake succeeded and nothing is coming", which look identical from
+    /// every other signal.
+    datagrams: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// What the host says over the control channel: rumble, termination, and
     /// features we do not act on yet. Drain it — a caller that ignores this
     /// still gets a stream, but loses the host's own account of what happened.
@@ -63,6 +67,21 @@ pub struct MoonlightStream {
 }
 
 impl MoonlightStream {
+    /// Wait until the host actually starts sending, or give up.
+    ///
+    /// Counted on datagrams rather than assembled frames so a host that is
+    /// sending but losing shards still reads as alive.
+    async fn wait_for_media(&self, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if self.datagrams.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     /// Claim the frame stream. Returns `None` if already taken.
     ///
     /// Keep the `MoonlightStream` itself alive for as long as you read from
@@ -90,14 +109,38 @@ impl Drop for Worker {
 ///
 /// Returns once media is negotiated; frames start arriving on the channel.
 pub async fn start(
-    session: &PairedSession,
+    session: &mut PairedSession,
     host_ip: std::net::IpAddr,
     app_id: u32,
     mode: StreamMode,
     bitrate_kbps: u32,
 ) -> Result<MoonlightStream> {
-    let launched = session.launch(app_id, mode).await?;
-    connect(&launched, host_ip, mode, bitrate_kbps).await
+    // How long a healthy host takes to start sending. Generous: a slow host
+    // starting an app is normal, a host that will never send is not.
+    const FIRST_MEDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    for attempt in 0..2 {
+        if let Err(e) = session.cancel().await {
+            tracing::debug!(error = %e, "nothing to clear before launch");
+        }
+        let launched = session.launch(app_id, mode).await?;
+        let stream = connect(&launched, host_ip, mode, bitrate_kbps).await?;
+        if stream.wait_for_media(FIRST_MEDIA_TIMEOUT).await {
+            return Ok(stream);
+        }
+        // Everything handshook and no media came: the host is holding a dead
+        // session under our id. Tearing this one down and moving to a fresh
+        // id is the only thing observed to clear it.
+        drop(stream);
+        let _ = session.cancel().await;
+        if attempt == 0 {
+            tracing::warn!("host accepted the session but sent no media; retrying with a fresh id");
+            session.rotate_session_id();
+        }
+    }
+    Err(Error::Session(
+        "host accepted the session but never sent media, even after a retry".into(),
+    ))
 }
 
 async fn connect(
@@ -144,6 +187,7 @@ async fn connect(
     let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let recovered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let datagrams = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let video_addr = std::net::SocketAddr::new(host_ip, negotiated.video_port);
@@ -157,6 +201,7 @@ async fn connect(
     let worker_stop = stop.clone();
     let worker_dropped = dropped.clone();
     let worker_recovered = recovered.clone();
+    let worker_datagrams = datagrams.clone();
     std::thread::Builder::new()
         .name("moonlight-video".into())
         .spawn(move || {
@@ -167,6 +212,7 @@ async fn connect(
                 &worker_stop,
                 &worker_dropped,
                 &worker_recovered,
+                &worker_datagrams,
             );
         })
         .map_err(|e| Error::Transport(format!("spawn video thread: {e}")))?;
@@ -180,6 +226,7 @@ async fn connect(
         }),
         dropped,
         recovered,
+        datagrams,
         _worker: Worker {
             commands: command_tx,
             stop,
@@ -199,6 +246,7 @@ fn receive_video(
     stop: &std::sync::atomic::AtomicBool,
     dropped: &std::sync::atomic::AtomicU64,
     recovered: &std::sync::atomic::AtomicU64,
+    datagrams: &std::sync::atomic::AtomicU64,
 ) {
     const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     let clock = gsa_core::time::MediaClock::new();
@@ -223,6 +271,7 @@ fn receive_video(
             }
         };
         let arrival_us = clock.now_us();
+        datagrams.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         depacketizer.push(&buf[..n]);
         while let Some(event) = depacketizer.next_event() {
             match event {

@@ -22,7 +22,10 @@ async fn main() {
     };
     let addr: std::net::SocketAddr = addr.parse().expect("host:port");
     let app_id: u32 = app.parse().expect("app id");
-    let client_id = "0123456789ABCDEF";
+    // Overridable so a wedged host can be probed with a fresh session slot.
+    let client_id_owned =
+        std::env::var("GSA_CLIENT_ID").unwrap_or_else(|_| "0123456789ABCDEF".into());
+    let client_id: &str = &client_id_owned;
 
     let identity = ClientIdentity::from_key_pem(
         &std::fs::read_to_string(store("gsa-moonlight-dev-key.pem")).expect("paired identity"),
