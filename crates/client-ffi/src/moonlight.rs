@@ -252,10 +252,17 @@ pub(crate) fn run_session(
             // Host feedback (rumble today) is drained off the frame path so a
             // quiet stream cannot delay it indefinitely.
             while let Ok(message) = stream.events.try_recv() {
-                if let Some(gsa_client_core::BackendEvent::Feedback(
+                let Some(event) = message.neutral() else {
+                    continue;
+                };
+                // The full effect, not just its existence: amplitudes, colours
+                // and motion requests all reach the embedder here.
+                crate::fire_pad_feedback(&cbs, &event);
+                if let gsa_client_core::BackendEvent::Feedback(
                     gsa_client_core::GamepadFeedback::Rumble { seat, .. },
-                )) = message.neutral()
+                ) = event
                 {
+                    // Kept for embedders written against the older callback.
                     crate::fire_notification(&cbs, crate::GSA_NOTIFY_RUMBLE, u32::from(seat));
                 }
             }

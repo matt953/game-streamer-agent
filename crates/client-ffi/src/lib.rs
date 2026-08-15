@@ -190,6 +190,18 @@ pub struct GsaCallbacks {
     /// gamepad kinds). Fires on a dedicated thread. Unknown kinds should be
     /// ignored so new ones stay backward-compatible.
     pub on_notification: Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32, arg: u32)>,
+    /// The host asked a controller to do something: rumble, trigger motors, an
+    /// LED colour, or to start sending motion. `kind` is a
+    /// `GSA_PAD_FEEDBACK_*` value and `a`/`b`/`c` are kind-specific — see each
+    /// constant. Fires on the session's control thread.
+    ///
+    /// Render only what the pad actually has: the session's capabilities
+    /// (`gsa_session_pad_caps`) say what the wire carries, not what is in the
+    /// user's hands. Unknown kinds must be ignored so later ones stay
+    /// backward-compatible.
+    pub on_pad_feedback: Option<
+        unsafe extern "C" fn(ctx: *mut c_void, kind: u32, seat: u32, a: u32, b: u32, c: u32),
+    >,
     /// Periodic encoder/network telemetry (~1 Hz): agent target + emitted
     /// bitrate + manual ceiling + ABR's network estimate (0 = unmeasured),
     /// client received goodput (all bits/s), frames dropped incomplete
@@ -217,6 +229,48 @@ pub const GSA_NOTIFY_GAMEPAD_CONNECTED: u32 = 1;
 /// A richer feedback callback is the right fix (see spec 16, task 52).
 pub const GSA_NOTIFY_RUMBLE: u32 = 3;
 pub const GSA_NOTIFY_GAMEPAD_DISCONNECTED: u32 = 2;
+
+/// Kinds for [`GsaCallbacks::on_pad_feedback`].
+///
+/// Body rumble: `a` is the low-frequency motor, `b` the high-frequency one,
+/// both 0..=65535. A zero pair is a **stop** and must be honoured — the host
+/// ends an effect explicitly rather than giving it a duration.
+pub const GSA_PAD_FEEDBACK_RUMBLE: u32 = 1;
+/// Trigger motors, independent of body rumble: `a` left, `b` right.
+pub const GSA_PAD_FEEDBACK_TRIGGER_RUMBLE: u32 = 2;
+/// Lightbar colour: `a`, `b`, `c` are red, green and blue, 0..=255.
+pub const GSA_PAD_FEEDBACK_LED: u32 = 3;
+/// The host wants motion samples: `a` is the rate in Hz, `b` is 0 for the
+/// gyroscope and 1 for the accelerometer. **Do not sample before this
+/// arrives** — motion is opt-in on every protocol that carries it, and an
+/// unread stream is battery spent for nothing.
+pub const GSA_PAD_FEEDBACK_MOTION_REQUEST: u32 = 4;
+
+/// Pad families for [`gsa_announce_gamepad`]. Announce what the user actually
+/// holds: hosts build a matching virtual device, and the choice decides which
+/// features exist for the whole session.
+pub const GSA_PAD_KIND_GENERIC: u32 = 0;
+pub const GSA_PAD_KIND_XBOX: u32 = 1;
+pub const GSA_PAD_KIND_DUALSHOCK4: u32 = 2;
+pub const GSA_PAD_KIND_DUALSENSE: u32 = 3;
+pub const GSA_PAD_KIND_SWITCH_PRO: u32 = 4;
+
+/// Contact phases for [`gsa_send_gamepad_touch`]. `CANCEL` is not `UP`: the
+/// contact ended without the user lifting, and a game that treats it as a
+/// release fires the action they aborted.
+pub const GSA_TOUCH_DOWN: u32 = 0;
+pub const GSA_TOUCH_MOVE: u32 = 1;
+pub const GSA_TOUCH_UP: u32 = 2;
+pub const GSA_TOUCH_CANCEL: u32 = 3;
+
+/// Battery states for [`gsa_send_gamepad_battery`].
+pub const GSA_BATTERY_UNKNOWN: u32 = 0;
+pub const GSA_BATTERY_NOT_PRESENT: u32 = 1;
+pub const GSA_BATTERY_DISCHARGING: u32 = 2;
+pub const GSA_BATTERY_CHARGING: u32 = 3;
+pub const GSA_BATTERY_FULL: u32 = 4;
+/// Percentage meaning "there is a battery, but its level is unknown".
+pub const GSA_BATTERY_PERCENT_UNKNOWN: u32 = 255;
 
 /// Raw `ctx` isn't `Send`; the embedder owns its thread-safety, so we carry the
 /// callback set across the receive-thread boundary explicitly.
@@ -549,6 +603,175 @@ pub unsafe extern "C" fn gsa_send_gamepad(
             axes: [lx, ly, rx, ry, lt, rt, 0, 0],
             ts_us: now_us(),
         })]);
+    }
+}
+
+/// Tell the host what controller occupies `seat`, before sending any state.
+///
+/// **Announce first, and announce again on every reconnect.** A host plugs a
+/// *default* pad the moment state arrives for a seat, and then ignores a later
+/// announcement for a seat it already has — so a snapshot that beats this call
+/// leaves the seat as the wrong device for the whole session, with motion,
+/// touch and battery silently dropped. This call clears the seat first, so
+/// calling it late recovers rather than being ignored.
+///
+/// `kind` is a `GSA_PAD_KIND_*` value and `caps` is the OR of the `GSA_PAD_*`
+/// flags the physical pad has. Report both honestly: hosts decide what virtual
+/// device to build from them, and claiming a capability the pad lacks produces
+/// feedback nothing can render.
+///
+/// # Safety
+/// `session` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_announce_gamepad(
+    session: *mut GsaSession,
+    seat: u8,
+    kind: u32,
+    caps: u32,
+) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: see `gsa_send_gamepad`.
+    let session = unsafe { &*session };
+    if let Some(input) = &session.input {
+        let kind = match kind {
+            GSA_PAD_KIND_XBOX => gsa_client_core::PadKind::Xbox,
+            GSA_PAD_KIND_DUALSHOCK4 => gsa_client_core::PadKind::DualShock4,
+            GSA_PAD_KIND_DUALSENSE => gsa_client_core::PadKind::DualSense,
+            GSA_PAD_KIND_SWITCH_PRO => gsa_client_core::PadKind::SwitchPro,
+            _ => gsa_client_core::PadKind::Generic,
+        };
+        let caps = gsa_client_core::PadCaps::from_bits(caps as u16);
+        input.announce_pad(seat, gsa_client_core::GamepadProfile::new(kind, caps));
+    }
+}
+
+/// Send one motion sample for `seat`.
+///
+/// **Only after `GSA_PAD_FEEDBACK_MOTION_REQUEST`**, and at the rate it asked
+/// for. Gyroscope values are degrees per second; acceleration is m/s²
+/// **including gravity**, so a pad lying still reads about 9.81 on one axis
+/// rather than zero. A reading of zero at rest means the sensors were never
+/// switched on — on some platforms they must be enabled explicitly, and an
+/// inactive sensor looks exactly like a perfectly still hand.
+///
+/// # Safety
+/// `session` must be a live handle.
+#[unsafe(no_mangle)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a C ABI takes scalars, not structs"
+)]
+pub unsafe extern "C" fn gsa_send_gamepad_motion(
+    session: *mut GsaSession,
+    seat: u8,
+    gyro_x: f32,
+    gyro_y: f32,
+    gyro_z: f32,
+    accel_x: f32,
+    accel_y: f32,
+    accel_z: f32,
+) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: see `gsa_send_gamepad`.
+    let session = unsafe { &*session };
+    if let Some(input) = &session.input {
+        input.send(vec![InputEvent::GamepadMotion {
+            seat,
+            gyro: [gyro_x, gyro_y, gyro_z],
+            accel: [accel_x, accel_y, accel_z],
+            ts_us: 0,
+        }]);
+    }
+}
+
+/// Send one contact on the pad's own touch surface.
+///
+/// `phase` is a `GSA_TOUCH_*` value; `x`/`y` are normalised [0,1] from the
+/// top-left of the surface, and `pressure` [0,1] (use 1.0 for a surface that
+/// reports contact without pressure). `pointer` identifies the finger and must
+/// stay stable for the life of that contact.
+///
+/// # Safety
+/// `session` must be a live handle.
+#[unsafe(no_mangle)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a C ABI takes scalars, not structs"
+)]
+pub unsafe extern "C" fn gsa_send_gamepad_touch(
+    session: *mut GsaSession,
+    seat: u8,
+    pointer: u8,
+    phase: u32,
+    x: f32,
+    y: f32,
+    pressure: f32,
+) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: see `gsa_send_gamepad`.
+    let session = unsafe { &*session };
+    if let Some(input) = &session.input {
+        let phase = match phase {
+            GSA_TOUCH_DOWN => gsa_protocol::input::TouchPhase::Down,
+            GSA_TOUCH_MOVE => gsa_protocol::input::TouchPhase::Move,
+            GSA_TOUCH_UP => gsa_protocol::input::TouchPhase::Up,
+            GSA_TOUCH_CANCEL => gsa_protocol::input::TouchPhase::Cancel,
+            // An unknown phase is dropped rather than guessed: reporting the
+            // wrong one strands a contact down or releases one still held.
+            _ => return,
+        };
+        input.send(vec![InputEvent::GamepadTouch {
+            seat,
+            pointer,
+            phase,
+            x,
+            y,
+            pressure,
+            ts_us: 0,
+        }]);
+    }
+}
+
+/// Report the pad's charge for `seat`.
+///
+/// `state` is a `GSA_BATTERY_*` value; `percent` is 0..=100, or
+/// [`GSA_BATTERY_PERCENT_UNKNOWN`] when the pad reports a state but no level —
+/// which is not the same as an empty battery. Send on change, not per frame.
+///
+/// # Safety
+/// `session` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_send_gamepad_battery(
+    session: *mut GsaSession,
+    seat: u8,
+    state: u32,
+    percent: u32,
+) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: see `gsa_send_gamepad`.
+    let session = unsafe { &*session };
+    if let Some(input) = &session.input {
+        let state = match state {
+            GSA_BATTERY_NOT_PRESENT => gsa_protocol::input::BatteryState::NotPresent,
+            GSA_BATTERY_DISCHARGING => gsa_protocol::input::BatteryState::Discharging,
+            GSA_BATTERY_CHARGING => gsa_protocol::input::BatteryState::Charging,
+            GSA_BATTERY_FULL => gsa_protocol::input::BatteryState::Full,
+            _ => gsa_protocol::input::BatteryState::Unknown,
+        };
+        input.send(vec![InputEvent::GamepadBattery {
+            seat,
+            state,
+            percent: (percent <= 100).then_some(percent as u8),
+            ts_us: 0,
+        }]);
     }
 }
 
@@ -888,6 +1111,57 @@ pub(crate) fn fire_notification(cbs: &GsaCallbacks, kind: u32, arg: u32) {
         // SAFETY: `ctx` valid for the session per the embedder contract.
         unsafe { cb(cbs.ctx, kind, arg) };
     }
+}
+
+/// Deliver one piece of controller feedback to the embedder, if it registered
+/// a callback. Backend-neutral: the caller has already translated the wire
+/// into [`gsa_client_core::BackendEvent`], so every protocol lands here in the
+/// same shape.
+pub(crate) fn fire_pad_feedback(cbs: &GsaCallbacks, event: &gsa_client_core::BackendEvent) {
+    let Some(cb) = cbs.on_pad_feedback else {
+        return;
+    };
+    use gsa_client_core::{BackendEvent, GamepadFeedback, MotionSensor};
+    let (kind, seat, a, b, c) = match *event {
+        BackendEvent::Feedback(GamepadFeedback::Rumble { seat, low, high }) => (
+            GSA_PAD_FEEDBACK_RUMBLE,
+            seat,
+            u32::from(low),
+            u32::from(high),
+            0,
+        ),
+        BackendEvent::Feedback(GamepadFeedback::TriggerRumble { seat, left, right }) => (
+            GSA_PAD_FEEDBACK_TRIGGER_RUMBLE,
+            seat,
+            u32::from(left),
+            u32::from(right),
+            0,
+        ),
+        BackendEvent::Feedback(GamepadFeedback::Led { seat, rgb }) => (
+            GSA_PAD_FEEDBACK_LED,
+            seat,
+            u32::from(rgb[0]),
+            u32::from(rgb[1]),
+            u32::from(rgb[2]),
+        ),
+        BackendEvent::MotionRequested {
+            seat,
+            sensor,
+            rate_hz,
+        } => (
+            GSA_PAD_FEEDBACK_MOTION_REQUEST,
+            seat,
+            u32::from(rate_hz),
+            u32::from(sensor == MotionSensor::Accel),
+            0,
+        ),
+        // Trigger effects are an opaque vendor blob and do not fit this
+        // shape; they need their own entry point rather than a lossy
+        // encoding here, and no host we support emits them yet.
+        _ => return,
+    };
+    // SAFETY: `ctx` valid for the session per the embedder contract.
+    unsafe { cb(cbs.ctx, kind, u32::from(seat), a, b, c) };
 }
 
 /// Carries a raw `ctx` onto the audio thread. Same embedder contract as
