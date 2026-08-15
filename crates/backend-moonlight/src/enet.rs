@@ -48,6 +48,29 @@ pub enum HostMessage {
     Other { kind: u16 },
 }
 
+impl HostMessage {
+    /// The backend-neutral form, for embedders that should not care which
+    /// protocol produced it. `None` for messages that carry no meaning
+    /// outside this backend (connection lifecycle, unimplemented features).
+    #[must_use]
+    pub fn neutral(&self) -> Option<gsa_client_backend_api::BackendEvent> {
+        match *self {
+            Self::Rumble {
+                controller,
+                low_frequency,
+                high_frequency,
+            } => Some(gsa_client_backend_api::BackendEvent::Rumble {
+                // Controller numbers are u16 on this wire and a seat index
+                // everywhere else; pads past 255 do not exist.
+                seat: controller.min(u16::from(u8::MAX)) as u8,
+                low: low_frequency,
+                high: high_frequency,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// What the caller can ask the control channel to send.
 #[derive(Debug, Clone)]
 pub enum Command {
