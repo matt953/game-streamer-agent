@@ -7,6 +7,7 @@
 mod audio;
 mod decode;
 mod reassembly;
+mod session;
 pub mod stats;
 
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
@@ -17,6 +18,7 @@ pub use gsa_client_backend_api::{
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
 pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
 pub use reassembly::Reassembler;
+pub use session::StreamSession;
 pub use stats::{ClockSync, LatencyStats, StatsSummary};
 
 use gsa_core::media::VideoMode;
@@ -219,52 +221,20 @@ pub struct Client {
     /// shared with the receive task, which sends NACKs and feedback through it.
     control_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<C2A>>>>,
     clock: MediaClock,
-    clock_sync: ClockSync,
     /// Moves into the receive task when it spawns.
     reassembler: Option<Reassembler>,
-    /// Completed frames from the receive task, awaiting the gate.
-    frames_rx: Option<tokio::sync::mpsc::UnboundedReceiver<BackendFrame>>,
-    /// How the gate asks the agent to repair a broken reference chain — the
-    /// same seam every backend uses (spec 16).
-    recovery: std::sync::Arc<dyn RecoverySink>,
+    /// Handed to the receive task when it spawns; the matching receiver lives
+    /// in [`StreamSession`].
+    frames_tx: Option<tokio::sync::mpsc::UnboundedSender<BackendFrame>>,
+    /// Everything that happens after a frame is whole — the gate, de-jitter,
+    /// and health accounting shared with every other backend (spec 16).
+    stream: StreamSession,
     /// Reassembler drop/recovery counters, mirrored out of the receive task.
     reassembly_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     reassembly_recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    stats: LatencyStats,
-    present: stats::PresentStats,
-    presented_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, std::time::Instant)>,
-    presented_tx: tokio::sync::mpsc::UnboundedSender<(u32, std::time::Instant)>,
     session: Option<SessionParams>,
-    /// Frame id of the last frame handed to the decoder (gap detection).
-    last_frame_id: Option<u32>,
-    /// Last frame actually DELIVERED for decoding — recovery requests must
-    /// cite a frame the decoder truly has; frames skipped while awaiting
-    /// resync were never decoded and are unusable as references.
-    last_delivered_id: Option<u32>,
-    /// Client-clock µs of the last keyframe request (rate limiting).
-    last_keyframe_request_us: u64,
     /// Client-clock µs of the last `StatsReport` sent (ABR signal, ~2 Hz).
     last_stats_report_us: u64,
-    /// True while the P-frame reference chain is broken (lost/undecodable
-    /// frame); we skip P-frames until a keyframe — or an agent-announced
-    /// recovery point — resyncs the decoder (spec 04).
-    awaiting_idr: bool,
-    /// Agent-announced first-safe frame id + 1 (0 = none), written by the
-    /// control reader task on [`SessionEvent::RecoveryPoint`].
-    recovery_point: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Set by the embedder when its decoder rejected a delivered frame: the
-    /// reference chain is broken in ways delivery tracking cannot see.
-    decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Adaptive de-jitter (default on): early frames are held to a
-    /// capture-anchored latency target only while measured jitter is high;
-    /// late frames never wait.
-    dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Recent capture→arrival latencies (µs) — their spread is the jitter.
-    jitter_win: std::collections::VecDeque<u32>,
-    /// Last measured p90−p10 latency spread (µs), for the stats report.
-    last_jitter_us: u32,
-    dejitter_active: bool,
-    first_gate_us: Option<u64>,
     /// Audio receive+decode, set by [`Client::take_audio_output`] and read by
     /// the receive task; `None` means audio datagrams are dropped.
     audio: std::sync::Arc<std::sync::Mutex<Option<audio::AudioReceive>>>,
@@ -330,42 +300,36 @@ impl Client {
         }
 
         let clock = MediaClock::new();
-        let presented_channel = tokio::sync::mpsc::unbounded_channel();
         let control_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let recovered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The channel is made here rather than when the receive task spawns,
+        // so the embedder can take handles (present sink, de-jitter switch)
+        // before the first frame arrives.
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut client = Self {
             endpoint,
             conn,
             control_send: Some(control_send),
             control_recv: Some(control_recv),
-            recovery: std::sync::Arc::new(GsaRecovery {
-                control_tx: control_tx.clone(),
-            }),
+            stream: StreamSession::new(
+                frames_rx,
+                std::sync::Arc::new(GsaRecovery {
+                    control_tx: control_tx.clone(),
+                }),
+                clock.clone(),
+                ClockSync::default(),
+                dropped.clone(),
+                recovered.clone(),
+            ),
             control_tx,
             clock,
-            clock_sync: ClockSync::default(),
             reassembler: Some(Reassembler::new()),
-            frames_rx: None,
-            reassembly_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            reassembly_recovered: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            stats: LatencyStats::default(),
-            present: stats::PresentStats::default(),
-            presented_rx: presented_channel.1,
-            presented_tx: presented_channel.0,
+            frames_tx: Some(frames_tx),
+            reassembly_dropped: dropped,
+            reassembly_recovered: recovered,
             session: None,
-            last_frame_id: None,
-            last_delivered_id: None,
-            last_keyframe_request_us: 0,
             last_stats_report_us: 0,
-            // Until the first keyframe, the decoder has no reference; skip any
-            // P-frames that arrive ahead of it.
-            awaiting_idr: true,
-            recovery_point: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            decode_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            dejitter: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            jitter_win: std::collections::VecDeque::new(),
-            last_jitter_us: 0,
-            dejitter_active: false,
-            first_gate_us: None,
             audio: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         client.sync_clock(5).await?;
@@ -383,14 +347,14 @@ impl Client {
                     agent_ts_us,
                 } if client_ts_us == sent => {
                     let now = self.clock.now_us();
-                    self.clock_sync.record(sent, now, agent_ts_us);
+                    self.stream.clock_sync_mut().record(sent, now, agent_ts_us);
                 }
                 A2C::Pong { .. } => continue, // stale pong; ignore
                 other => return Err(Error::Session(format!("expected pong, got {other:?}"))),
             }
         }
         tracing::debug!(
-            offset_us = self.clock_sync.offset_us(),
+            offset_us = self.stream.clock_sync_mut().offset_us(),
             "clock sync complete"
         );
         Ok(())
@@ -419,7 +383,7 @@ impl Client {
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<ControlEvent>> {
         let mut recv = self.control_recv.take()?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let recovery_point = self.recovery_point.clone();
+        let recovery_point = self.stream.recovery_point();
         tokio::spawn(async move {
             loop {
                 match recv_msg::<A2C>(&mut recv).await {
@@ -570,20 +534,19 @@ impl Client {
     /// delay-based estimator, and a paced present must not read as path
     /// congestion. NACKs and feedback also fire at true arrival time.
     fn ensure_receiver(&mut self) {
-        if self.frames_rx.is_some() {
+        let Some(frames_tx) = self.frames_tx.take() else {
             return;
-        }
+        };
         // The receive task and the gate both send on it; start it first so no
         // NACK or recovery request is dropped for want of a writer.
         self.ensure_control_writer();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let task = ReceiveTask {
             conn: self.conn.clone(),
             clock: self.clock.clone(),
             reassembler: self.reassembler.take().expect("receiver spawned once"),
             control_tx: self.control_tx.clone(),
             audio: self.audio.clone(),
-            frames_tx: tx,
+            frames_tx,
             dropped: self.reassembly_dropped.clone(),
             recovered: self.reassembly_recovered.clone(),
             feedback_batch: Vec::new(),
@@ -592,157 +555,33 @@ impl Client {
             nacked: std::collections::VecDeque::new(),
             nack_window: (0, 0),
         };
-        self.frames_rx = Some(rx);
         tokio::spawn(task.run());
     }
 
-    /// Next video frame past the loss-recovery gate, with its header and
-    /// reassembled access unit. `None` when the connection closes. Shared by
-    /// `recv_frame` (decode path) and `recv_encoded` (embedder passthrough).
-    async fn next_gated_frame(&mut self) -> Result<Option<BackendFrame>> {
-        self.ensure_receiver();
-        loop {
-            let rx = self.frames_rx.as_mut().expect("receiver running");
-            let Some(af) = rx.recv().await else {
-                return Ok(None);
-            };
-            let backlog = !self
-                .frames_rx
-                .as_ref()
-                .expect("receiver running")
-                .is_empty();
-            if let Some(out) = self.gate(af, backlog).await? {
-                return Ok(Some(out));
-            }
-        }
-    }
-
-    /// Reference-chain gate for one released frame (spec 04): on a break
-    /// (lost frame), hold the last good picture and skip P-frames until a
-    /// keyframe resyncs — decoding a P-frame against a stale reference
-    /// corrupts output. Requests the keyframe immediately.
-    async fn gate(&mut self, f: BackendFrame, backlog: bool) -> Result<Option<BackendFrame>> {
-        let arrival_us = f.arrival_us;
-        self.stats.on_frame_complete(f.data.len(), arrival_us);
-        // A decoder-rejected frame breaks the chain even though delivery
-        // looked clean: freeze and request recovery like any gap.
-        if self
-            .decode_error
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-            && !self.awaiting_idr
-        {
-            tracing::debug!("embedder reported decode error; freezing");
-            self.awaiting_idr = true;
-            self.request_keyframe_throttled();
-        }
-        let is_idr = f.keyframe;
-        if is_idr {
-            self.awaiting_idr = false;
-        }
-        if let Some(last) = self.last_frame_id {
-            let delta = f.frame_id.wrapping_sub(last);
-            if delta == 0 || delta > u32::MAX / 2 {
-                // Reassembler releases in order, so this should be
-                // unreachable; if it fires, ordering is broken upstream.
-                tracing::warn!(last, got = f.frame_id, "OUT-OF-ORDER frame gated");
-            } else if delta != 1 && !is_idr && !self.awaiting_idr {
-                tracing::debug!(gap_after = last, got = f.frame_id, "frame gap; freezing");
-                self.awaiting_idr = true;
-                self.request_keyframe_throttled();
-            }
-        }
-
-        // Frozen: an agent-announced recovery point resumes decoding without
-        // a keyframe — frames from it on reference nothing we're missing.
-        if self.awaiting_idr && !is_idr {
-            let rp = self
-                .recovery_point
-                .load(std::sync::atomic::Ordering::Acquire);
-            let safe = rp > 0 && {
-                let first_safe = (rp - 1) as u32;
-                f.frame_id.wrapping_sub(first_safe) < u32::MAX / 2
-            };
-            if safe {
-                self.awaiting_idr = false;
-            } else {
-                // Skip P-frames (a broken reference is the corruption);
-                // advance the id so the gap isn't re-flagged, keep asking.
-                self.last_frame_id = Some(f.frame_id);
-                self.request_keyframe_throttled();
-                return Ok(None);
-            }
-        }
-
-        // The frame is consumed regardless of what the caller does with it;
-        // advance so the next frame isn't misread as another gap.
-        self.last_frame_id = Some(f.frame_id);
-        self.last_delivered_id = Some(f.frame_id);
-        self.dejitter_release(f.capture_ts_us, arrival_us, backlog)
-            .await;
-        Ok(Some(f))
-    }
-
-    /// Receive datagrams until the next complete frame decodes.
-    /// Returns `None` when the connection closes.
+    /// Receive frames until the next one decodes. `None` when the connection
+    /// closes. The gate, de-jitter and stats all live in the shared session.
     pub async fn recv_frame(
         &mut self,
         decoder: &mut dyn VideoDecoder,
     ) -> Result<Option<FrameOutput>> {
-        loop {
-            let Some(gated) = self.next_gated_frame().await? else {
-                return Ok(None);
-            };
-            let decode_start = self.clock.now_us();
-            match decoder.decode(&gated.data) {
-                Ok(Some(frame)) => {
-                    let now = self.clock.now_us();
-                    let decode_us = (now - decode_start) as u32;
-                    let latency_us = self.clock_sync.frame_latency_us(now, gated.capture_ts_us);
-                    self.stats.on_frame_decoded(latency_us, decode_us);
-                    self.report_stats_if_due();
-                    return Ok(Some(FrameOutput {
-                        frame,
-                        frame_id: gated.frame_id,
-                        capture_ts_us: gated.capture_ts_us,
-                        latency_us,
-                        decode_us,
-                    }));
-                }
-                Ok(None) => {
-                    // Decoder accepted the data but produced no frame
-                    // (parameter sets / buffering).
-                }
-                Err(e) => {
-                    // Undecodable (loss-damaged) frame: never fatal. Freeze and
-                    // request a healing keyframe.
-                    tracing::debug!(error = %e, "decode error; freezing until keyframe");
-                    self.awaiting_idr = true;
-                    self.request_keyframe_throttled();
-                }
-            }
+        self.ensure_receiver();
+        let out = self.stream.recv_frame(decoder).await?;
+        if out.is_some() {
+            self.report_stats_if_due();
         }
+        Ok(out)
     }
 
     /// Receive the next complete **encoded** access unit plus metadata, for
-    /// embedders that decode on the platform (VideoToolbox / MediaCodec). Same
-    /// loss-recovery gate as `recv_frame`; audio routes as a side effect.
+    /// embedders that decode on the platform (VideoToolbox / MediaCodec).
     /// `None` when the connection closes.
     pub async fn recv_encoded(&mut self) -> Result<Option<EncodedFrame>> {
-        let Some(gated) = self.next_gated_frame().await? else {
-            return Ok(None);
-        };
-        let now = self.clock.now_us();
-        let latency_us = self.clock_sync.frame_latency_us(now, gated.capture_ts_us);
-        // Decode happens app-side; record it as zero in the stats window.
-        self.stats.on_frame_decoded(latency_us, 0);
-        self.report_stats_if_due();
-        Ok(Some(EncodedFrame {
-            data: gated.data,
-            frame_id: gated.frame_id,
-            keyframe: gated.keyframe,
-            capture_ts_us: gated.capture_ts_us,
-            latency_us,
-        }))
+        self.ensure_receiver();
+        let out = self.stream.recv_encoded().await?;
+        if out.is_some() {
+            self.report_stats_if_due();
+        }
+        Ok(out)
     }
 
     /// Report client stats to the agent ~2 Hz — the ABR delay signal (spec 04).
@@ -757,14 +596,8 @@ impl Client {
             return;
         };
         self.last_stats_report_us = now;
-        self.drain_presented();
-        let p = self.present.summary();
-        let s = self.stats.summary(
-            self.reassembly_dropped
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.reassembly_recovered
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
+        let p = self.stream.present_stats();
+        let s = self.stream.stats();
         let _ = tx.send(C2A::StatsReport(gsa_protocol::control::ClientStats {
             frames_received: s.frames_complete,
             frames_complete: s.frames_complete,
@@ -772,7 +605,7 @@ impl Client {
             frames_recovered: s.frames_recovered as u32,
             frames_decoded: s.frames_decoded,
             decode_us_p50: s.decode_ms_p50.map_or(0, |ms| (ms * 1000.0) as u32),
-            jitter_us: self.last_jitter_us,
+            jitter_us: self.stream.jitter_us(),
             frames_presented: p.presented,
             present_fps_x100: p.fps_x100,
             low1_fps_x100: p.low1_fps_x100,
@@ -788,145 +621,39 @@ impl Client {
         }));
     }
 
-    /// Request a healing keyframe, rate-limited so a burst of gaps/errors
-    /// doesn't spam the host (one keyframe fixes them all). Throttling lives
-    /// here, not in the backend, so every protocol inherits it.
-    fn request_keyframe_throttled(&mut self) {
-        const MIN_INTERVAL_US: u64 = 250_000;
-        let now = self.clock.now_us();
-        if now.saturating_sub(self.last_keyframe_request_us) < MIN_INTERVAL_US {
-            return;
-        }
-        self.last_keyframe_request_us = now;
-        // With a known-good frame the host can clean references instead of
-        // resetting the world with an IDR (spec 04 rung 2).
-        match self.last_delivered_id {
-            Some(last_good) => self.recovery.request_recovery(last_good),
-            None => self.recovery.request_keyframe(),
-        }
-    }
-
     /// Shared de-jitter switch for the embedder (default enabled).
     #[must_use]
     pub fn dejitter_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        self.dejitter.clone()
+        self.stream.dejitter_flag()
     }
 
-    /// Absorb delay variance by holding early frames to a capture-anchored
-    /// latency target — the window's p90 — so the spread is spent waiting,
-    /// not stuttering. Anchoring to capture time (never to the previous
-    /// release) makes drift structurally impossible: the release rate equals
-    /// the capture rate. Late frames never wait, a backlog is drained
-    /// unpaced, and a clean link pays nothing.
-    async fn dejitter_release(&mut self, capture_ts_us: u32, arrival_us: u64, backlog: bool) {
-        const WIN: usize = 32;
-        const JITTER_ON_US: u32 = 12_000;
-        /// Hysteresis: a link hovering at the engage threshold must not flap
-        /// the mode (and its log line) every few frames.
-        const JITTER_OFF_US: u32 = 8_000;
-        const DEJITTER_MAX_US: u32 = 33_000;
-        /// Startup transient (clock sync settling, burst catch-up) must not
-        /// read as jitter.
-        const WARMUP_US: u64 = 2_000_000;
-        let now = self.clock.now_us();
-        self.first_gate_us.get_or_insert(now);
-        if let Some(lat) = self.clock_sync.frame_latency_us(arrival_us, capture_ts_us) {
-            if self.jitter_win.len() == WIN {
-                self.jitter_win.pop_front();
-            }
-            self.jitter_win.push_back(lat);
-        }
-        if self.jitter_win.len() < WIN / 2 {
-            return;
-        }
-        let mut lat: Vec<u32> = self.jitter_win.iter().copied().collect();
-        lat.sort_unstable();
-        let (p10, p90) = (lat[lat.len() / 10], lat[lat.len() * 9 / 10]);
-        let jitter = p90 - p10;
-        self.last_jitter_us = jitter;
-        // Pacing is only sound at the queue head with nothing waiting:
-        // holding a frame while more are already queued builds a standing
-        // backlog that can never drain — the opposite of smoothing.
-        if backlog || !self.dejitter.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        let age = now.saturating_sub(self.first_gate_us.unwrap_or(now));
-        if age < WARMUP_US {
-            return;
-        }
-        let high = if self.dejitter_active {
-            jitter >= JITTER_OFF_US
-        } else {
-            jitter >= JITTER_ON_US
-        };
-        if high != self.dejitter_active {
-            self.dejitter_active = high;
-            tracing::debug!(jitter_us = jitter, active = high, "dejitter mode");
-        }
-        if !high {
-            return;
-        }
-        let Some(lat_now) = self.clock_sync.frame_latency_us(now, capture_ts_us) else {
-            return;
-        };
-        let target = p90.min(p10.saturating_add(DEJITTER_MAX_US));
-        if lat_now < target {
-            let wait = u64::from((target - lat_now).min(DEJITTER_MAX_US));
-            tokio::time::sleep(std::time::Duration::from_micros(wait)).await;
-        }
-    }
-
-    /// Shared flag the embedder sets when its decoder rejects a frame; the
+    /// Shared flag the embedder sets when its decoder rejected a frame; the
     /// gate treats it as a reference break and requests recovery.
     #[must_use]
     pub fn decode_error_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        self.decode_error.clone()
+        self.stream.decode_error_flag()
     }
 
     /// Handle for the embedder's display path to report presented frames.
     #[must_use]
     pub fn presented_sink(&self) -> PresentedSink {
-        PresentedSink {
-            tx: self.presented_tx.clone(),
-        }
+        self.stream.presented_sink()
     }
 
     /// Direct form of [`PresentedSink::presented`] for harnesses that own
     /// the client.
     pub fn frame_presented(&mut self, capture_ts_us: u32) {
-        let now = self.clock.now_us();
-        let latency = self.clock_sync.frame_latency_us(now, capture_ts_us);
-        self.present.on_presented(latency, capture_ts_us, now);
-    }
-
-    /// Fold queued presentation reports (stamped on the display thread) into
-    /// the health stats.
-    fn drain_presented(&mut self) {
-        while let Ok((capture_ts, at)) = self.presented_rx.try_recv() {
-            let now = self
-                .clock
-                .now_us()
-                .saturating_sub(at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
-            let latency = self.clock_sync.frame_latency_us(now, capture_ts);
-            self.present.on_presented(latency, capture_ts, now);
-        }
+        self.stream.frame_presented(capture_ts_us);
     }
 
     #[must_use]
     pub fn stats(&self) -> StatsSummary {
-        self.stats.summary(
-            self.reassembly_dropped
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.reassembly_recovered
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        self.stream.stats()
     }
 
     /// Presentation-side health summary (fed by [`PresentedSink`]).
-    #[must_use]
     pub fn present_stats(&mut self) -> stats::PresentSummary {
-        self.drain_presented();
-        self.present.summary()
+        self.stream.present_stats()
     }
 
     /// Graceful shutdown: close the connection and flush the endpoint.
