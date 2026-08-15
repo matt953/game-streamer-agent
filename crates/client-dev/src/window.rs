@@ -38,6 +38,11 @@ enum AppEvent {
     RecvMbps(Option<f64>),
     /// Agent-pushed notification (e.g. host confirmed the virtual pad plugged).
     Notification(ControlEvent),
+    /// The host asked for motion samples at this rate. Sampling starts here
+    /// and not before — an unasked motion stream is spent battery.
+    MotionRequested {
+        rate_hz: u16,
+    },
     StreamEnded(String),
 }
 
@@ -333,12 +338,17 @@ fn moonlight_loop(
                 while let Ok(message) = stream.events.try_recv() {
                     tracing::info!(?message, "host control message");
                     // Motion is opt-in: sampling starts here and not before.
-                    if let Some(gsa_client_core::BackendEvent::MotionRequested { rate_hz, .. }) =
-                        message.neutral()
-                        && let Some(pad) = &_pad
+                    if let Some(gsa_client_core::BackendEvent::MotionRequested {
+                        rate_hz, ..
+                    }) = message.neutral()
                     {
-                        pad.motion_hz
-                            .store(u32::from(rate_hz), std::sync::atomic::Ordering::Relaxed);
+                        if let Some(pad) = &_pad {
+                            pad.motion_hz
+                                .store(u32::from(rate_hz), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // A physical pad is read on the event-loop thread, so
+                        // the request has to cross over to it.
+                        let _ = proxy.send_event(AppEvent::MotionRequested { rate_hz });
                     }
                 }
                 // The display path is the source of presentation truth; without
@@ -528,6 +538,19 @@ struct App {
     /// Presented content rect (letterboxed), for normalizing cursor coords.
     content_rect: Option<(f32, f32, f32, f32)>,
     gamepad: Option<GamepadCapture>,
+    /// The platform's own gamepad framework, when it can see the controller.
+    /// It reports motion, a touch surface and battery, which the portable
+    /// path cannot; it takes precedence and `gamepad` stays unused.
+    #[cfg(target_os = "macos")]
+    platform_pad: Option<crate::gamepad_gc::GcCapture>,
+    /// Whether this pad has been announced to the host. Nothing richer than
+    /// buttons works until it has been.
+    pad_announced: bool,
+    /// Non-zero once the host asks for motion.
+    motion_hz: u16,
+    /// How long to wait for the platform framework to find the controller
+    /// before falling back to the portable path. `None` once the window is up.
+    portable_pad_after: Option<std::time::Instant>,
     toast: Option<Toast>,
     /// Client-side view of the live encode bitrate (bps), stepped by the [ / ]
     /// dev keybinds to exercise the manual bitrate knob (spec 04 ABR actuator).
@@ -585,13 +608,55 @@ impl ApplicationHandler<AppEvent> for App {
         let gpu = Gpu::new(window.clone()).expect("init wgpu");
         self.window = Some(window);
         self.gpu = Some(gpu);
+        // Both are opened: the platform framework is the only source of
+        // motion, touch and battery, but it populates lazily off the run loop
+        // and may not see the pad for a few frames yet, so the portable path
+        // covers the gap and every other OS. Whichever has the pad is used.
         self.gamepad = GamepadCapture::new();
     }
 
     /// Poll the controller between events. Winit would otherwise sleep until
     /// the next frame or keystroke, and a gamepad generates neither.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let (Some(gamepad), Some(input)) = (&mut self.gamepad, &self.input)
+        // The framework fills its controller list from the run loop, so the
+        // pad can appear several frames after the window does. Retry until it
+        // does rather than deciding once at startup that there is none.
+        #[cfg(target_os = "macos")]
+        if self.platform_pad.is_none() && self.input.is_some() {
+            self.platform_pad = crate::gamepad_gc::GcCapture::new();
+        }
+        #[cfg(target_os = "macos")]
+        if let (Some(pad), Some(input)) = (&mut self.platform_pad, &self.input) {
+            if !self.pad_announced {
+                // Announce before anything else: a host that has not been told
+                // what the pad is builds a plain one and then drops motion,
+                // touch and battery for it without complaint.
+                input.announce_pad(0, pad.profile());
+                self.pad_announced = true;
+            }
+            let events = pad.poll(self.motion_hz > 0);
+            if !events.is_empty() {
+                input.send(events);
+            }
+        }
+        // Only one path drives the pad: the platform one when it has it, so
+        // the host does not receive two snapshots per poll for one controller.
+        let platform_active = {
+            #[cfg(target_os = "macos")]
+            {
+                self.platform_pad.is_some()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+        let waiting_for_platform = self
+            .portable_pad_after
+            .is_some_and(|at| std::time::Instant::now() < at);
+        if !platform_active
+            && !waiting_for_platform
+            && let (Some(gamepad), Some(input)) = (&mut self.gamepad, &self.input)
             && let Some(event) = gamepad.poll()
         {
             input.send(vec![event]);
@@ -612,7 +677,21 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
+            AppEvent::MotionRequested { rate_hz } => {
+                tracing::info!(rate_hz, "host asked for motion");
+                self.motion_hz = rate_hz;
+            }
             AppEvent::Ready(input, knobs, bitrate) => {
+                // The race starts here, not when the window opened: nothing
+                // can be sent before this. The platform framework needs a few
+                // run-loop turns to find the pad, and until it has, the
+                // portable path stays quiet — because **the first message a
+                // seat sends must be its arrival**. A state snapshot plugs a
+                // default pad for that slot, and the host then ignores the
+                // arrival that follows, losing motion, touch and battery for
+                // the whole session.
+                self.portable_pad_after =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                 self.input = Some(input);
                 self.knobs = knobs;
                 self.bitrate_bps = bitrate;

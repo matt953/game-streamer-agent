@@ -25,6 +25,11 @@ const SERVICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4
 /// starve the connection's own upkeep (acks, pings, retransmits).
 const MAX_COMMANDS_PER_TICK: usize = 64;
 
+/// Messages held while the control channel connects. Enough for a client that
+/// announces a controller and starts streaming its state immediately; beyond
+/// that the oldest input is stale anyway.
+const MAX_PENDING_BEFORE_START: usize = 256;
+
 /// Channel count to request. Reference clients open this many and place some
 /// controller streams on the higher channels.
 const CHANNELS: usize = 48;
@@ -234,6 +239,8 @@ pub fn run(
 
     let mut connected = false;
     let mut started = false;
+    // Messages held while the channel comes up.
+    let mut pending: Vec<(Vec<u8>, Delivery)> = Vec::new();
     // Kinds already reported, so an unparsed message is logged once loudly
     // rather than every time it arrives.
     let mut seen_kinds = std::collections::HashSet::new();
@@ -316,10 +323,20 @@ pub fn run(
             ));
         }
 
+        // Anything queued before the channel was up is sent first, in order:
+        // a send with no peer is dropped silently, so input from a client that
+        // announces its controller the moment the session starts would
+        // otherwise vanish with nothing to show for it.
+        if started {
+            for (plaintext, delivery) in std::mem::take(&mut pending) {
+                send(&mut host, &mut crypto, &plaintext, delivery)?;
+            }
+        }
+
         // Drain the queue rather than taking one command per service tick: at
         // one per `SERVICE_INTERVAL` the channel tops out around 250 messages
         // a second, and motion alone can exceed that — the backlog would show
-        // up as input lag that grows for as long as the user keeps moving.
+        // as input lag that grows for as long as the user keeps moving.
         // Bounded so a flood cannot starve ENet's own servicing.
         for _ in 0..MAX_COMMANDS_PER_TICK {
             match commands.try_recv() {
@@ -349,7 +366,16 @@ pub fn run(
                         Command::Input { bytes, delivery } => (bytes, delivery),
                         Command::Stop => unreachable!("handled above"),
                     };
-                    send(&mut host, &mut crypto, &plaintext, delivery)?;
+                    if started {
+                        send(&mut host, &mut crypto, &plaintext, delivery)?;
+                    } else {
+                        // Bounded: a host that never completes the handshake
+                        // fails on the deadline below, and until then a
+                        // runaway producer must not grow this without limit.
+                        if pending.len() < MAX_PENDING_BEFORE_START {
+                            pending.push((plaintext, delivery));
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
             }

@@ -122,6 +122,7 @@ impl InputSink for MoonlightInput {
         let Ok(encoder) = self.encoder.lock() else {
             return;
         };
+        tracing::info!(seat, ?profile, "announcing controller to host");
         let message = encoder.arrival_message(seat, profile);
         let _ = self.commands.send(Command::Input {
             bytes: message.bytes,

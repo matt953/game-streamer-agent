@@ -38,6 +38,23 @@ objc2-core-media = { workspace = true, features = ["CMSampleBuffer", "CMTime", "
 objc2-core-video = { workspace = true, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-video-toolbox = { workspace = true, features = ["VTDecompressionSession", "VTDecompressionProperties", "VTSession", "VTErrors", "objc2-core-media", "block2"] }
 block2 = { workspace = true }
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true, features = ["NSArray", "NSNotification", "NSString", "NSEnumerator"] }
+objc2-game-controller = { workspace = true, features = [
+    "GCController",
+    "GCExtendedGamepad",
+    "GCControllerElement",
+    "GCControllerButtonInput",
+    "GCControllerAxisInput",
+    "GCControllerDirectionPad",
+    "GCMotion",
+    "GCPhysicalInputProfile",
+    "GCDevice",
+    "GCDeviceBattery",
+    "GCDualSenseGamepad",
+    "GCDualShockGamepad",
+    "GCControllerTouchpad",
+] }
 
 # Hosts the VideoToolbox decoder FFI (decoder_vt.rs): opts out of the
 # workspace-wide `unsafe_code = "forbid"`; unsafe blocks must carry SAFETY

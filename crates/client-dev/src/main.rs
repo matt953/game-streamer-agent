@@ -7,6 +7,8 @@ mod decoder;
 #[cfg(target_os = "macos")]
 mod decoder_vt;
 mod gamepad_capture;
+#[cfg(target_os = "macos")]
+mod gamepad_gc;
 mod headless;
 mod input_capture;
 mod moonlight;
