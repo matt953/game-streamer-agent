@@ -4,6 +4,7 @@
 
 mod logs;
 mod shaper;
+mod taint;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -71,6 +72,14 @@ enum Cmd {
         #[arg(long)]
         identity: Option<String>,
     },
+    /// Clean-room check (spec 16): fail if a shipped artifact contains the
+    /// name of a project we may not derive from. Run before any release.
+    TaintAudit {
+        /// Artifact to scan; repeatable. Defaults to the release client FFI
+        /// library, which is what an app links.
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -110,6 +119,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::DevSign { identity } => dev_sign(identity),
+        Cmd::TaintAudit { paths } => taint::taint_audit(paths),
     }
 }
 
