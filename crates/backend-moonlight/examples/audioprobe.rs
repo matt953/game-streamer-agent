@@ -89,6 +89,12 @@ async fn main() {
     .expect("socket");
     let audio_port = negotiated.audio_port;
 
+    // After video is established on the first socket, claim the audio port
+    // from a second one. If audio appears there the host was willing all
+    // along and the binding was the problem; if nothing appears, the host is
+    // not producing audio for this session at all.
+    let mut second: Option<gsa_backend_moonlight::MediaSocket> = None;
+    let mut on_second = 0usize;
     let mut buf = vec![0u8; 4096];
     let mut by_type: std::collections::BTreeMap<u8, (usize, usize)> =
         std::collections::BTreeMap::new();
@@ -96,14 +102,34 @@ async fn main() {
     let start = std::time::Instant::now();
     let mut last_ping = start - std::time::Duration::from_secs(1);
     while start.elapsed() < std::time::Duration::from_secs(10) {
+        if start.elapsed() >= std::time::Duration::from_secs(4) && second.is_none() {
+            let sock = gsa_backend_moonlight::MediaSocket::bind(
+                std::net::SocketAddr::new(addr.ip(), audio_port),
+                negotiated.ping_payload,
+            )
+            .expect("second socket");
+            println!("[4s] claiming the audio port from a second socket");
+            second = Some(sock);
+        }
         if last_ping.elapsed() >= std::time::Duration::from_millis(400) {
             let _ = media.ping();
-            if std::env::var("GSA_AUDIO_PLAIN").is_ok() {
-                let _ = media.ping_port_plain(audio_port);
-            } else {
-                let _ = media.ping_port(audio_port);
+            match second.as_mut() {
+                Some(sock) => {
+                    let _ = sock.ping();
+                }
+                None => {
+                    let _ = media.ping_port(audio_port);
+                }
             }
             last_ping = std::time::Instant::now();
+        }
+        if let Some(sock) = second.as_ref()
+            && let Ok(Some(n)) = sock.recv(&mut buf)
+        {
+            on_second += 1;
+            if on_second == 1 {
+                println!("  second socket got {n} bytes, packet type {}", buf[1]);
+            }
         }
         if let Ok(Some(n)) = media.recv(&mut buf) {
             if n < 2 {
@@ -124,6 +150,7 @@ async fn main() {
         }
     }
 
+    println!("\nsecond socket received {on_second} datagrams");
     println!("\npacket types seen (type: count, bytes):");
     for (kind, (count, bytes)) in &by_type {
         let label = match kind {
