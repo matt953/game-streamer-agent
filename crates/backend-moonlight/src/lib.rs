@@ -20,11 +20,13 @@ mod host;
 mod http;
 mod identity;
 mod pair;
+mod rtsp;
 mod tls;
 
 pub use host::{LaunchedSession, PairedSession, StreamMode};
 pub use identity::ClientIdentity;
 pub use pair::{PairedHost, pair, random_pin};
+pub use rtsp::{Negotiated, Rtsp, StreamRequest};
 
 /// The client certificate in the hex-encoded-PEM form the `/pair` endpoint
 /// expects. Exposed for reproducing a handshake step by hand when a host

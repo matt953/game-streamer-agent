@@ -61,7 +61,38 @@ async fn main() {
                 "  host state: {} current_game={}",
                 info.state, info.current_game
             );
-            // Optionally keep the session up so the RTSP stage can be worked
+            // Negotiate the streams. The host picks the ports and tells us
+            // which encryption it wants, so nothing here is assumed.
+            let mut rtsp = gsa_backend_moonlight::Rtsp::new(&launched.rtsp_url).expect("rtsp url");
+            let want = gsa_backend_moonlight::StreamRequest {
+                width: mode.width,
+                height: mode.height,
+                fps: mode.fps,
+                bitstream_format: 0, // H.264 first; HEVC once decode is wired
+                bitrate_kbps: 20_000,
+                packet_size: 1392,
+                channels: mode.channels,
+            };
+            match rtsp.negotiate(want).await {
+                Ok(n) => {
+                    println!("  negotiated:");
+                    println!("    video port:   {}", n.video_port);
+                    println!("    audio port:   {}", n.audio_port);
+                    println!("    control port: {}", n.control_port);
+                    println!(
+                        "    encryption:   supported={:#x} requested={:#x} control_v2={}",
+                        n.encryption_supported,
+                        n.encryption_requested,
+                        n.control_v2()
+                    );
+                    println!("    ref invalidation: {}", n.reference_invalidation);
+                    println!("    ping payload: {:?}", n.ping_payload.is_some());
+                    println!("    connect data: {:?}", n.connect_data);
+                }
+                Err(e) => eprintln!("  rtsp failed: {e}"),
+            }
+
+            // Optionally keep the session up so later stages can be worked
             // on against a live host; still cancelled on the way out.
             if let Some(hold) = std::env::args().nth(3).and_then(|s| s.parse().ok()) {
                 println!("holding the session open for {hold}s");

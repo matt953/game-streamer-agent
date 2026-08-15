@@ -31,6 +31,37 @@ pub(crate) async fn get(addr: std::net::SocketAddr, path_and_query: &str) -> Res
     exchange(&mut stream, addr, path_and_query).await
 }
 
+/// Send raw bytes on a fresh connection and read until the peer closes.
+///
+/// For protocols that delimit a response by connection close rather than by
+/// a content length — which is how these hosts answer RTSP.
+pub(crate) async fn request_raw(addr: std::net::SocketAddr, request: &[u8]) -> Result<Vec<u8>> {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| Error::Transport(format!("connect {addr}: {e}")))?;
+    let _ = stream.set_nodelay(true);
+    stream
+        .write_all(request)
+        .await
+        .map_err(|e| Error::Transport(format!("send request: {e}")))?;
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| Error::Transport(format!("read response: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() > MAX_BODY {
+            return Err(Error::Transport("response too large".into()));
+        }
+    }
+    Ok(raw)
+}
+
 /// Send one `GET` and read the whole response off an already-connected
 /// stream, so the plain and TLS paths share their framing.
 pub(crate) async fn exchange<S>(
