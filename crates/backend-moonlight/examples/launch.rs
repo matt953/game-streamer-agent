@@ -61,6 +61,12 @@ async fn main() {
                 "  host state: {} current_game={}",
                 info.state, info.current_game
             );
+            // Optionally keep the session up so the RTSP stage can be worked
+            // on against a live host; still cancelled on the way out.
+            if let Some(hold) = std::env::args().nth(3).and_then(|s| s.parse().ok()) {
+                println!("holding the session open for {hold}s");
+                tokio::time::sleep(std::time::Duration::from_secs(hold)).await;
+            }
         }
         Err(e) => eprintln!("launch failed: {e}"),
     }
