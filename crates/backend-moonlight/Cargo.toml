@@ -6,14 +6,23 @@ rust-version.workspace = true
 repository.workspace = true
 publish = false
 license = "MIT OR Apache-2.0"
-description = "Moonlight-protocol client backend (Sunshine/Apollo/Wolf hosts) — clean-room, see spec 16"
+description = "Moonlight-protocol client backend (Sunshine/Apollo/Wolf hosts) — clean-room"
 
 [dependencies]
 gsa-core = { workspace = true }
 gsa-client-backend-api = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+rcgen = { workspace = true }
 roxmltree = "0.21"
+rsa = "0.9"
+sha2 = { version = "0.10", features = ["oid"] }
+aes = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+x509-parser = "0.18"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

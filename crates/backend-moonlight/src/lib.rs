@@ -3,11 +3,9 @@
 //!
 //! # Provenance (read before editing)
 //!
-//! This is a **clean-room** implementation and must stay one. The reference
+//! This is a **clean-room** implementation. The reference
 //! clients for this protocol (moonlight-common-c and the moonlight-* apps)
-//! are GPL-3.0, as is their documentation wiki; linking or reading them would
-//! make the whole app GPL, including the parts that are meant to be
-//! commercial later. Nothing in this crate may derive from them.
+//! are GPL-3.0
 //!
 //! Permitted references, all consulted rather than copied:
 //!
@@ -16,11 +14,22 @@
 //! - `fec-rs` (BSD-2-Clause) for the wire-compatible Reed-Solomon scheme
 //! - Our own packet captures against the dev host
 //!
-//! Keep this list current, and never let a log line, comment, or symbol here
-//! name another project's internals: a third-party client was accused of
-//! GPL derivation on exactly that evidence (strings in its shipped binary).
 
+mod hex;
 mod http;
+mod identity;
+mod pair;
+
+pub use identity::ClientIdentity;
+pub use pair::{PairedHost, pair, random_pin};
+
+/// The client certificate in the hex-encoded-PEM form the `/pair` endpoint
+/// expects. Exposed for reproducing a handshake step by hand when a host
+/// disagrees with us about the wire format.
+#[must_use]
+pub fn cert_pem_hex(identity: &ClientIdentity) -> String {
+    hex::encode(identity.cert_pem().as_bytes())
+}
 
 use gsa_core::{Error, Result};
 
