@@ -22,7 +22,7 @@ mod identity;
 mod pair;
 mod tls;
 
-pub use host::PairedSession;
+pub use host::{LaunchedSession, PairedSession, StreamMode};
 pub use identity::ClientIdentity;
 pub use pair::{PairedHost, pair, random_pin};
 

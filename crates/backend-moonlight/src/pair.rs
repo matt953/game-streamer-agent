@@ -39,7 +39,7 @@ pub fn random_pin() -> String {
     bytes.iter().map(|b| char::from(b'0' + b % 10)).collect()
 }
 
-fn random_16() -> [u8; 16] {
+pub(crate) fn random_16() -> [u8; 16] {
     let mut out = [0u8; 16];
     rand_core::OsRng.fill_bytes(&mut out);
     out

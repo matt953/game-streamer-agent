@@ -55,6 +55,54 @@ impl PairedSession {
         parse_catalog(&body, running)
     }
 
+    /// Ask the host to start streaming `app_id`, and get back the session's
+    /// RTSP address plus the key the control channel will be encrypted with.
+    ///
+    /// `sops` lets the host change the desktop's resolution to match what we
+    /// asked for. Defaulted off here: silently reconfiguring someone's
+    /// monitor is a surprising thing for a client to do, and Apollo can be
+    /// told to override the mode host-side anyway.
+    pub async fn launch(&self, app_id: u32, mode: StreamMode) -> Result<LaunchedSession> {
+        let riaes_key = crate::pair::random_16();
+        // Paired with the key as the control channel's identity; hosts treat
+        // it as a signed integer, so keep it inside the positive range.
+        let riaes_key_id: i32 = i32::from_be_bytes([
+            crate::pair::random_16()[0] & 0x7f,
+            crate::pair::random_16()[1],
+            crate::pair::random_16()[2],
+            crate::pair::random_16()[3],
+        ]);
+        let body = self
+            .get(&format!(
+                "/launch?uniqueid={}&appid={app_id}&mode={}x{}x{}&additionalStates=1&sops={}\
+                 &rikey={}&rikeyid={riaes_key_id}&localAudioPlayMode=0&surroundAudioInfo={}\
+                 &hdrMode={}&gcmap=1",
+                self.client_id,
+                mode.width,
+                mode.height,
+                mode.fps,
+                u8::from(mode.allow_host_mode_change),
+                crate::hex::encode(&riaes_key),
+                mode.surround_audio_info(),
+                u8::from(mode.hdr),
+            ))
+            .await?;
+        let rtsp_url = xml_field(&body, "sessionUrl0")?;
+        Ok(LaunchedSession {
+            rtsp_url,
+            riaes_key,
+            riaes_key_id,
+        })
+    }
+
+    /// Stop whatever the host is streaming. Safe to call when idle.
+    pub async fn cancel(&self) -> Result<()> {
+        let body = self
+            .get(&format!("/cancel?uniqueid={}", self.client_id))
+            .await?;
+        xml_field(&body, "cancel").map(|_| ())
+    }
+
     async fn get(&self, path_and_query: &str) -> Result<Vec<u8>> {
         tls::get(
             self.tls_addr,
@@ -64,6 +112,80 @@ impl PairedSession {
         )
         .await
     }
+}
+
+/// What we ask the host to encode.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamMode {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// Let the host change its desktop resolution to match. Off by default.
+    pub allow_host_mode_change: bool,
+    pub hdr: bool,
+    /// Speaker count we can render. 2 is stereo.
+    pub channels: u8,
+}
+
+impl Default for StreamMode {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            allow_host_mode_change: false,
+            hdr: false,
+            channels: 2,
+        }
+    }
+}
+
+impl StreamMode {
+    /// Channel count in the low half, channel mask in the high half — the
+    /// packing the launch endpoint expects.
+    fn surround_audio_info(self) -> u32 {
+        let mask: u32 = match self.channels {
+            6 => 0x3f,
+            8 => 0x63f,
+            _ => 0x3,
+        };
+        (mask << 16) | u32::from(self.channels.max(2))
+    }
+}
+
+/// A stream the host has started for us.
+#[derive(Debug, Clone)]
+pub struct LaunchedSession {
+    /// Where to run the RTSP handshake.
+    pub rtsp_url: String,
+    /// AES key for the control channel, chosen by us at launch.
+    pub riaes_key: [u8; 16],
+    /// Identifies that key; also feeds the control channel's nonces.
+    pub riaes_key_id: i32,
+}
+
+/// One element's text from a host reply, erroring with the body when absent.
+fn xml_field(body: &[u8], name: &str) -> Result<String> {
+    let text = std::str::from_utf8(body).map_err(|_| Error::Session("non-UTF-8 reply".into()))?;
+    let doc = roxmltree::Document::parse(text)
+        .map_err(|e| Error::Session(format!("malformed reply: {e}")))?;
+    let root = doc.root_element();
+    if root.attribute("status_code").is_some_and(|c| c != "200") {
+        let message = root
+            .attribute("status_message")
+            .unwrap_or("no reason given");
+        // Apollo grants only view/list rights to clients past the first, so a
+        // refusal here is usually permissions rather than a protocol fault.
+        return Err(Error::Session(format!(
+            "host refused: {message} (if this is a permission error, grant this \
+             client launch rights host-side)"
+        )));
+    }
+    root.children()
+        .find(|n| n.has_tag_name(name))
+        .and_then(|n| n.text())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Session(format!("reply has no <{name}>: {text}")))
 }
 
 /// Classify an entry from its title.
@@ -152,6 +274,34 @@ mod tests {
                 .iter()
                 .all(|e| !e.running)
         );
+    }
+
+    #[test]
+    fn surround_info_packs_mask_over_count() {
+        use super::StreamMode;
+        let stereo = StreamMode::default();
+        assert_eq!(stereo.channels, 2);
+        assert_eq!(stereo.surround_audio_info(), (0x3 << 16) | 2);
+        let five_one = StreamMode {
+            channels: 6,
+            ..StreamMode::default()
+        };
+        assert_eq!(five_one.surround_audio_info(), (0x3f << 16) | 6);
+        // A host must never be told we have fewer speakers than stereo; the
+        // audio path has no mono mode to fall back to.
+        let broken = StreamMode {
+            channels: 0,
+            ..StreamMode::default()
+        };
+        assert_eq!(broken.surround_audio_info() & 0xffff, 2);
+    }
+
+    #[test]
+    fn a_refusal_names_the_reason_not_the_missing_field() {
+        use super::xml_field;
+        let xml = br#"<root status_code="503" status_message="Permission denied"/>"#;
+        let err = xml_field(xml, "sessionUrl0").unwrap_err().to_string();
+        assert!(err.contains("Permission denied"), "{err}");
     }
 
     #[test]
