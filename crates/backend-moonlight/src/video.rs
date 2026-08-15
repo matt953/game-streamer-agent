@@ -109,6 +109,9 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
     /// The host's own encode-latency estimate, in µs, when it reported one.
     pub host_latency_us: Option<u32>,
+    /// Some of this frame was rebuilt from parity — loss that cost nothing
+    /// visible. Worth counting separately from loss that did.
+    pub recovered: bool,
 }
 
 /// Why a frame did not survive.
@@ -271,6 +274,7 @@ impl Depacketizer {
         let mut payload = Vec::new();
         let mut shard_count = 0usize;
         let mut shard_width = 0usize;
+        let recovered = assembly.blocks.values().any(|b| !b.complete());
         for block in assembly.blocks.values() {
             match block.resolve() {
                 Ok(shards) => {
@@ -285,7 +289,7 @@ impl Depacketizer {
             }
         }
         Some(
-            match parse_frame(frame_index, &payload, shard_width, shard_count) {
+            match parse_frame(frame_index, &payload, shard_width, shard_count, recovered) {
                 Some(frame) => Received::Frame(frame),
                 None => Received::Lost(FrameLoss::Unrecoverable { frame_index }),
             },
@@ -321,6 +325,7 @@ fn parse_frame(
     payload: &[u8],
     shard_width: usize,
     shard_count: usize,
+    recovered: bool,
 ) -> Option<VideoFrame> {
     if payload.len() <= FRAME_HEADER_LEN {
         return None;
@@ -348,6 +353,7 @@ fn parse_frame(
         keyframe: frame_type == 2,
         data: payload[FRAME_HEADER_LEN..end].to_vec(),
         host_latency_us: (latency_units != 0).then(|| u32::from(latency_units) * 100),
+        recovered,
     })
 }
 

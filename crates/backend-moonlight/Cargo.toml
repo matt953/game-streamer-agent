@@ -28,6 +28,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls-pemfile = "2"
 
 [dev-dependencies]
+gsa-client-core = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]

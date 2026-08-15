@@ -15,6 +15,7 @@
 //! - Our own packet captures against the dev host
 //!
 
+mod backend;
 mod control;
 mod enet;
 mod hex;
@@ -27,6 +28,7 @@ mod rtsp;
 mod tls;
 mod video;
 
+pub use backend::{MoonlightStream, start};
 pub use control::{Crypto, message, message_type, msg};
 pub use enet::{Command, HostMessage, run as run_control};
 pub use host::{LaunchedSession, PairedSession, StreamMode};
