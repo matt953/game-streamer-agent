@@ -122,6 +122,17 @@ impl GamepadProfile {
     }
 }
 
+/// Which sensor a motion sample or request refers to. They are separate
+/// streams: a host may want one and not the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionSensor {
+    /// Angular rate, degrees per second.
+    Gyro,
+    /// Linear acceleration, m/s², **including gravity** — a pad at rest reads
+    /// ~9.81 on one axis rather than zero.
+    Accel,
+}
+
 /// One trigger's resistance profile.
 ///
 /// Positions are along the pull, 0 released to 255 fully pressed, so they mean
@@ -132,6 +143,19 @@ pub enum TriggerEffect {
     /// Free travel.
     #[default]
     Off,
+    /// This trigger is not part of the change: whatever it is already doing
+    /// continues. Distinct from [`TriggerEffect::Off`], which cancels an
+    /// effect the game may still want.
+    Unchanged,
+    /// A vendor effect passed through untouched.
+    ///
+    /// Some hosts forward the game's own effect blob rather than describing
+    /// the effect, so there is nothing to interpret: a client holding the
+    /// matching physical pad writes these bytes to it directly. Synthesising
+    /// an approximation from them is worse than rendering nothing, because the
+    /// parameters are a per-effect bit-packed structure and a wrong reading
+    /// produces a trigger that fights the user.
+    Raw { effect: u8, params: [u8; 10] },
     /// Constant resistance from `start` onwards.
     Feedback { start: u8, strength: u8 },
     /// Resistance between `start` and `end`, then a release past it — a

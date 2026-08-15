@@ -22,7 +22,7 @@
 
 pub mod gamepad;
 
-pub use gamepad::{GamepadFeedback, GamepadProfile, PadCaps, PadKind, TriggerEffect};
+pub use gamepad::{GamepadFeedback, GamepadProfile, MotionSensor, PadCaps, PadKind, TriggerEffect};
 use gsa_core::Result;
 pub use gsa_protocol::input::InputEvent;
 
@@ -150,6 +150,15 @@ pub enum BackendEvent {
     /// LED colour. The embedder renders what the pad supports and drops the
     /// rest ([`GamepadFeedback::requires`]).
     Feedback(GamepadFeedback),
+    /// The host wants motion samples for `seat` at `rate_hz`, and not before:
+    /// motion is opt-in on every protocol that carries it, because a client
+    /// that streams gyro nobody consumes spends battery for nothing. Sampling
+    /// starts on this and stops when the pad goes away.
+    MotionRequested {
+        seat: u8,
+        sensor: MotionSensor,
+        rate_hz: u16,
+    },
     /// Periodic host encoder telemetry (bits/s). A field the backend cannot
     /// know is 0, meaning unmeasured: display it as "—", not as zero.
     EncodeStats {

@@ -19,6 +19,14 @@ pub mod msg {
     pub const INPUT_DATA: u16 = 0x0206;
     pub const INVALIDATE_REF_FRAMES: u16 = 0x0301;
     pub const RUMBLE: u16 = 0x010b;
+    /// Trigger motors, host → client.
+    pub const RUMBLE_TRIGGERS: u16 = 0x5500;
+    /// The host asking the client to start sending motion samples.
+    pub const MOTION_EVENT: u16 = 0x5501;
+    /// Lightbar colour, host → client.
+    pub const RGB_LED: u16 = 0x5502;
+    /// Opaque trigger-effect blobs, host → client.
+    pub const ADAPTIVE_TRIGGER: u16 = 0x5503;
     /// Implementations disagree with the specification here; both values are
     /// accepted on receive.
     pub const TERMINATION: u16 = 0x0109;

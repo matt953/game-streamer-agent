@@ -13,8 +13,8 @@ pub mod stats;
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
 pub use gsa_client_backend_api::{
     ActiveSession, BackendEvent, BackendFrame, CaptureClock, CatalogEntry, CatalogKind,
-    GamepadFeedback, GamepadProfile, InputSink, PadCaps, PadKind, RecoverySink, SessionCaps,
-    SessionKnobs, SessionOrigin, StreamBackend, TriggerEffect,
+    GamepadFeedback, GamepadProfile, InputSink, MotionSensor, PadCaps, PadKind, RecoverySink,
+    SessionCaps, SessionKnobs, SessionOrigin, StreamBackend, TriggerEffect,
 };
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
 pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};

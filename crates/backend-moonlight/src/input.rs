@@ -16,7 +16,9 @@
 //! tracked here rather than left to callers.
 
 use crate::control::{message, msg};
-use gsa_protocol::input::{InputEvent, MouseButton, MouseMove, gamepad};
+use crate::enet::Delivery;
+use gsa_client_backend_api::{GamepadProfile, MotionSensor, PadCaps, PadKind};
+use gsa_protocol::input::{BatteryState, InputEvent, MouseButton, MouseMove, TouchPhase, gamepad};
 
 /// Input message kinds, as the host numbers them.
 mod kind {
@@ -29,7 +31,56 @@ mod kind {
     pub const MOUSE_SCROLL: u32 = 0x0000_000a;
     pub const CONTROLLER_MULTI: u32 = 0x0000_000c;
     pub const MOUSE_HSCROLL: u32 = 0x5500_0001;
+    pub const CONTROLLER_ARRIVAL: u32 = 0x5500_0004;
+    pub const CONTROLLER_TOUCH: u32 = 0x5500_0005;
+    pub const CONTROLLER_MOTION: u32 = 0x5500_0006;
+    pub const CONTROLLER_BATTERY: u32 = 0x5500_0007;
 }
+
+/// Capability bits in a [`kind::CONTROLLER_ARRIVAL`] body. These are the
+/// host's numbering, not ours; [`PadCaps`] is translated into them.
+mod pad_cap {
+    pub const ANALOG_TRIGGERS: u16 = 0x01;
+    pub const RUMBLE: u16 = 0x02;
+    pub const TRIGGER_RUMBLE: u16 = 0x04;
+    pub const TOUCHPAD: u16 = 0x08;
+    pub const ACCELEROMETER: u16 = 0x10;
+    pub const GYRO: u16 = 0x20;
+    pub const BATTERY: u16 = 0x40;
+    pub const RGB_LED: u16 = 0x80;
+}
+
+/// Pad type values in a [`kind::CONTROLLER_ARRIVAL`] body.
+mod pad_type {
+    pub const UNKNOWN: u8 = 0x00;
+    pub const XBOX: u8 = 0x01;
+    pub const PLAYSTATION: u8 = 0x02;
+    pub const NINTENDO: u8 = 0x03;
+}
+
+/// Motion-sample discriminator, shared by the client's samples and the host's
+/// request for them.
+mod motion_kind {
+    pub const ACCEL: u8 = 0x01;
+    pub const GYRO: u8 = 0x02;
+}
+
+/// Touch event types. A host may switch on this *or* infer contact from
+/// pressure, so both must agree in every message we send.
+mod touch_event {
+    pub const DOWN: u8 = 0x01;
+    pub const UP: u8 = 0x02;
+    pub const MOVE: u8 = 0x03;
+    pub const CANCEL: u8 = 0x04;
+}
+
+/// Percentage value meaning "the pad has a battery but will not say how full".
+const BATTERY_PERCENT_UNKNOWN: u8 = 0xff;
+
+/// Least pressure that reads as contact on a host that ignores the event type
+/// and thresholds pressure instead. That host compares strictly greater than
+/// 0.5, so a contact reporting exactly 0.5 would read as a release.
+const CONTACT_PRESSURE: f32 = 0.51;
 
 /// Reference surface width/height declared with every absolute position. The
 /// host scales the coordinates against it, so the units are ours to choose;
@@ -45,6 +96,26 @@ const PAD_HEADER: u16 = 0x001a;
 const PAD_MID: u16 = 0x0014;
 const PAD_TAIL_A: u16 = 0x009c;
 const PAD_TAIL_B: u16 = 0x0055;
+
+/// One encoded message and how it should ride the control channel.
+///
+/// Delivery is a property of the message, not of the caller: only the encoder
+/// knows that a motion sample supersedes itself while a button edge does not.
+#[derive(Debug, Clone)]
+pub struct WireMessage {
+    pub bytes: Vec<u8>,
+    pub delivery: Delivery,
+}
+
+impl WireMessage {
+    /// Mark this message as droppable. Valid only where the next sample makes
+    /// a lost one irrelevant.
+    #[must_use]
+    fn unreliable(mut self) -> Self {
+        self.delivery = Delivery::Unreliable;
+        self
+    }
+}
 
 /// Encodes input events, holding the state the wire format requires the client
 /// to remember.
@@ -64,7 +135,7 @@ impl InputEncoder {
     }
 
     /// Encode one event, or `None` if this protocol has no message for it.
-    pub fn encode(&mut self, event: &InputEvent) -> Option<Vec<u8>> {
+    pub fn encode(&mut self, event: &InputEvent) -> Option<WireMessage> {
         match event {
             InputEvent::Key { usage, down, .. } => {
                 let vk = hid_usage_to_virtual_key(*usage)?;
@@ -139,12 +210,178 @@ impl InputEncoder {
                 };
                 Some(self.controller_message(&idle))
             }
-            // Touch, pen and motion have wire kinds that are not implemented.
+            // Motion is deliberately absent here: one event carries two
+            // sensors and the wire has one message per sensor, so the sink
+            // expands it through `motion_message` rather than this returning
+            // half of it.
+            InputEvent::GamepadTouch {
+                seat,
+                pointer,
+                phase,
+                x,
+                y,
+                pressure,
+                ..
+            } => touch_message(*seat, *pointer, *phase, *x, *y, *pressure),
+            InputEvent::GamepadBattery {
+                seat,
+                state,
+                percent,
+                ..
+            } => Some(battery_message(*seat, *state, *percent)),
+            // Touchscreen and pen events have wire kinds this backend does not
+            // send: the scope here is gaming, and a pad's touchpad is a
+            // different message from a screen's.
             _ => None,
         }
     }
 
-    fn controller_message(&self, pad: &gsa_protocol::input::GamepadInput) -> Vec<u8> {
+    /// Announce what pad occupies `seat`, so the host builds a matching device.
+    ///
+    /// Nothing richer than buttons works before this: a host that has not been
+    /// told what the pad is creates a plain Xbox device, and then drops motion,
+    /// touch and battery for it without complaint.
+    pub fn arrival_message(&self, seat: u8, profile: GamepadProfile) -> WireMessage {
+        let mut body = Vec::with_capacity(8);
+        body.push(seat & 0x0f);
+        body.push(pad_type_byte(profile.kind));
+        // Implementations disagree on this field's width — one reads a byte
+        // here and takes the next byte as part of the button flags, another
+        // requires a full 16-bit field and rejects a 7-byte body outright.
+        // Writing 16 bits with a zero high byte satisfies both readings: every
+        // defined capability fits in the low byte, so the byte-reader is still
+        // correct and the word-reader gets its length.
+        body.extend_from_slice(&wire_caps(profile.caps).to_le_bytes());
+        // Which buttons the pad physically has. Advertising the standard set
+        // is honest for every pad we support and costs nothing.
+        body.extend_from_slice(&gsa_protocol::input::gamepad::XINPUT_MASK.to_le_bytes());
+        input_message(kind::CONTROLLER_ARRIVAL, &body)
+    }
+
+    /// A motion sample for one sensor. Send only after the host asks.
+    pub fn motion_message(&self, seat: u8, sensor: MotionSensor, values: [f32; 3]) -> WireMessage {
+        let discriminator = match sensor {
+            MotionSensor::Accel => motion_kind::ACCEL,
+            MotionSensor::Gyro => motion_kind::GYRO,
+        };
+        motion_message(seat, discriminator, values)
+    }
+}
+
+/// Translate our capability set into the host's bits.
+///
+/// Analog triggers are always claimed: every pad this client supports has
+/// them, and the bit describes the pad rather than anything we choose.
+fn wire_caps(caps: PadCaps) -> u16 {
+    let mut bits = pad_cap::ANALOG_TRIGGERS;
+    for (ours, theirs) in [
+        (PadCaps::RUMBLE, pad_cap::RUMBLE),
+        (PadCaps::TRIGGER_RUMBLE, pad_cap::TRIGGER_RUMBLE),
+        (PadCaps::TOUCHPAD, pad_cap::TOUCHPAD),
+        (PadCaps::ACCEL, pad_cap::ACCELEROMETER),
+        (PadCaps::GYRO, pad_cap::GYRO),
+        (PadCaps::BATTERY, pad_cap::BATTERY),
+        (PadCaps::LED, pad_cap::RGB_LED),
+    ] {
+        if caps.contains(ours) {
+            bits |= theirs;
+        }
+    }
+    bits
+}
+
+/// Map a pad to the host's type byte.
+///
+/// Hosts disagree about how they decide to build a motion-capable device: one
+/// requires this to say PlayStation and ignores the capability bits entirely,
+/// another promotes an unknown pad that advertises motion, a third goes purely
+/// on the bits. Reporting the pad honestly is what satisfies all of them —
+/// there is no value that is safe to lie with.
+fn pad_type_byte(kind: PadKind) -> u8 {
+    match kind {
+        PadKind::Xbox => pad_type::XBOX,
+        PadKind::DualShock4 | PadKind::DualSense => pad_type::PLAYSTATION,
+        PadKind::SwitchPro => pad_type::NINTENDO,
+        _ => pad_type::UNKNOWN,
+    }
+}
+
+/// Motion body: seat, sensor, two reserved bytes, then three little-endian
+/// floats. Gyro is degrees per second; acceleration is m/s² **including
+/// gravity**, on the axes the pad reports rather than the display's.
+fn motion_message(seat: u8, discriminator: u8, values: [f32; 3]) -> WireMessage {
+    let mut body = Vec::with_capacity(16);
+    body.push(seat & 0x0f);
+    body.push(discriminator);
+    body.extend_from_slice(&[0, 0]);
+    for value in values {
+        body.extend_from_slice(&value.to_le_bytes());
+    }
+    // Motion supersedes itself many times a second; retransmitting a stale
+    // sample would delay live input behind it for nothing.
+    input_message(kind::CONTROLLER_MOTION, &body).unreliable()
+}
+
+/// Touchpad body: seat, event, two reserved bytes, pointer id, then x, y and
+/// pressure as little-endian floats normalised to [0,1].
+fn touch_message(
+    seat: u8,
+    pointer: u8,
+    phase: TouchPhase,
+    x: f32,
+    y: f32,
+    pressure: f32,
+) -> Option<WireMessage> {
+    // A host may switch on the event type or may ignore it entirely and
+    // threshold pressure instead, so the two must never disagree: a "down"
+    // carrying no pressure reads as a release on the second kind of host.
+    let (event, pressure) = match phase {
+        TouchPhase::Down => (
+            touch_event::DOWN,
+            pressure.clamp(0.0, 1.0).max(CONTACT_PRESSURE),
+        ),
+        TouchPhase::Move => (
+            touch_event::MOVE,
+            pressure.clamp(0.0, 1.0).max(CONTACT_PRESSURE),
+        ),
+        TouchPhase::Up => (touch_event::UP, 0.0),
+        TouchPhase::Cancel => (touch_event::CANCEL, 0.0),
+        // A phase added later is dropped rather than guessed: reporting it as
+        // the wrong one would either strand a contact down or release one the
+        // user is still holding.
+        _ => return None,
+    };
+    let mut body = Vec::with_capacity(20);
+    body.push(seat & 0x0f);
+    body.push(event);
+    body.extend_from_slice(&[0, 0]);
+    body.extend_from_slice(&u32::from(pointer).to_le_bytes());
+    for value in [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0), pressure] {
+        body.extend_from_slice(&value.to_le_bytes());
+    }
+    Some(input_message(kind::CONTROLLER_TOUCH, &body))
+}
+
+/// Battery body: seat, state, percentage, one reserved byte.
+fn battery_message(seat: u8, state: BatteryState, percent: Option<u8>) -> WireMessage {
+    let body = vec![
+        seat & 0x0f,
+        match state {
+            BatteryState::NotPresent => 0x01,
+            BatteryState::Discharging => 0x02,
+            BatteryState::Charging => 0x03,
+            BatteryState::Full => 0x05,
+            // Includes `Unknown`: hosts treat 0 as "no information".
+            _ => 0x00,
+        },
+        percent.map_or(BATTERY_PERCENT_UNKNOWN, |p| p.min(100)),
+        0,
+    ];
+    input_message(kind::CONTROLLER_BATTERY, &body)
+}
+
+impl InputEncoder {
+    fn controller_message(&self, pad: &gsa_protocol::input::GamepadInput) -> WireMessage {
         let axis = |a: gamepad::Axis| pad.axes[a.index()];
         let mut body = Vec::with_capacity(26);
         body.extend_from_slice(&PAD_HEADER.to_le_bytes());
@@ -195,13 +432,18 @@ impl InputEncoder {
 /// `data_size` counts the input-type word as well as the body, and is
 /// big-endian while the input type beside it is little-endian. That mismatch
 /// is the wire format, not a bug here.
-fn input_message(input_type: u32, body: &[u8]) -> Vec<u8> {
+fn input_message(input_type: u32, body: &[u8]) -> WireMessage {
     let data_size = (4 + body.len()) as u32;
     let mut payload = Vec::with_capacity(8 + body.len());
     payload.extend_from_slice(&data_size.to_be_bytes());
     payload.extend_from_slice(&input_type.to_le_bytes());
     payload.extend_from_slice(body);
-    message(msg::INPUT_DATA, &payload)
+    WireMessage {
+        bytes: message(msg::INPUT_DATA, &payload),
+        // Reliable unless a caller downgrades it: losing an edge event leaves
+        // the host holding a key or a button that the user released.
+        delivery: Delivery::Reliable,
+    }
 }
 
 fn clamp_i16(v: f32) -> i16 {
@@ -297,6 +539,173 @@ fn hid_usage_to_virtual_key(usage: u16) -> Option<u8> {
 }
 
 #[cfg(test)]
+mod arrival_tests {
+    use super::{InputEncoder, wire_caps};
+    use gsa_client_backend_api::{GamepadProfile, MotionSensor, PadCaps, PadKind};
+    use gsa_protocol::input::{BatteryState, TouchPhase};
+
+    fn body(message: &super::WireMessage) -> Vec<u8> {
+        // Envelope: 4 bytes control header, 4 data size, 4 input type.
+        message.bytes[12..].to_vec()
+    }
+
+    fn input_type(message: &super::WireMessage) -> u32 {
+        u32::from_le_bytes([
+            message.bytes[8],
+            message.bytes[9],
+            message.bytes[10],
+            message.bytes[11],
+        ])
+    }
+
+    /// Hosts disagree on the capabilities field's width: one reads a byte,
+    /// another requires two and rejects a shorter body outright. Eight bytes
+    /// with a zero high byte is the only encoding both accept.
+    #[test]
+    fn an_arrival_body_is_eight_bytes_so_either_reading_works() {
+        let encoder = InputEncoder::new();
+        let message = encoder.arrival_message(
+            0,
+            GamepadProfile::new(PadKind::DualSense, PadCaps::RUMBLE | PadCaps::MOTION),
+        );
+        let fields = body(&message);
+        assert_eq!(input_type(&message), 0x5500_0004);
+        assert_eq!(fields.len(), 8);
+        // Byte 3 is the capabilities' high byte under one reading and part of
+        // the button flags under the other; zero keeps both correct.
+        assert_eq!(fields[3], 0);
+        // Buttons occupy the last four bytes either way.
+        assert_eq!(
+            u32::from_le_bytes([fields[4], fields[5], fields[6], fields[7]]),
+            0xffff
+        );
+    }
+
+    /// A host that goes purely on the type byte gives motion to a PlayStation
+    /// pad and to nothing else, so the pad must be reported honestly.
+    #[test]
+    fn pad_types_map_to_the_hosts_families() {
+        let encoder = InputEncoder::new();
+        let kind_byte =
+            |kind| body(&encoder.arrival_message(0, GamepadProfile::new(kind, PadCaps::NONE)))[1];
+        assert_eq!(kind_byte(PadKind::DualSense), 0x02);
+        assert_eq!(kind_byte(PadKind::DualShock4), 0x02);
+        assert_eq!(kind_byte(PadKind::Xbox), 0x01);
+        assert_eq!(kind_byte(PadKind::SwitchPro), 0x03);
+        assert_eq!(kind_byte(PadKind::Generic), 0x00);
+    }
+
+    #[test]
+    fn capabilities_translate_to_the_hosts_bits() {
+        // Analog triggers are always claimed: every pad here has them.
+        assert_eq!(wire_caps(PadCaps::NONE), 0x01);
+        assert_eq!(wire_caps(PadCaps::RUMBLE), 0x01 | 0x02);
+        assert_eq!(
+            wire_caps(PadCaps::GYRO | PadCaps::ACCEL),
+            0x01 | 0x20 | 0x10
+        );
+        assert_eq!(
+            wire_caps(PadCaps::TOUCHPAD | PadCaps::LED | PadCaps::BATTERY),
+            0x01 | 0x08 | 0x80 | 0x40
+        );
+        // Every defined bit fits the low byte — which is why an 8-byte body
+        // with a zero high byte satisfies the u8 reader too.
+        assert_eq!(wire_caps(PadCaps::from_bits(u16::MAX)) & 0xff00, 0);
+    }
+
+    #[test]
+    fn motion_is_three_little_endian_floats_and_never_retransmitted() {
+        let encoder = InputEncoder::new();
+        let message = encoder.motion_message(1, MotionSensor::Gyro, [1.0, -2.0, 0.5]);
+        let fields = body(&message);
+        assert_eq!(input_type(&message), 0x5500_0006);
+        assert_eq!(fields.len(), 16);
+        assert_eq!(fields[0], 1);
+        assert_eq!(fields[1], 0x02, "gyro discriminator");
+        assert_eq!(
+            f32::from_le_bytes([fields[4], fields[5], fields[6], fields[7]]),
+            1.0
+        );
+        assert_eq!(
+            f32::from_le_bytes([fields[8], fields[9], fields[10], fields[11]]),
+            -2.0
+        );
+        assert_eq!(
+            f32::from_le_bytes([fields[12], fields[13], fields[14], fields[15]]),
+            0.5
+        );
+        // A stale sample is worse than no sample.
+        assert_eq!(message.delivery, crate::enet::Delivery::Unreliable);
+        let accel = encoder.motion_message(1, MotionSensor::Accel, [0.0; 3]);
+        assert_eq!(body(&accel)[1], 0x01, "acceleration discriminator");
+    }
+
+    /// One host switches on the event type; another ignores it and thresholds
+    /// pressure. A contact must read as contact under both.
+    #[test]
+    fn a_touch_carries_contact_pressure_as_well_as_its_event_type() {
+        let mut encoder = InputEncoder::new();
+        let mut touch = |phase, pressure| {
+            let event = gsa_protocol::input::InputEvent::GamepadTouch {
+                seat: 0,
+                pointer: 3,
+                phase,
+                x: 0.25,
+                y: 0.5,
+                pressure,
+                ts_us: 0,
+            };
+            body(&encoder.encode(&event).expect("touch encodes"))
+        };
+
+        // A press reporting no pressure at all still has to register.
+        let down = touch(TouchPhase::Down, 0.0);
+        assert_eq!(down.len(), 20);
+        assert_eq!(down[1], 0x01);
+        assert_eq!(u32::from_le_bytes([down[4], down[5], down[6], down[7]]), 3);
+        assert_eq!(
+            f32::from_le_bytes([down[8], down[9], down[10], down[11]]),
+            0.25
+        );
+        let pressure = f32::from_le_bytes([down[16], down[17], down[18], down[19]]);
+        assert!(
+            pressure > 0.5,
+            "reads as contact on a pressure-thresholding host"
+        );
+
+        // A release must fall below the threshold as well as saying "up".
+        let up = touch(TouchPhase::Up, 1.0);
+        assert_eq!(up[1], 0x02);
+        assert_eq!(f32::from_le_bytes([up[16], up[17], up[18], up[19]]), 0.0);
+
+        // Cancel is its own event, not a release.
+        assert_eq!(touch(TouchPhase::Cancel, 1.0)[1], 0x04);
+    }
+
+    #[test]
+    fn battery_reports_an_absent_level_as_unknown_not_as_empty() {
+        let mut encoder = InputEncoder::new();
+        let mut battery = |state, percent| {
+            let event = gsa_protocol::input::InputEvent::GamepadBattery {
+                seat: 0,
+                state,
+                percent,
+                ts_us: 0,
+            };
+            body(&encoder.encode(&event).expect("battery encodes"))
+        };
+        let unknown = battery(BatteryState::Discharging, None);
+        assert_eq!(unknown.len(), 4);
+        assert_eq!(unknown[1], 0x02);
+        assert_eq!(unknown[2], 0xff, "0xff is 'no level', 0 would be 'empty'");
+        assert_eq!(battery(BatteryState::Discharging, Some(0))[2], 0);
+        assert_eq!(battery(BatteryState::Charging, Some(50))[2], 50);
+        assert_eq!(battery(BatteryState::Full, Some(255))[2], 100, "clamped");
+        assert_eq!(battery(BatteryState::NotPresent, None)[1], 0x01);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{InputEncoder, hid_usage_to_virtual_key};
     use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove, gamepad};
@@ -320,7 +729,7 @@ mod tests {
                 ts_us: 0,
             }))
             .unwrap();
-        assert_eq!(hex(&out), "06020c000000000807000000ffff0000");
+        assert_eq!(hex(&out.bytes), "06020c000000000807000000ffff0000");
     }
 
     #[test]
@@ -333,7 +742,7 @@ mod tests {
                 ts_us: 0,
             })
             .unwrap();
-        assert_eq!(hex(&out), "06020900000000050800000001");
+        assert_eq!(hex(&out.bytes), "06020900000000050800000001");
     }
 
     #[test]
@@ -348,7 +757,7 @@ mod tests {
             })
             .unwrap();
         // Published example for left-alt down with the alt modifier set.
-        assert_eq!(hex(&out), "06020e000000000a0300000000a480040000");
+        assert_eq!(hex(&out.bytes), "06020e000000000a0300000000a480040000");
     }
 
     #[test]
@@ -367,7 +776,7 @@ mod tests {
             })
             .unwrap();
         // Modifier byte sits after the key code; shift is 0x01.
-        assert_eq!(out[out.len() - 3], 0x01);
+        assert_eq!(out.bytes[out.bytes.len() - 3], 0x01);
         e.encode(&InputEvent::Key {
             usage: 0xe1,
             down: false,
@@ -381,7 +790,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            out[out.len() - 3],
+            out.bytes[out.bytes.len() - 3],
             0x00,
             "released modifier must stop being sent"
         );
@@ -400,7 +809,7 @@ mod tests {
             .unwrap();
         // Captured from a real client: pad 0, mask 0x0001, button A.
         assert_eq!(
-            hex(&out),
+            hex(&out.bytes),
             "060222000000001e0c0000001a000000010014000010000000000000000000009c0000005500"
         );
     }
@@ -419,7 +828,7 @@ mod tests {
             .unwrap();
         // The active mask lives 4 bytes into the body; a cleared bit is what
         // tells the host to unplug the pad.
-        let mask = u16::from_le_bytes([out[16], out[17]]);
+        let mask = u16::from_le_bytes([out.bytes[16], out.bytes[17]]);
         assert_eq!(mask, 0, "a stale mask would leave the pad plugged in");
     }
 
@@ -438,8 +847,8 @@ mod tests {
             }))
             .unwrap();
         // Trigger byte follows the button word; full pull must reach 255.
-        assert_eq!(out[22], 0xff);
-        assert_eq!(i16::from_le_bytes([out[24], out[25]]), -32768);
+        assert_eq!(out.bytes[22], 0xff);
+        assert_eq!(i16::from_le_bytes([out.bytes[24], out.bytes[25]]), -32768);
     }
 
     #[test]

@@ -50,6 +50,55 @@ pub enum InputEvent {
         seat: u8,
         ts_us: u64,
     },
+    /// A finger on the pad's own touch surface. Distinct from
+    /// [`InputEvent::Touch`], which is a touchscreen: the host routes this to
+    /// the virtual pad's touchpad, and a game reads the two differently.
+    GamepadTouch {
+        seat: u8,
+        /// Which finger, stable for the life of the contact.
+        pointer: u8,
+        phase: TouchPhase,
+        /// Normalized [0,1] across the pad's surface, origin top-left.
+        x: f32,
+        y: f32,
+        /// [0,1]; 1.0 when the surface reports contact without pressure.
+        pressure: f32,
+        ts_us: u64,
+    },
+    /// The pad's charge level, for hosts that present it to the game.
+    GamepadBattery {
+        seat: u8,
+        state: BatteryState,
+        /// 0..=100, or `None` when the pad reports a state but no level.
+        percent: Option<u8>,
+        ts_us: u64,
+    },
+}
+
+/// Where a contact is in its life. `Cancel` is not `Up`: the contact ended
+/// without the user lifting (a palm rejected, the surface losing focus), and a
+/// game that treats it as a release will fire the action the user aborted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum TouchPhase {
+    Down,
+    Move,
+    Up,
+    Cancel,
+}
+
+/// Charge state, as pads report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum BatteryState {
+    /// The pad has no battery — wired, or a virtual pad.
+    NotPresent,
+    Discharging,
+    Charging,
+    /// Charging complete while still on the cable.
+    Full,
+    /// The pad has a battery but will not say more.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -201,6 +250,81 @@ mod tests {
             position(&InputEvent::GamepadDisconnect { seat: 0, ts_us: 0 }),
             8
         );
+        // Appended after `GamepadDisconnect`, never inserted before it.
+        assert_eq!(
+            position(&InputEvent::GamepadTouch {
+                seat: 0,
+                pointer: 0,
+                phase: super::TouchPhase::Down,
+                x: 0.0,
+                y: 0.0,
+                pressure: 1.0,
+                ts_us: 0,
+            }),
+            9
+        );
+        assert_eq!(
+            position(&InputEvent::GamepadBattery {
+                seat: 0,
+                state: super::BatteryState::Discharging,
+                percent: Some(50),
+                ts_us: 0,
+            }),
+            10
+        );
+    }
+
+    /// A cancelled contact must not decode as a release: the game would fire
+    /// the action the user aborted.
+    #[test]
+    fn a_cancelled_contact_survives_the_wire_as_itself() {
+        let bytes = crate::encode_msg(&InputEvent::GamepadTouch {
+            seat: 1,
+            pointer: 2,
+            phase: super::TouchPhase::Cancel,
+            x: 0.25,
+            y: 0.75,
+            pressure: 0.5,
+            ts_us: 7,
+        })
+        .unwrap();
+        let back: InputEvent = crate::decode_msg(&bytes).unwrap();
+        let InputEvent::GamepadTouch {
+            phase, x, pointer, ..
+        } = back
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(phase, super::TouchPhase::Cancel);
+        assert_eq!(pointer, 2);
+        assert!((x - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_battery_without_a_level_is_distinguishable_from_an_empty_one() {
+        for (state, percent) in [
+            (super::BatteryState::Unknown, None),
+            (super::BatteryState::Discharging, Some(0)),
+        ] {
+            let bytes = crate::encode_msg(&InputEvent::GamepadBattery {
+                seat: 0,
+                state,
+                percent,
+                ts_us: 0,
+            })
+            .unwrap();
+            let back: InputEvent = crate::decode_msg(&bytes).unwrap();
+            let InputEvent::GamepadBattery {
+                state: got_state,
+                percent: got_percent,
+                ..
+            } = back
+            else {
+                panic!("wrong variant");
+            };
+            assert_eq!(got_state, state);
+            assert_eq!(got_percent, percent);
+        }
     }
 
     #[test]

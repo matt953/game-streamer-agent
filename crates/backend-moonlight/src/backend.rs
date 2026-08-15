@@ -88,12 +88,45 @@ impl InputSink for MoonlightInput {
             return;
         };
         for event in &events {
+            // Motion carries two sensors in one event but the wire has one
+            // message per sensor, so it is expanded here rather than losing
+            // half of it.
+            if let gsa_client_backend_api::InputEvent::GamepadMotion {
+                seat, gyro, accel, ..
+            } = event
+            {
+                for (sensor, values) in [
+                    (gsa_client_backend_api::MotionSensor::Gyro, gyro),
+                    (gsa_client_backend_api::MotionSensor::Accel, accel),
+                ] {
+                    let message = encoder.motion_message(*seat, sensor, *values);
+                    let _ = self.commands.send(Command::Input {
+                        bytes: message.bytes,
+                        delivery: message.delivery,
+                    });
+                }
+                continue;
+            }
             if let Some(message) = encoder.encode(event) {
                 // Fire-and-forget: a full queue means the session is ending,
                 // and this runs on the embedder's UI thread.
-                let _ = self.commands.send(Command::Input(message));
+                let _ = self.commands.send(Command::Input {
+                    bytes: message.bytes,
+                    delivery: message.delivery,
+                });
             }
         }
+    }
+
+    fn announce_pad(&self, seat: u8, profile: gsa_client_backend_api::GamepadProfile) {
+        let Ok(encoder) = self.encoder.lock() else {
+            return;
+        };
+        let message = encoder.arrival_message(seat, profile);
+        let _ = self.commands.send(Command::Input {
+            bytes: message.bytes,
+            delivery: message.delivery,
+        });
     }
 }
 
@@ -164,12 +197,22 @@ impl MoonlightStream {
 
     /// What of a controller this session carries.
     ///
-    /// Rumble only for now: the protocol also defines pad announcement,
-    /// motion, touchpad and battery, but claiming a capability the encoder
-    /// does not send would have the embedder capture for nothing.
+    /// This is the *protocol's* reach, not a promise about the host at the
+    /// other end: a host that emulates a lesser pad ignores what it cannot
+    /// use. Motion is the exception that proves the design — it is listed
+    /// here but must not be sampled until the host asks
+    /// ([`gsa_client_backend_api::BackendEvent::MotionRequested`]), which is
+    /// how a client avoids streaming gyro nobody consumes.
     #[must_use]
     pub fn pad_caps(&self) -> gsa_client_backend_api::PadCaps {
-        gsa_client_backend_api::PadCaps::RUMBLE
+        use gsa_client_backend_api::PadCaps;
+        PadCaps::RUMBLE
+            | PadCaps::TRIGGER_RUMBLE
+            | PadCaps::MOTION
+            | PadCaps::TOUCHPAD
+            | PadCaps::ADAPTIVE_TRIGGERS
+            | PadCaps::LED
+            | PadCaps::BATTERY
     }
 }
 

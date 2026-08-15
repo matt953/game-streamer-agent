@@ -99,6 +99,124 @@ pub fn run(
     Ok(())
 }
 
+/// Drive a synthetic controller so protocol work does not depend on hardware.
+///
+/// Sends a pad snapshot at a plausible rate with one button cycling, which is
+/// enough to make the host plug a virtual pad and reveal what it sends back.
+/// The returned guard stops the thread when the session ends.
+fn spawn_synthetic_pad(input: std::sync::Arc<dyn gsa_client_core::InputSink>) -> SyntheticPad {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    // Motion starts only when the host asks, so the sampling rate is the
+    // host's choice and an unasked stream is never sent.
+    let motion_hz = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let thread_motion = motion_hz.clone();
+    let handle = std::thread::spawn(move || {
+        // Announce before sending state: a host that has not been told what
+        // the pad is builds a plain one and then silently drops everything
+        // richer than buttons.
+        input.announce_pad(
+            0,
+            gsa_client_core::GamepadProfile::new(
+                gsa_client_core::PadKind::DualSense,
+                gsa_client_core::PadCaps::RUMBLE
+                    | gsa_client_core::PadCaps::TRIGGER_RUMBLE
+                    | gsa_client_core::PadCaps::MOTION
+                    | gsa_client_core::PadCaps::TOUCHPAD
+                    | gsa_client_core::PadCaps::LED
+                    | gsa_client_core::PadCaps::BATTERY,
+            ),
+        );
+        let mut tick = 0u32;
+        while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // A button held for half a second, then released: a game (and the
+            // host's own logs) sees a real pad rather than a frozen one.
+            let buttons = if (tick / 30).is_multiple_of(2) {
+                gsa_protocol::input::gamepad::A
+            } else {
+                0
+            };
+            input.send(vec![gsa_client_core::InputEvent::Gamepad(
+                gsa_protocol::input::GamepadInput {
+                    seat: 0,
+                    buttons,
+                    axes: [0; 8],
+                    ts_us: 0,
+                },
+            )]);
+
+            // Motion at the rate the host asked for, sampled between pad
+            // snapshots. Values sweep so a host-side viewer sees movement
+            // rather than a pad lying perfectly still.
+            let hz = thread_motion.load(std::sync::atomic::Ordering::Relaxed);
+            if hz > 0 {
+                let per_frame = (hz / 60).max(1);
+                for _ in 0..per_frame {
+                    let phase = f32::from(tick as u16 % 360) * std::f32::consts::PI / 180.0;
+                    input.send(vec![gsa_client_core::InputEvent::GamepadMotion {
+                        seat: 0,
+                        // Degrees per second.
+                        gyro: [phase.sin() * 90.0, phase.cos() * 90.0, 0.0],
+                        // m/s², including gravity: a pad at rest is not zero.
+                        accel: [0.0, 9.81, 0.0],
+                        ts_us: 0,
+                    }]);
+                }
+            }
+            // A touchpad swipe and a battery report, once, a couple of
+            // seconds in: enough to prove the host accepts both without
+            // flooding the log with them.
+            if tick == 120 {
+                for (step, phase) in [
+                    (0.0, gsa_protocol::input::TouchPhase::Down),
+                    (0.5, gsa_protocol::input::TouchPhase::Move),
+                    (1.0, gsa_protocol::input::TouchPhase::Up),
+                ] {
+                    input.send(vec![gsa_client_core::InputEvent::GamepadTouch {
+                        seat: 0,
+                        pointer: 0,
+                        phase,
+                        x: step,
+                        y: 0.5,
+                        pressure: 1.0,
+                        ts_us: 0,
+                    }]);
+                }
+                input.send(vec![gsa_client_core::InputEvent::GamepadBattery {
+                    seat: 0,
+                    state: gsa_protocol::input::BatteryState::Discharging,
+                    percent: Some(77),
+                    ts_us: 0,
+                }]);
+            }
+            tick = tick.wrapping_add(1);
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+    });
+    SyntheticPad {
+        stop,
+        motion_hz,
+        handle: Some(handle),
+    }
+}
+
+/// Stops the synthetic pad when dropped, so the session teardown is clean.
+struct SyntheticPad {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Sampling rate the host asked for; 0 until it does.
+    motion_hz: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SyntheticPad {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Present a Moonlight host's stream in the same window (spec 16).
 ///
 /// The point of this path is that only the *source* differs: frames arrive
@@ -111,25 +229,38 @@ pub fn run_moonlight(
     bitrate_mbps: u32,
     force_sw: bool,
     seconds: u64,
+    synthetic_pad: bool,
 ) -> Result<()> {
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
     std::thread::Builder::new()
         .name("gsa-moonlight-net".into())
-        .spawn(move || moonlight_loop(addr, app_id, bitrate_mbps, force_sw, seconds, &proxy))?;
+        .spawn(move || {
+            moonlight_loop(
+                addr,
+                app_id,
+                bitrate_mbps,
+                force_sw,
+                seconds,
+                synthetic_pad,
+                &proxy,
+            )
+        })?;
 
     let mut app = App::default();
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments, reason = "dev harness flags, not an API")]
 fn moonlight_loop(
     addr: std::net::SocketAddr,
     app_id: u32,
     bitrate_mbps: u32,
     force_sw: bool,
     seconds: u64,
+    synthetic_pad: bool,
     proxy: &EventLoopProxy<AppEvent>,
 ) {
     let outcome = (|| -> Result<()> {
@@ -179,6 +310,11 @@ fn moonlight_loop(
                 bitrate_mbps.saturating_mul(1_000_000),
             ));
 
+            // A synthetic pad, for probing what the host does once a controller
+            // exists. Real pads come from `GamepadCapture`; this exists so
+            // protocol work does not wait on hardware being awake.
+            let _pad = synthetic_pad.then(|| spawn_synthetic_pad(stream.input.clone()));
+
             let mut decoder = make_decoder(force_sw)?;
             let mut frames = 0u64;
             let deadline = (seconds > 0)
@@ -191,6 +327,20 @@ fn moonlight_loop(
                     break Ok(());
                 };
                 frames += 1;
+                // Drain the host's own messages. The channel is unbounded, and
+                // what arrives on it is the only record of what the host did
+                // with the pad we announced.
+                while let Ok(message) = stream.events.try_recv() {
+                    tracing::info!(?message, "host control message");
+                    // Motion is opt-in: sampling starts here and not before.
+                    if let Some(gsa_client_core::BackendEvent::MotionRequested { rate_hz, .. }) =
+                        message.neutral()
+                        && let Some(pad) = &_pad
+                    {
+                        pad.motion_hz
+                            .store(u32::from(rate_hz), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 // The display path is the source of presentation truth; without
                 // this the health stats would report every frame as unshown.
                 core.frame_presented(out.capture_ts_us);
