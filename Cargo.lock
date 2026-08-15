@@ -1326,6 +1326,7 @@ dependencies = [
 name = "gsa-client-ffi"
 version = "0.1.0"
 dependencies = [
+ "gsa-backend-moonlight",
  "gsa-client-core",
  "gsa-core",
  "gsa-protocol",

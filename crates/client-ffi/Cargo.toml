@@ -15,6 +15,7 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 gsa-client-core = { workspace = true }
+gsa-backend-moonlight = { workspace = true }
 gsa-core = { workspace = true }
 gsa-protocol = { workspace = true }
 gsa-transport = { workspace = true }

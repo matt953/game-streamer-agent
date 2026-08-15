@@ -6,7 +6,9 @@
 //! types. This first function is a **spike**: prove the core links, connects,
 //! and receives from inside the app before the real callback surface lands.
 
-mod devlog;
+pub(crate) mod devlog;
+mod host;
+mod moonlight;
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
@@ -15,8 +17,8 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use gsa_client_core::{
-    Client, ControlEvent, DecodedFrame, GamepadInput, InputEvent, InputSender, PixelOrder,
-    PresentedSink, ServerAuth, SourceKind, VideoDecoder,
+    Client, ControlEvent, DecodedFrame, GamepadInput, InputEvent, PixelOrder, PresentedSink,
+    ServerAuth, SourceKind, VideoDecoder,
 };
 use gsa_core::id::SourceId;
 use gsa_core::media::{Codec, H264Profile};
@@ -187,11 +189,17 @@ pub struct GsaCallbacks {
 
 /// `on_notification` kinds. Stable across the ABI; append new values.
 pub const GSA_NOTIFY_GAMEPAD_CONNECTED: u32 = 1;
+/// The host asked a controller to rumble; `arg` is the seat.
+///
+/// Magnitudes are not carried yet: this callback shape passes a single `u32`,
+/// and packing two 16-bit levels into it would be a trap for the next reader.
+/// A richer feedback callback is the right fix (see spec 16, task 52).
+pub const GSA_NOTIFY_RUMBLE: u32 = 3;
 pub const GSA_NOTIFY_GAMEPAD_DISCONNECTED: u32 = 2;
 
 /// Raw `ctx` isn't `Send`; the embedder owns its thread-safety, so we carry the
 /// callback set across the receive-thread boundary explicitly.
-struct SendCallbacks(GsaCallbacks);
+pub(crate) struct SendCallbacks(pub(crate) GsaCallbacks);
 // SAFETY: the embedder guarantees `ctx` is safe to use from the receive/audio
 // threads (documented on `GsaCallbacks`); Rust only passes it back opaquely.
 unsafe impl Send for SendCallbacks {}
@@ -202,9 +210,13 @@ unsafe impl Send for SendCallbacks {}
 pub struct GsaSession {
     stop: Arc<Notify>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Sync input sink (input events → reliable control stream). Present once
-    /// the session is streaming; `None` if input couldn't be enabled.
-    input: Option<InputSender>,
+    /// Where input goes. Backend-neutral so one session handle serves every
+    /// protocol; `None` if input could not be enabled.
+    input: Option<Arc<dyn gsa_client_core::InputSink>>,
+    /// Live quality controls, when the backend has any. A Moonlight host
+    /// fixes bitrate at negotiation, so it has none — and a control the host
+    /// would ignore is not offered.
+    knobs: Option<Arc<dyn gsa_client_core::SessionKnobs>>,
     /// Presentation reporter for [`gsa_frame_presented`].
     presented: PresentedSink,
     /// Decoder-failure latch for [`gsa_frame_undecodable`].
@@ -217,10 +229,11 @@ pub struct GsaSession {
 
 /// Handed back from `session_loop` once it knows the outcome: whether the
 /// session reached the streaming state, plus its input sink and negotiated codec.
-enum SessionReady {
+pub(crate) enum SessionReady {
     Failed,
     Streaming {
-        input: Option<InputSender>,
+        input: Option<Arc<dyn gsa_client_core::InputSink>>,
+        knobs: Option<Arc<dyn gsa_client_core::SessionKnobs>>,
         presented: PresentedSink,
         decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -310,6 +323,7 @@ pub unsafe extern "C" fn gsa_session_start(
     match ready_rx.recv() {
         Ok(SessionReady::Streaming {
             input,
+            knobs,
             presented,
             decode_error,
             dejitter,
@@ -318,6 +332,7 @@ pub unsafe extern "C" fn gsa_session_start(
             stop,
             thread: Some(thread),
             input,
+            knobs,
             presented,
             decode_error,
             dejitter,
@@ -374,8 +389,8 @@ pub unsafe extern "C" fn gsa_set_bitrate(session: *const GsaSession, bitrate_bps
         return;
     }
     // SAFETY: caller contract guarantees a live handle.
-    if let Some(input) = &unsafe { &*session }.input {
-        input.set_bitrate(bitrate_bps);
+    if let Some(knobs) = &unsafe { &*session }.knobs {
+        knobs.set_bitrate(bitrate_bps);
     }
 }
 
@@ -445,8 +460,8 @@ pub unsafe extern "C" fn gsa_set_abr(session: *const GsaSession, enabled: bool) 
         return;
     }
     // SAFETY: caller contract guarantees a live handle.
-    if let Some(input) = &unsafe { &*session }.input {
-        input.set_abr(enabled);
+    if let Some(knobs) = &unsafe { &*session }.knobs {
+        knobs.set_abr(enabled);
     }
 }
 
@@ -520,7 +535,7 @@ fn now_us() -> u64 {
 /// I/O rather than spin, so this only affects *when* they wake, not fairness.
 /// No-op on other platforms (Android/desktop use their own mechanisms).
 #[cfg(target_vendor = "apple")]
-fn boost_thread_qos() {
+pub(crate) fn boost_thread_qos() {
     // SAFETY: sets only the calling thread's QoS class; always safe to call.
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
@@ -528,7 +543,7 @@ fn boost_thread_qos() {
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn boost_thread_qos() {}
+pub(crate) fn boost_thread_qos() {}
 
 /// Kind of a source, as reported to [`gsa_list_sources`]. Values are stable
 /// across the ABI; `Unknown` covers future variants. Non-`TestPattern` display
@@ -698,7 +713,12 @@ async fn session_loop(
 
     // Hand the sync input sink back with the ready signal; it also routes the
     // recv loop's keyframe requests through its background writer task.
-    let input = client.take_input_sender();
+    let input = client.take_input_sender().map(Arc::new);
+    let knobs: Option<Arc<dyn gsa_client_core::SessionKnobs>> = input
+        .clone()
+        .map(|i| i as Arc<dyn gsa_client_core::SessionKnobs>);
+    let input: Option<Arc<dyn gsa_client_core::InputSink>> =
+        input.map(|i| i as Arc<dyn gsa_client_core::InputSink>);
     let presented = client.presented_sink();
     let decode_error = client.decode_error_flag();
     let dejitter = client.dejitter_flag();
@@ -707,6 +727,7 @@ async fn session_loop(
         .map_or(GSA_CODEC_H264, codec_to_flag);
     let _ = ready_tx.send(SessionReady::Streaming {
         input,
+        knobs,
         presented,
         decode_error,
         dejitter,
@@ -807,7 +828,7 @@ async fn session_loop(
 }
 
 /// Deliver a `GSA_NOTIFY_*` notification to the embedder, if it registered one.
-fn fire_notification(cbs: &GsaCallbacks, kind: u32, arg: u32) {
+pub(crate) fn fire_notification(cbs: &GsaCallbacks, kind: u32, arg: u32) {
     if let Some(cb) = cbs.on_notification {
         // SAFETY: `ctx` valid for the session per the embedder contract.
         unsafe { cb(cbs.ctx, kind, arg) };
@@ -816,6 +837,6 @@ fn fire_notification(cbs: &GsaCallbacks, kind: u32, arg: u32) {
 
 /// Carries a raw `ctx` onto the audio thread. Same embedder contract as
 /// [`SendCallbacks`].
-struct SendPtr(*mut c_void);
+pub(crate) struct SendPtr(pub(crate) *mut c_void);
 // SAFETY: see `GsaCallbacks` threading contract.
 unsafe impl Send for SendPtr {}
