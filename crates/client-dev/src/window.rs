@@ -93,6 +93,122 @@ pub fn run(
     Ok(())
 }
 
+/// Present a Moonlight host's stream in the same window (spec 16).
+///
+/// The point of this path is that only the *source* differs: frames arrive
+/// from a different protocol, and everything after — the reference gate,
+/// de-jitter release, decode, and presentation — is the same code the gsa
+/// backend runs. A picture here is evidence the seam holds.
+pub fn run_moonlight(
+    addr: std::net::SocketAddr,
+    app_id: u32,
+    bitrate_mbps: u32,
+    force_sw: bool,
+    seconds: u64,
+) -> Result<()> {
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+
+    std::thread::Builder::new()
+        .name("gsa-moonlight-net".into())
+        .spawn(move || moonlight_loop(addr, app_id, bitrate_mbps, force_sw, seconds, &proxy))?;
+
+    let mut app = App::default();
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+fn moonlight_loop(
+    addr: std::net::SocketAddr,
+    app_id: u32,
+    bitrate_mbps: u32,
+    force_sw: bool,
+    seconds: u64,
+    proxy: &EventLoopProxy<AppEvent>,
+) {
+    let outcome = (|| -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .context("client runtime")?;
+        runtime.block_on(async {
+            let mut session = crate::moonlight::paired_session(addr).await?;
+            let mut stream = gsa_backend_moonlight::start(
+                &mut session,
+                addr.ip(),
+                app_id,
+                gsa_backend_moonlight::StreamMode::default(),
+                bitrate_mbps.saturating_mul(1000),
+            )
+            .await
+            .context("start moonlight session")?;
+
+            // Everything from here is the shared core.
+            let mut core = gsa_client_core::StreamSession::new(
+                stream.take_frames().context("frames already taken")?,
+                stream.recovery.clone(),
+                gsa_core::time::MediaClock::new(),
+                gsa_client_core::ClockSync::default(),
+                stream.dropped.clone(),
+                stream.recovered.clone(),
+            );
+
+            let mut decoder = make_decoder(force_sw)?;
+            let mut frames = 0u64;
+            let deadline = (seconds > 0)
+                .then(|| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
+            let result = loop {
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    break Ok(());
+                }
+                let Some(out) = core.recv_frame(decoder.as_mut()).await? else {
+                    break Ok(());
+                };
+                frames += 1;
+                // The display path is the source of presentation truth; without
+                // this the health stats would report every frame as unshown.
+                core.frame_presented(out.capture_ts_us);
+                if frames.is_multiple_of(120) {
+                    let present = core.present_stats();
+                    let stats = core.stats();
+                    tracing::info!(
+                        frames,
+                        present_fps = f64::from(present.fps_x100) / 100.0,
+                        low1_fps = f64::from(present.low1_fps_x100) / 100.0,
+                        freezes = present.freezes,
+                        stutters = present.stutters,
+                        dropped = stats.frames_dropped_incomplete,
+                        recovered = stats.frames_recovered,
+                        "moonlight stream stats"
+                    );
+                }
+                if proxy
+                    .send_event(AppEvent::Frame(Box::new(out.frame)))
+                    .is_err()
+                {
+                    break Ok(()); // window closed
+                }
+            };
+            // Always tear the host session down, however this ended: leaving
+            // one behind is what makes the next attempt fail with no picture.
+            drop(core);
+            drop(stream);
+            let _ = session.cancel().await;
+            result
+        })
+    })();
+
+    let message = match outcome {
+        Ok(()) => "stream ended".to_owned(),
+        Err(e) => {
+            tracing::error!(error = format!("{e:#}"), "moonlight session ended");
+            format!("{e:#}")
+        }
+    };
+    let _ = proxy.send_event(AppEvent::StreamEnded(message));
+}
+
 fn network_loop(
     addr: std::net::SocketAddr,
     source: Option<String>,

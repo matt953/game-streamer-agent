@@ -103,6 +103,7 @@ pub fn run(
         {
             match event {
                 enet::Event::Connect { .. } => {
+                    tracing::info!("control channel connected");
                     connected = true;
                     let _ = events.send(HostMessage::Connected);
                 }

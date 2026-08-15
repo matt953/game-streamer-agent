@@ -9,6 +9,7 @@ mod decoder_vt;
 mod gamepad_capture;
 mod headless;
 mod input_capture;
+mod moonlight;
 mod pairing;
 mod window;
 
@@ -60,6 +61,22 @@ struct Cli {
     /// Name recorded on the agent when pairing.
     #[arg(long, default_value = "gsa-client-dev")]
     name: String,
+    /// Stream from a Moonlight host (Sunshine/Apollo) instead of a gsa agent:
+    /// its cleartext address, e.g. `192.168.1.10:47989`. Pair first with the
+    /// backend's `pair` example.
+    #[arg(long)]
+    moonlight: Option<std::net::SocketAddr>,
+    /// App id to launch on the Moonlight host (see the backend's `catalog`).
+    #[arg(long, default_value_t = 881_448_767)]
+    moonlight_app: u32,
+    /// Bitrate to request from the Moonlight host, Mb/s.
+    #[arg(long, default_value_t = 20)]
+    moonlight_mbps: u32,
+    /// Stop after N seconds (0 = until the window closes). Exiting cleanly
+    /// matters: a session abandoned mid-stream leaves the host unable to
+    /// start the next one.
+    #[arg(long, default_value_t = 0)]
+    moonlight_seconds: u64,
 }
 
 fn main() -> Result<()> {
@@ -77,6 +94,16 @@ fn main() -> Result<()> {
         let code = cli.code.as_deref().context("--pair requires --code")?;
         let runtime = tokio::runtime::Runtime::new()?;
         return runtime.block_on(pairing::run_pair(cli.connect, code, &cli.name));
+    }
+
+    if let Some(host) = cli.moonlight {
+        return window::run_moonlight(
+            host,
+            cli.moonlight_app,
+            cli.moonlight_mbps,
+            cli.sw_decode,
+            cli.moonlight_seconds,
+        );
     }
 
     let auth = pairing::load_auth()?;

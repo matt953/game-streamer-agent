@@ -120,9 +120,7 @@ pub async fn start(
     const FIRST_MEDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     for attempt in 0..2 {
-        if let Err(e) = session.cancel().await {
-            tracing::debug!(error = %e, "nothing to clear before launch");
-        }
+        clear_running_session(session).await;
         let launched = session.launch(app_id, mode).await?;
         let stream = connect(&launched, host_ip, mode, bitrate_kbps).await?;
         if stream.wait_for_media(FIRST_MEDIA_TIMEOUT).await {
@@ -163,6 +161,14 @@ async fn connect(
         })
         .await?;
 
+    tracing::info!(
+        video = negotiated.video_port,
+        audio = negotiated.audio_port,
+        control = negotiated.control_port,
+        payload = negotiated.ping_payload.is_some(),
+        connect_data = ?negotiated.connect_data,
+        "negotiated"
+    );
     let (command_tx, command_rx) = std::sync::mpsc::channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let crypto = Crypto::new(launched.riaes_key, negotiated.control_v2());
@@ -232,6 +238,39 @@ async fn connect(
             stop,
         },
     })
+}
+
+/// Stop whatever the host is streaming, and wait until it says so.
+///
+/// Cancelling blind and launching immediately is a race: the host finishes
+/// tearing down *after* our new session exists and takes it with it, which
+/// presents as a session that handshakes perfectly and never sends a frame.
+/// So only cancel when the host says it is busy, then wait for it to agree
+/// that it is idle before launching.
+async fn clear_running_session(session: &PairedSession) {
+    const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    match session.server_info().await {
+        // Nothing running: launching straight into a clean host is the
+        // common case and must not pay for the recovery path.
+        Ok(info) if !info.state.ends_with("_BUSY") => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read host state before launch");
+            return;
+        }
+    }
+    if let Err(e) = session.cancel().await {
+        tracing::debug!(error = %e, "cancel before launch failed");
+    }
+    let deadline = std::time::Instant::now() + SETTLE_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        match session.server_info().await {
+            Ok(info) if !info.state.ends_with("_BUSY") => return,
+            _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        }
+    }
+    tracing::warn!("host still reports a session running; launching anyway");
 }
 
 /// Read datagrams, reassemble, and publish frames at their arrival time.
