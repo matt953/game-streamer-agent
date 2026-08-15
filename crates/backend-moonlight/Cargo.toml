@@ -1,0 +1,19 @@
+[package]
+name = "gsa-backend-moonlight"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Moonlight-protocol client backend (Sunshine/Apollo/Wolf hosts) — clean-room, see spec 16"
+
+[dependencies]
+gsa-core = { workspace = true }
+gsa-client-backend-api = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+roxmltree = "0.21"
+
+[lints]
+workspace = true
