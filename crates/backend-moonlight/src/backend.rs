@@ -7,7 +7,7 @@
 
 use crate::host::{LaunchedSession, PairedSession, StreamMode};
 use crate::{Command, Crypto, Depacketizer, MediaSocket, Received, Rtsp, StreamRequest};
-use gsa_client_backend_api::{BackendFrame, RecoverySink, SessionOrigin};
+use gsa_client_backend_api::{BackendFrame, InputSink, RecoverySink, SessionOrigin};
 use gsa_core::{Error, Result};
 
 /// Asks the host to repair the reference chain, via the control channel.
@@ -41,6 +41,31 @@ impl RecoverySink for MoonlightRecovery {
     }
 }
 
+/// Sends the embedder's input over the control channel.
+///
+/// The encoder is stateful — it remembers held modifiers and which pads are
+/// plugged in — so it lives here rather than being rebuilt per event.
+#[derive(Debug)]
+pub struct MoonlightInput {
+    commands: std::sync::mpsc::Sender<Command>,
+    encoder: std::sync::Mutex<crate::InputEncoder>,
+}
+
+impl InputSink for MoonlightInput {
+    fn send(&self, events: Vec<gsa_client_backend_api::InputEvent>) {
+        let Ok(mut encoder) = self.encoder.lock() else {
+            return;
+        };
+        for event in &events {
+            if let Some(message) = encoder.encode(event) {
+                // Fire-and-forget: a full queue means the session is going
+                // away, and blocking a UI thread on it would be worse.
+                let _ = self.commands.send(Command::Input(message));
+            }
+        }
+    }
+}
+
 /// A live Moonlight stream, reduced to the neutral pieces.
 #[derive(Debug)]
 pub struct MoonlightStream {
@@ -50,6 +75,8 @@ pub struct MoonlightStream {
     /// receive threads alive.
     frames: Option<tokio::sync::mpsc::UnboundedReceiver<BackendFrame>>,
     pub recovery: std::sync::Arc<dyn RecoverySink>,
+    /// Where to send keyboard, mouse and controller input.
+    pub input: std::sync::Arc<dyn InputSink>,
     /// Frames the wire could not deliver whole, for the shared health stats.
     pub dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Frames rebuilt from parity — loss that cost nothing visible.
@@ -271,6 +298,10 @@ async fn connect(
         recovery: std::sync::Arc::new(MoonlightRecovery {
             commands: std::sync::Mutex::new(command_tx.clone()),
             reference_invalidation: negotiated.reference_invalidation,
+        }),
+        input: std::sync::Arc::new(MoonlightInput {
+            commands: command_tx.clone(),
+            encoder: std::sync::Mutex::new(crate::InputEncoder::new()),
         }),
         dropped,
         recovered,

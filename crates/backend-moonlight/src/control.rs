@@ -16,6 +16,7 @@ pub mod msg {
     pub const START_B: u16 = 0x0307;
     pub const PERIODIC_PING: u16 = 0x0200;
     pub const IDR_FRAME: u16 = 0x0302;
+    pub const INPUT_DATA: u16 = 0x0206;
     pub const INVALIDATE_REF_FRAMES: u16 = 0x0301;
     pub const RUMBLE: u16 = 0x010b;
     /// The specification and every implementation disagree here, so both are

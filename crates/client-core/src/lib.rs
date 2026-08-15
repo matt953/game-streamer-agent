@@ -13,7 +13,7 @@ pub mod stats;
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
 pub use gsa_client_backend_api::{
     ActiveSession, BackendEvent, BackendFrame, CaptureClock, InputSink, RecoverySink, SessionCaps,
-    SessionKnobs, StreamBackend,
+    SessionKnobs, SessionOrigin, StreamBackend,
 };
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
 pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
@@ -165,6 +165,33 @@ impl InputSender {
     /// Enable/disable server-side ABR for the session.
     pub fn set_abr(&self, enabled: bool) {
         let _ = self.tx.send(C2A::SetAbr { enabled });
+    }
+}
+
+impl gsa_client_backend_api::InputSink for InputSender {
+    fn send(&self, events: Vec<gsa_protocol::input::InputEvent>) {
+        InputSender::send(self, events);
+    }
+}
+
+impl SessionKnobs for InputSender {
+    fn caps(&self) -> SessionCaps {
+        SessionCaps {
+            live_bitrate: true,
+            server_abr: true,
+            reference_invalidation: true,
+            // The agent stamps frames with its own capture clock and we keep
+            // an offset estimate, so latency here is true glass-to-glass.
+            capture_clock: CaptureClock::HostSynced,
+        }
+    }
+
+    fn set_bitrate(&self, bitrate_bps: u32) {
+        InputSender::set_bitrate(self, bitrate_bps);
+    }
+
+    fn set_abr(&self, enabled: bool) {
+        InputSender::set_abr(self, enabled);
     }
 }
 

@@ -25,8 +25,14 @@ const GAMEPAD_POLL: std::time::Duration = std::time::Duration::from_millis(4);
 
 #[derive(Debug)]
 enum AppEvent {
-    /// Session is streaming: input sink + the agent's starting bitrate (bps).
-    Ready(gsa_client_core::InputSender, u32),
+    /// Session is streaming: where input goes, the quality controls the
+    /// backend actually supports (`None` when it has none), and the starting
+    /// bitrate (bps).
+    Ready(
+        std::sync::Arc<dyn gsa_client_core::InputSink>,
+        Option<std::sync::Arc<dyn gsa_client_core::SessionKnobs>>,
+        u32,
+    ),
     Frame(Box<DecodedFrame>),
     /// Rolling received video goodput (Mb/s), for the title HUD.
     RecvMbps(Option<f64>),
@@ -154,6 +160,15 @@ fn moonlight_loop(
                 stream.recovered.clone(),
             );
 
+            // Input goes over the same control channel; the host exposes no
+            // live quality knobs, so none are offered rather than shown and
+            // silently ignored.
+            let _ = proxy.send_event(AppEvent::Ready(
+                stream.input.clone(),
+                None,
+                bitrate_mbps.saturating_mul(1_000_000),
+            ));
+
             let mut decoder = make_decoder(force_sw)?;
             let mut frames = 0u64;
             let deadline = (seconds > 0)
@@ -244,7 +259,12 @@ fn network_loop(
                 .await?;
 
             if let Some(sender) = client.take_input_sender() {
-                let _ = proxy.send_event(AppEvent::Ready(sender, params.bitrate_bps));
+                let sender = std::sync::Arc::new(sender);
+                let _ = proxy.send_event(AppEvent::Ready(
+                    sender.clone(),
+                    Some(sender),
+                    params.bitrate_bps,
+                ));
             }
 
             // Start audio playback; keep `_audio` alive for the session. Video
@@ -341,7 +361,9 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     latest: Option<Box<DecodedFrame>>,
-    input: Option<gsa_client_core::InputSender>,
+    input: Option<std::sync::Arc<dyn gsa_client_core::InputSink>>,
+    /// Live quality controls, when the backend has any.
+    knobs: Option<std::sync::Arc<dyn gsa_client_core::SessionKnobs>>,
     /// Presented content rect (letterboxed), for normalizing cursor coords.
     content_rect: Option<(f32, f32, f32, f32)>,
     gamepad: Option<GamepadCapture>,
@@ -429,8 +451,9 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::Ready(sender, bitrate) => {
-                self.input = Some(sender);
+            AppEvent::Ready(input, knobs, bitrate) => {
+                self.input = Some(input);
+                self.knobs = knobs;
                 self.bitrate_bps = bitrate;
                 self.update_title();
             }
@@ -513,7 +536,7 @@ impl ApplicationHandler<AppEvent> for App {
                         PhysicalKey::Code(KeyCode::BracketLeft | KeyCode::BracketRight)
                     )
                 {
-                    if self.input.is_some() {
+                    if self.knobs.is_some() {
                         let up = key.physical_key == PhysicalKey::Code(KeyCode::BracketRight);
                         let stepped = if up {
                             u64::from(self.bitrate_bps) * 5 / 4
@@ -521,8 +544,8 @@ impl ApplicationHandler<AppEvent> for App {
                             u64::from(self.bitrate_bps) * 3 / 4
                         };
                         self.bitrate_bps = (stepped as u32).clamp(200_000, 100_000_000);
-                        if let Some(input) = &self.input {
-                            input.set_bitrate(self.bitrate_bps);
+                        if let Some(knobs) = &self.knobs {
+                            knobs.set_bitrate(self.bitrate_bps);
                         }
                         tracing::info!(
                             bitrate_bps = self.bitrate_bps,
@@ -537,10 +560,10 @@ impl ApplicationHandler<AppEvent> for App {
                 if key.state == winit::event::ElementState::Pressed
                     && key.physical_key == PhysicalKey::Code(KeyCode::Backslash)
                 {
-                    if self.input.is_some() {
+                    if self.knobs.is_some() {
                         self.abr_on = !self.abr_on;
-                        if let Some(input) = &self.input {
-                            input.set_abr(self.abr_on);
+                        if let Some(knobs) = &self.knobs {
+                            knobs.set_abr(self.abr_on);
                         }
                         tracing::info!(abr_on = self.abr_on, "ABR toggled (\\)");
                         self.update_title();

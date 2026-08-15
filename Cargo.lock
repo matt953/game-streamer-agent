@@ -1211,6 +1211,7 @@ dependencies = [
  "gsa-client-backend-api",
  "gsa-client-core",
  "gsa-core",
+ "gsa-protocol",
  "rand_core 0.6.4",
  "rcgen",
  "roxmltree",
