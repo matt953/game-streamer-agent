@@ -77,6 +77,10 @@ async fn capture(
         })
         .await?;
     println!("negotiated video port {}", negotiated.video_port);
+    println!(
+        "  session ping payload: {}",
+        negotiated.ping_payload.is_some()
+    );
 
     // The control channel must be up: some hosts only begin sending media
     // once they have seen the start messages on it.
@@ -91,6 +95,11 @@ async fn capture(
 
     let video_addr = std::net::SocketAddr::new(addr.ip(), negotiated.video_port);
     let mut video = gsa_backend_moonlight::MediaSocket::bind(video_addr, negotiated.ping_payload)?;
+    // The audio port must be pinged even though this example never reads it:
+    // without it the host tears the whole session down after ten seconds.
+    // It pings by address — the session payload belongs to video alone.
+    let audio_addr = std::net::SocketAddr::new(addr.ip(), negotiated.audio_port);
+    let mut audio = gsa_backend_moonlight::MediaSocket::bind(audio_addr, None)?;
     println!(
         "pinging {video_addr} from local port {}",
         video.local_port()
@@ -107,17 +116,46 @@ async fn capture(
     let mut bytes = 0usize;
     let start = std::time::Instant::now();
     let mut last_ping = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    // Functional probe: if the host honours a keyframe request, our control
+    // messages are genuinely being understood, not merely sent.
+    let mut idr_requested = false;
 
-    while start.elapsed() < std::time::Duration::from_secs(12) {
+    let run_for = std::time::Duration::from_secs(
+        std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12),
+    );
+    let mut last_report = std::time::Instant::now();
+    let mut window = 0usize;
+    while start.elapsed() < run_for {
+        if last_report.elapsed() >= std::time::Duration::from_secs(2) {
+            println!(
+                "  [{:>5.1}s] video: {window} datagrams in the last 2s",
+                start.elapsed().as_secs_f32()
+            );
+            window = 0;
+            last_report = std::time::Instant::now();
+        }
         if last_ping.elapsed() >= std::time::Duration::from_millis(500) {
             video.ping()?;
+            audio.ping()?;
             last_ping = std::time::Instant::now();
         }
+        if !idr_requested && start.elapsed() >= std::time::Duration::from_secs(4) {
+            idr_requested = true;
+            println!(
+                "  [{:>5.1}s] asking the host for a keyframe",
+                start.elapsed().as_secs_f32()
+            );
+            let _ = cmd_tx.send(gsa_backend_moonlight::Command::RequestIdr);
+        }
         while let Ok(m) = evt_rx.try_recv() {
-            println!("  control: {m:?}");
+            println!("  [{:>5.1}s] control: {m:?}", start.elapsed().as_secs_f32());
         }
         if let Some(n) = video.recv(&mut buf)? {
             seen += 1;
+            window += 1;
             bytes += n;
             depacketizer.push(&buf[..n]);
             while let Some(event) = depacketizer.next_event() {
@@ -127,8 +165,14 @@ async fn capture(
                         frame_bytes += f.data.len();
                         if f.keyframe {
                             keyframes += 1;
+                            println!(
+                                "  [{:>5.1}s] keyframe #{keyframes} (frame {})",
+                                start.elapsed().as_secs_f32(),
+                                f.frame_index
+                            );
                         }
                         if first_frame.is_none() {
+                            println!("  [{:>5.1}s] first frame", start.elapsed().as_secs_f32());
                             println!(
                                 "first frame: index={} keyframe={} {} bytes, starts:",
                                 f.frame_index,

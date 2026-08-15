@@ -40,8 +40,14 @@ pub struct Negotiated {
     pub video_port: u16,
     pub audio_port: u16,
     pub control_port: u16,
-    /// Echoed back in the media-port pings so the host can bind our streams
-    /// without trusting the source address.
+    /// Session ping payload, echoed so the host can bind a stream to this
+    /// session rather than trusting the source address.
+    ///
+    /// **Exactly one socket may use it.** The host issues a single payload
+    /// for the whole session and binds by payload, so a second socket
+    /// sending the same value steals the first stream's binding — observed
+    /// live: pinging audio with this payload silently stopped video. Give it
+    /// to the video socket; audio uses the address-matched legacy ping.
     pub ping_payload: Option<[u8; 16]>,
     /// Passed as ENet connect data, binding the control channel to this
     /// session for the same reason.

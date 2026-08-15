@@ -15,7 +15,7 @@ use rusty_enet as enet;
 
 /// How often to tell the host we are still here. Hosts drop a session after
 /// several seconds without one, and ENet's own keepalives do not count.
-const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Poll interval. ENet needs servicing regularly to retransmit and to
 /// surface received packets.
@@ -32,8 +32,12 @@ pub enum HostMessage {
     /// Reported rather than inferred: everything else depends on it, and a
     /// silent failure to connect looks exactly like a quiet host.
     Connected,
-    /// The session is over; the payload is the host's reason code.
+    /// The host said the session is over, with its own reason code.
     Terminated { reason: u32 },
+    /// The ENet peer went away without the host saying why — a timeout or a
+    /// reset. Distinct from `Terminated` because the causes and the fixes are
+    /// completely different.
+    Disconnected,
     Rumble {
         controller: u16,
         low_frequency: u16,
@@ -103,7 +107,7 @@ pub fn run(
                     let _ = events.send(HostMessage::Connected);
                 }
                 enet::Event::Disconnect { .. } => {
-                    let _ = events.send(HostMessage::Terminated { reason: 0 });
+                    let _ = events.send(HostMessage::Disconnected);
                     return Ok(());
                 }
                 enet::Event::Receive { packet, .. } => {
@@ -187,8 +191,17 @@ fn send<S: enet::Socket>(
 ) -> Result<()> {
     let frame = crypto.seal(plaintext)?;
     let packet = enet::Packet::reliable(frame.as_slice());
+    let mut sent = false;
     for peer in host.connected_peers_mut() {
-        let _ = peer.send(0, &packet);
+        match peer.send(0, &packet) {
+            Ok(()) => sent = true,
+            // Silently dropping these would turn a dead control channel into
+            // a mystery: the session simply stops responding.
+            Err(e) => tracing::warn!(error = ?e, "control send failed"),
+        }
+    }
+    if !sent {
+        tracing::warn!("control message dropped: no connected peer");
     }
     Ok(())
 }

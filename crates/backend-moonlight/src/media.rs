@@ -5,6 +5,18 @@
 //! streams back to its source port. So the ping must leave the very socket we
 //! intend to receive on, and it must keep going until frames arrive: until
 //! the host has heard from us it has nowhere to send.
+//!
+//! Two rules learned the hard way against a real host:
+//!
+//! - **Every media port must be pinged, including one we do not consume.**
+//!   Pinging video alone let video flow, and then the host tore the whole
+//!   session down after ten seconds — video and control both stopped.
+//! - **Only one socket may use the session ping payload.** The host issues a
+//!   single payload per session and binds streams by it, so a second socket
+//!   sending the same value re-binds the first stream to the wrong port.
+//!   Giving audio the same payload as video silently killed video entirely.
+//!   The stream we actually read gets the payload; the other pings by
+//!   address with the legacy form.
 
 use gsa_core::{Error, Result};
 
@@ -23,6 +35,9 @@ pub struct MediaSocket {
 }
 
 impl MediaSocket {
+    /// `payload` binds this socket to the session; pass `None` to ping by
+    /// address instead. See the module note — at most one socket per session
+    /// may carry the payload.
     pub fn bind(host: std::net::SocketAddr, payload: Option<[u8; 16]>) -> Result<Self> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")
             .map_err(|e| Error::Transport(format!("bind media socket: {e}")))?;
