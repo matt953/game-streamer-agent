@@ -6,11 +6,13 @@
 //! keyframe — which is why a small gap is concealed and a large one simply
 //! resumes.
 //!
-//! **Not yet exercised against a real host.** The dev host produces no audio
-//! at all — the stock client gets none from it either — so this path is
-//! covered by round-trip tests through the same Opus codec the wire uses, and
-//! its behaviour on live packets is unproven. Treat a first live session as a
-//! test, not a regression check.
+//! Verified against a real host (2026-08-15): 798 packets decoded to 798 PCM
+//! frames with no gaps — 3.99 s of 48 kHz stereo, matching the packet count
+//! exactly — and the samples carry real programme material rather than
+//! silence. Audio only appears when the host's capture can actually hear
+//! something: an application holding the audio device exclusively makes the
+//! host send nothing at all, which is a host condition and not a client
+//! fault.
 
 use gsa_audio::OpusDecoder;
 use gsa_core::Result;

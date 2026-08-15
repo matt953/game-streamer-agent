@@ -95,6 +95,14 @@ async fn main() {
     // not producing audio for this session at all.
     let mut second: Option<gsa_backend_moonlight::MediaSocket> = None;
     let mut on_second = 0usize;
+    // Feed what arrives through the real decode path and measure the result:
+    // decoding without checking the samples would pass on silence.
+    let (mut audio_rx, pcm_out) = gsa_backend_moonlight::AudioReceive::new().expect("audio");
+    let mut pcm_frames = 0usize;
+    let mut samples = 0usize;
+    let mut peak = 0i32;
+    let mut energy = 0f64;
+    let mut wav: Vec<i16> = Vec::new();
     let mut buf = vec![0u8; 4096];
     let mut by_type: std::collections::BTreeMap<u8, (usize, usize)> =
         std::collections::BTreeMap::new();
@@ -136,6 +144,18 @@ async fn main() {
                 continue;
             }
             let packet_type = buf[1];
+            if gsa_backend_moonlight::AudioReceive::owns(&buf[..n]) {
+                audio_rx.handle(&buf[..n]);
+                while let Ok(pcm) = pcm_out.try_recv() {
+                    pcm_frames += 1;
+                    samples += pcm.len();
+                    for s in &pcm {
+                        peak = peak.max(i32::from(s.abs()));
+                        energy += f64::from(*s) * f64::from(*s);
+                    }
+                    wav.extend_from_slice(&pcm);
+                }
+            }
             let entry = by_type.entry(packet_type).or_insert((0, 0));
             entry.0 += 1;
             entry.1 += n;
@@ -150,7 +170,21 @@ async fn main() {
         }
     }
 
-    println!("\nsecond socket received {on_second} datagrams");
+    let rms = if samples > 0 {
+        (energy / samples as f64).sqrt()
+    } else {
+        0.0
+    };
+    println!("\ndecoded {pcm_frames} PCM frames, {samples} samples, peak {peak}, rms {rms:.0}");
+    println!("second socket received {on_second} datagrams");
+    if !wav.is_empty() {
+        let path = std::env::temp_dir().join("gsa-moonlight-audio.wav");
+        if let Err(e) = write_wav(&path, &wav, 48_000, 2) {
+            println!("could not write audio: {e}");
+        } else {
+            println!("wrote {} ({} samples)", path.display(), wav.len());
+        }
+    }
     println!("\npacket types seen (type: count, bytes):");
     for (kind, (count, bytes)) in &by_type {
         let label = match kind {
@@ -165,4 +199,33 @@ async fn main() {
     let _ = cmd_tx.send(gsa_backend_moonlight::Command::Stop);
     let _ = control.join();
     let _ = session.cancel().await;
+}
+
+/// Write interleaved PCM as a WAV so a human can listen to what we decoded.
+fn write_wav(
+    path: &std::path::Path,
+    pcm: &[i16],
+    sample_rate: u32,
+    channels: u16,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let data_len = (pcm.len() * 2) as u32;
+    let byte_rate = sample_rate * u32::from(channels) * 2;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&channels.to_le_bytes())?;
+    f.write_all(&sample_rate.to_le_bytes())?;
+    f.write_all(&byte_rate.to_le_bytes())?;
+    f.write_all(&(channels * 2).to_le_bytes())?; // block align
+    f.write_all(&16u16.to_le_bytes())?; // bits per sample
+    f.write_all(b"data")?;
+    f.write_all(&data_len.to_le_bytes())?;
+    for s in pcm {
+        f.write_all(&s.to_le_bytes())?;
+    }
+    f.flush()
 }
