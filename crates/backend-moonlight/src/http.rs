@@ -28,8 +28,21 @@ pub(crate) async fn get(addr: std::net::SocketAddr, path_and_query: &str) -> Res
         .map_err(|e| Error::Transport(format!("connect {addr}: {e}")))?;
     // Nagle would sit on this request waiting for more to send.
     let _ = stream.set_nodelay(true);
+    exchange(&mut stream, addr, path_and_query).await
+}
+
+/// Send one `GET` and read the whole response off an already-connected
+/// stream, so the plain and TLS paths share their framing.
+pub(crate) async fn exchange<S>(
+    stream: &mut S,
+    host: std::net::SocketAddr,
+    path_and_query: &str,
+) -> Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let request =
-        format!("GET {path_and_query} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        format!("GET {path_and_query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await

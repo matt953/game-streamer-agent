@@ -130,7 +130,26 @@ fn field(body: &[u8], name: &str) -> Result<String> {
         .ok_or_else(|| Error::Session(format!("pairing reply has no <{name}>: {text}")))
 }
 
+/// Percent-encode a value for a query string, keeping only the characters
+/// that are unambiguous everywhere.
+fn query_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(*byte));
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Run the handshake against a host.
+///
+/// `device_name` is how we introduce ourselves, and it is **required**: a host
+/// that gets no name answers the first request with an empty document instead
+/// of opening a pairing session, so the PIN never gets a chance to matter.
 ///
 /// `pin` must be shown to the operator to enter host-side. The first request
 /// **blocks until they do**, so this call can legitimately take minutes;
@@ -138,6 +157,7 @@ fn field(body: &[u8], name: &str) -> Result<String> {
 pub async fn pair(
     addr: std::net::SocketAddr,
     client_id: &str,
+    device_name: &str,
     pin: &str,
     identity: &ClientIdentity,
 ) -> Result<PairedHost> {
@@ -148,7 +168,8 @@ pub async fn pair(
     let body = http::get(
         addr,
         &format!(
-            "/pair?uniqueid={client_id}&phrase=getservercert&salt={}&clientcert={}",
+            "/pair?uniqueid={client_id}&devicename={}&phrase=getservercert&salt={}&clientcert={}",
+            query_escape(device_name),
             hex::encode(&salt),
             hex::encode(identity.cert_pem().as_bytes()),
         ),

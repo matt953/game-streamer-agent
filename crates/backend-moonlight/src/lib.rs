@@ -16,10 +16,13 @@
 //!
 
 mod hex;
+mod host;
 mod http;
 mod identity;
 mod pair;
+mod tls;
 
+pub use host::PairedSession;
 pub use identity::ClientIdentity;
 pub use pair::{PairedHost, pair, random_pin};
 
@@ -55,6 +58,8 @@ pub struct ServerInfo {
     pub state: String,
     /// Codec capability bitfield, meaningless until paired (see above).
     pub codec_mode_support: u32,
+    /// App id the host is currently running, 0 when idle.
+    pub current_game: u32,
 }
 
 /// Ask a host to describe itself over the cleartext port. This is the only
@@ -68,7 +73,7 @@ pub async fn probe(addr: std::net::SocketAddr, client_id: &str) -> Result<Server
     parse_server_info(&body)
 }
 
-fn parse_server_info(body: &[u8]) -> Result<ServerInfo> {
+pub(crate) fn parse_server_info(body: &[u8]) -> Result<ServerInfo> {
     let text = std::str::from_utf8(body).map_err(|_| Error::Session("non-UTF-8 XML".into()))?;
     let doc = roxmltree::Document::parse(text)
         .map_err(|e| Error::Session(format!("malformed serverinfo XML: {e}")))?;
@@ -96,6 +101,9 @@ fn parse_server_info(body: &[u8]) -> Result<ServerInfo> {
         state: field("state").unwrap_or_default(),
         codec_mode_support: field("ServerCodecModeSupport")
             .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        current_game: field("currentgame")
+            .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0),
     })
 }

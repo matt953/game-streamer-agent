@@ -60,13 +60,43 @@ async fn main() {
     println!();
     println!("waiting for the host to accept (it will not answer until then) …");
 
-    match gsa_backend_moonlight::pair(addr, client_id, &pin, &identity).await {
+    match gsa_backend_moonlight::pair(addr, client_id, "gsa dev client", &pin, &identity).await {
         Ok(paired) => {
-            println!("paired with {}", addr);
-            println!(
-                "host certificate: {} bytes of PEM",
-                paired.host_cert_pem.len()
+            println!("paired with {addr}");
+            // Prove the pairing is real by using it: the app list is only
+            // reachable over mutual TLS as a client the host now trusts.
+            let info = gsa_backend_moonlight::probe(addr, client_id)
+                .await
+                .expect("probe");
+            // Persist the host certificate: it is what pins every future
+            // TLS connection to this exact machine.
+            let cert_path = std::env::temp_dir().join("gsa-moonlight-host-cert.pem");
+            std::fs::write(&cert_path, &paired.host_cert_pem).expect("save host cert");
+            println!("host certificate saved to {}", cert_path.display());
+            let tls_addr = std::net::SocketAddr::new(addr.ip(), info.https_port);
+            let session = gsa_backend_moonlight::PairedSession::new(
+                tls_addr,
+                paired.host_cert_pem,
+                identity,
+                client_id.to_owned(),
             );
+            let info = session
+                .server_info()
+                .await
+                .expect("authenticated serverinfo");
+            println!(
+                "host says: paired={} codecs={:#x} current_game={}",
+                info.paired, info.codec_mode_support, info.current_game
+            );
+            for entry in session.catalog().await.expect("catalog") {
+                println!(
+                    "  [{:>10}] {:<20} {:?}{}",
+                    entry.id,
+                    entry.title,
+                    entry.kind,
+                    if entry.running { "  (running)" } else { "" }
+                );
+            }
         }
         Err(e) => {
             eprintln!("pairing failed: {e}");
