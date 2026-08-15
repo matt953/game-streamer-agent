@@ -21,6 +21,7 @@ mod hex;
 mod host;
 mod http;
 mod identity;
+mod media;
 mod pair;
 mod rtsp;
 mod tls;
@@ -29,6 +30,7 @@ pub use control::{Crypto, message, message_type, msg};
 pub use enet::{Command, HostMessage, run as run_control};
 pub use host::{LaunchedSession, PairedSession, StreamMode};
 pub use identity::ClientIdentity;
+pub use media::MediaSocket;
 pub use pair::{PairedHost, pair, random_pin};
 pub use rtsp::{Negotiated, Rtsp, StreamRequest};
 
