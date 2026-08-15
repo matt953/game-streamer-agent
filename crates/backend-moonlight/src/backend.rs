@@ -7,7 +7,7 @@
 
 use crate::host::{LaunchedSession, PairedSession, StreamMode};
 use crate::{Command, Crypto, Depacketizer, MediaSocket, Received, Rtsp, StreamRequest};
-use gsa_client_backend_api::{BackendFrame, RecoverySink};
+use gsa_client_backend_api::{BackendFrame, RecoverySink, SessionOrigin};
 use gsa_core::{Error, Result};
 
 /// Asks the host to repair the reference chain, via the control channel.
@@ -58,6 +58,8 @@ pub struct MoonlightStream {
     /// handshake succeeded and nothing is coming", which look identical from
     /// every other signal.
     datagrams: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether this started the app or rejoined one already running.
+    pub origin: SessionOrigin,
     /// What the host says over the control channel: rumble, termination, and
     /// features we do not act on yet. Drain it — a caller that ignores this
     /// still gets a stream, but loses the host's own account of what happened.
@@ -118,27 +120,65 @@ pub async fn start(
     // How long a healthy host takes to start sending. Generous: a slow host
     // starting an app is normal, a host that will never send is not.
     const FIRST_MEDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // A host that just lost a client needs a moment before it will serve the
+    // next one, and how long varies; back off rather than hammering it.
+    const SETTLE: [u64; 3] = [0, 2, 4];
 
-    for attempt in 0..2 {
-        clear_running_session(session).await;
-        let launched = session.launch(app_id, mode).await?;
-        let stream = connect(&launched, host_ip, mode, bitrate_kbps).await?;
+    for (attempt, settle) in SETTLE.iter().enumerate() {
+        if *settle > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(*settle)).await;
+        }
+        // Only the first attempt honours a session the host is already
+        // running. Once one has failed to deliver, rejoining it again just
+        // reproduces the failure — start something new instead.
+        let (launched, origin) = if attempt == 0 {
+            begin(session, app_id, mode).await?
+        } else {
+            let _ = session.cancel().await;
+            (session.launch(app_id, mode).await?, SessionOrigin::Launched)
+        };
+        let mut stream = connect(&launched, host_ip, mode, bitrate_kbps).await?;
+        stream.origin = origin;
         if stream.wait_for_media(FIRST_MEDIA_TIMEOUT).await {
+            if attempt > 0 {
+                tracing::info!(attempt, "media flowing after retry");
+            }
             return Ok(stream);
         }
-        // Everything handshook and no media came: the host is holding a dead
-        // session under our id. Tearing this one down and moving to a fresh
-        // id is the only thing observed to clear it.
         drop(stream);
         let _ = session.cancel().await;
-        if attempt == 0 {
-            tracing::warn!("host accepted the session but sent no media; retrying with a fresh id");
-            session.rotate_session_id();
-        }
+        tracing::warn!(attempt, "host accepted the session but sent no media");
     }
     Err(Error::Session(
-        "host accepted the session but never sent media, even after a retry".into(),
+        "host accepted the session but never sent media, after three attempts".into(),
     ))
+}
+
+/// Start the app, or rejoin the one the host is already running.
+///
+/// Asking the host what it is doing first is the whole point: launching over
+/// a session the host still holds gets a session that handshakes and never
+/// streams, and resuming when nothing is running has nothing to resume.
+async fn begin(
+    session: &PairedSession,
+    app_id: u32,
+    mode: StreamMode,
+) -> Result<(LaunchedSession, SessionOrigin)> {
+    let running = match session.server_info().await {
+        Ok(info) => info.current_game,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read host state; assuming idle");
+            0
+        }
+    };
+    if running == app_id {
+        return Ok((session.resume(mode).await?, SessionOrigin::Rejoined));
+    }
+    if running != 0 {
+        // Something else is running; it must stop before ours can start.
+        let _ = session.cancel().await;
+    }
+    Ok((session.launch(app_id, mode).await?, SessionOrigin::Launched))
 }
 
 async fn connect(
@@ -196,13 +236,15 @@ async fn connect(
     let datagrams = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // One socket for every media stream. A host binds a stream to whichever
+    // address pinged its port, so a second socket sharing the session steals
+    // the first stream's binding: video then arrives on the audio socket and
+    // reads exactly like "the host sent nothing". With a single socket there
+    // is nothing to steal, and both ports still get the ping they need to
+    // keep the session alive.
     let video_addr = std::net::SocketAddr::new(host_ip, negotiated.video_port);
-    let audio_addr = std::net::SocketAddr::new(host_ip, negotiated.audio_port);
-    let video = MediaSocket::bind(video_addr, negotiated.ping_payload)?;
-    // Pinged but not consumed: a host that never hears from a media port
-    // tears the whole session down. It pings by address — only one socket may
-    // carry the session payload without stealing another stream's binding.
-    let audio = MediaSocket::bind(audio_addr, None)?;
+    let media = MediaSocket::bind(video_addr, negotiated.ping_payload)?;
+    let audio_port = negotiated.audio_port;
 
     let worker_stop = stop.clone();
     let worker_dropped = dropped.clone();
@@ -212,8 +254,8 @@ async fn connect(
         .name("moonlight-video".into())
         .spawn(move || {
             receive_video(
-                video,
-                audio,
+                media,
+                audio_port,
                 &frames_tx,
                 &worker_stop,
                 &worker_dropped,
@@ -233,6 +275,8 @@ async fn connect(
         dropped,
         recovered,
         datagrams,
+        // Overwritten by `start`, which knows how the session began.
+        origin: SessionOrigin::Launched,
         _worker: Worker {
             commands: command_tx,
             stop,
@@ -240,37 +284,9 @@ async fn connect(
     })
 }
 
-/// Stop whatever the host is streaming, and wait until it says so.
-///
-/// Cancelling blind and launching immediately is a race: the host finishes
-/// tearing down *after* our new session exists and takes it with it, which
-/// presents as a session that handshakes perfectly and never sends a frame.
-/// So only cancel when the host says it is busy, then wait for it to agree
-/// that it is idle before launching.
-async fn clear_running_session(session: &PairedSession) {
-    const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-    match session.server_info().await {
-        // Nothing running: launching straight into a clean host is the
-        // common case and must not pay for the recovery path.
-        Ok(info) if !info.state.ends_with("_BUSY") => return,
-        Ok(_) => {}
-        Err(e) => {
-            tracing::debug!(error = %e, "could not read host state before launch");
-            return;
-        }
-    }
-    if let Err(e) = session.cancel().await {
-        tracing::debug!(error = %e, "cancel before launch failed");
-    }
-    let deadline = std::time::Instant::now() + SETTLE_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        match session.server_info().await {
-            Ok(info) if !info.state.ends_with("_BUSY") => return,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
-        }
-    }
-    tracing::warn!("host still reports a session running; launching anyway");
+/// Video datagrams carry packet type 0; audio uses its own types.
+fn is_video(datagram: &[u8]) -> bool {
+    datagram.len() > 1 && datagram[1] == 0
 }
 
 /// Read datagrams, reassemble, and publish frames at their arrival time.
@@ -279,8 +295,8 @@ async fn clear_running_session(session: &PairedSession) {
 /// a frame stamped when it is released would make a paced present look like
 /// network delay to anything reasoning about the link.
 fn receive_video(
-    mut video: MediaSocket,
-    mut audio: MediaSocket,
+    mut media: MediaSocket,
+    audio_port: u16,
     frames: &tokio::sync::mpsc::UnboundedSender<BackendFrame>,
     stop: &std::sync::atomic::AtomicBool,
     dropped: &std::sync::atomic::AtomicU64,
@@ -295,13 +311,16 @@ fn receive_video(
 
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
         if last_ping.elapsed() >= PING_INTERVAL {
-            if let Err(e) = video.ping().and_then(|()| audio.ping()) {
+            // Both ports, one socket. Skipping the audio port is not an
+            // option: a host with a media stream it cannot deliver tears the
+            // whole session down after ten seconds.
+            if let Err(e) = media.ping().and_then(|()| media.ping_port(audio_port)) {
                 tracing::warn!(error = %e, "media ping failed");
                 return;
             }
             last_ping = std::time::Instant::now();
         }
-        let n = match video.recv(&mut buf) {
+        let n = match media.recv(&mut buf) {
             Ok(Some(n)) => n,
             Ok(None) => continue,
             Err(e) => {
@@ -311,6 +330,11 @@ fn receive_video(
         };
         let arrival_us = clock.now_us();
         datagrams.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Both streams share this socket now, so only video goes to the
+        // video reassembler; audio is told apart by its packet type.
+        if !is_video(&buf[..n]) {
+            continue;
+        }
         depacketizer.push(&buf[..n]);
         while let Some(event) = depacketizer.next_event() {
             match event {

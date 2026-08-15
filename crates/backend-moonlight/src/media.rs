@@ -54,19 +54,26 @@ impl MediaSocket {
 
     /// Tell the host where to send. Repeat until media arrives.
     pub fn ping(&mut self) -> Result<()> {
-        let datagram = match self.payload {
-            Some(payload) => {
-                let mut out = Vec::with_capacity(20);
-                out.extend_from_slice(&payload);
-                out.extend_from_slice(&self.sequence.to_le_bytes());
-                self.sequence = self.sequence.wrapping_add(1);
-                out
-            }
-            None => PLAIN_PING.to_vec(),
-        };
+        let datagram = self.ping_datagram();
         self.socket
             .send_to(&datagram, self.host)
             .map_err(|e| Error::Transport(format!("send media ping: {e}")))?;
+        Ok(())
+    }
+
+    /// Ping a different port on the same host from this socket.
+    ///
+    /// Used to claim every media stream for one socket: a host binds a
+    /// stream to whichever address pinged it, so pinging from two sockets
+    /// lets the later one steal the earlier one's stream. Pinging both ports
+    /// from a single socket leaves nothing to steal — and the streams are
+    /// told apart by their packet type on arrival.
+    pub fn ping_port(&mut self, port: u16) -> Result<()> {
+        let target = std::net::SocketAddr::new(self.host.ip(), port);
+        let datagram = self.ping_datagram();
+        self.socket
+            .send_to(&datagram, target)
+            .map_err(|e| Error::Transport(format!("send media ping to {target}: {e}")))?;
         Ok(())
     }
 
@@ -83,6 +90,19 @@ impl MediaSocket {
                 Ok(None)
             }
             Err(e) => Err(Error::Transport(format!("receive media: {e}"))),
+        }
+    }
+
+    fn ping_datagram(&mut self) -> Vec<u8> {
+        match self.payload {
+            Some(payload) => {
+                let mut out = Vec::with_capacity(20);
+                out.extend_from_slice(&payload);
+                out.extend_from_slice(&self.sequence.to_le_bytes());
+                self.sequence = self.sequence.wrapping_add(1);
+                out
+            }
+            None => PLAIN_PING.to_vec(),
         }
     }
 

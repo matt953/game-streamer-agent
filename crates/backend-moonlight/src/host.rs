@@ -63,19 +63,11 @@ impl PairedSession {
     /// monitor is a surprising thing for a client to do, and Apollo can be
     /// told to override the mode host-side anyway.
     pub async fn launch(&self, app_id: u32, mode: StreamMode) -> Result<LaunchedSession> {
-        let riaes_key = crate::pair::random_16();
-        // Paired with the key as the control channel's identity; hosts treat
-        // it as a signed integer, so keep it inside the positive range.
-        let riaes_key_id: i32 = i32::from_be_bytes([
-            crate::pair::random_16()[0] & 0x7f,
-            crate::pair::random_16()[1],
-            crate::pair::random_16()[2],
-            crate::pair::random_16()[3],
-        ]);
+        let (riaes_key, riaes_key_id) = new_stream_key();
         let body = self
             .get(&format!(
                 "/launch?uniqueid={}&appid={app_id}&mode={}x{}x{}&additionalStates=1&sops={}\
-                 &rikey={}&rikeyid={riaes_key_id}&localAudioPlayMode=0&surroundAudioInfo={}\
+                 &rikey={}&rikeyid={riaes_key_id}&localAudioPlayMode={}&surroundAudioInfo={}\
                  &hdrMode={}&gcmap=1",
                 self.client_id,
                 mode.width,
@@ -83,6 +75,36 @@ impl PairedSession {
                 mode.fps,
                 u8::from(mode.allow_host_mode_change),
                 crate::hex::encode(&riaes_key),
+                u8::from(mode.keep_host_audio),
+                mode.surround_audio_info(),
+                u8::from(mode.hdr),
+            ))
+            .await?;
+        let rtsp_url = xml_field(&body, "sessionUrl0")?;
+        Ok(LaunchedSession {
+            rtsp_url,
+            riaes_key,
+            riaes_key_id,
+        })
+    }
+
+    /// Rejoin the session the host is already holding for us.
+    ///
+    /// This is the call real clients make when the host still has a session
+    /// for their certificate — it re-keys the streams and restarts delivery.
+    /// Launching again instead silently inherits the old session, which
+    /// handshakes perfectly and never sends a frame.
+    pub async fn resume(&self, mode: StreamMode) -> Result<LaunchedSession> {
+        let (riaes_key, riaes_key_id) = new_stream_key();
+        let body = self
+            .get(&format!(
+                "/resume?uniqueid={}&rikey={}&rikeyid={riaes_key_id}&mode={}x{}x{}\
+                 &surroundAudioInfo={}&hdrMode={}",
+                self.client_id,
+                crate::hex::encode(&riaes_key),
+                mode.width,
+                mode.height,
+                mode.fps,
                 mode.surround_audio_info(),
                 u8::from(mode.hdr),
             ))
@@ -103,18 +125,6 @@ impl PairedSession {
         xml_field(&body, "cancel").map(|_| ())
     }
 
-    /// Start using a freshly generated session id.
-    ///
-    /// Recovery only. A host keeps per-session state keyed to this id, and a
-    /// client that died without tearing down leaves a dead session behind
-    /// that a later launch silently inherits. Nothing else clears it, so
-    /// moving to a new id is how a client heals itself. Permissions follow
-    /// the certificate, not this id, so a rotated client stays authorised.
-    pub fn rotate_session_id(&mut self) {
-        self.client_id = crate::hex::encode(&crate::pair::random_16()[..8]);
-        tracing::info!(client_id = %self.client_id, "rotated session id to clear a dead session");
-    }
-
     /// The id this session is currently using.
     #[must_use]
     pub fn client_id(&self) -> &str {
@@ -132,6 +142,18 @@ impl PairedSession {
     }
 }
 
+/// A fresh stream key and its id.
+///
+/// The id doubles as a key epoch: hosts re-derive their ciphers when it
+/// changes, which is what makes a resume actually restart the streams.
+fn new_stream_key() -> ([u8; 16], i32) {
+    let key = crate::pair::random_16();
+    let id_bytes = crate::pair::random_16();
+    // Hosts read this as a signed integer; keep it positive.
+    let id = i32::from_be_bytes([id_bytes[0] & 0x7f, id_bytes[1], id_bytes[2], id_bytes[3]]);
+    (key, id)
+}
+
 /// What we ask the host to encode.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamMode {
@@ -143,6 +165,12 @@ pub struct StreamMode {
     pub hdr: bool,
     /// Speaker count we can render. 2 is stereo.
     pub channels: u8,
+    /// Leave the host's own speakers working while we stream.
+    ///
+    /// Hosts silence themselves by default so a stream does not play twice in
+    /// one room. That is the wrong default for a machine somebody else is
+    /// sitting at: it takes their audio away without asking.
+    pub keep_host_audio: bool,
 }
 
 impl Default for StreamMode {
@@ -154,6 +182,7 @@ impl Default for StreamMode {
             allow_host_mode_change: false,
             hdr: false,
             channels: 2,
+            keep_host_audio: true,
         }
     }
 }

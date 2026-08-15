@@ -223,6 +223,23 @@ pub struct SessionRequest {
     pub abr: bool,
 }
 
+/// How a session came to be.
+///
+/// Every backend distinguishes starting something new from rejoining what the
+/// host is already running, even though each spells it differently — a
+/// Moonlight host resumes an app it still has open, a console reconnects to
+/// the session on screen, a cloud service picks up a running instance. The
+/// distinction is worth surfacing rather than hiding: the two have different
+/// costs, and a user who is told "rejoined your session" understands why
+/// their game is mid-level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// The host started the app for us.
+    Launched,
+    /// We rejoined a session the host was already running.
+    Rejoined,
+}
+
 /// A streaming protocol the client can speak.
 ///
 /// Used generically — the embedder names the backend at the call site — so
