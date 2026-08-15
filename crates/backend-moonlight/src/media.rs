@@ -77,6 +77,19 @@ impl MediaSocket {
         Ok(())
     }
 
+    /// Ping another port with the address-matched legacy form.
+    ///
+    /// Some hosts bind a stream from the payload and others from the source
+    /// address; which form a given port wants is not something the wire tells
+    /// us, so it is chosen by the caller and settled by experiment.
+    pub fn ping_port_plain(&self, port: u16) -> Result<()> {
+        let target = std::net::SocketAddr::new(self.host.ip(), port);
+        self.socket
+            .send_to(PLAIN_PING, target)
+            .map_err(|e| Error::Transport(format!("send media ping to {target}: {e}")))?;
+        Ok(())
+    }
+
     /// Receive one datagram, or `None` if the read timed out.
     pub fn recv(&self, buf: &mut [u8]) -> Result<Option<usize>> {
         match self.socket.recv_from(buf) {

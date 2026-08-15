@@ -1,0 +1,141 @@
+//! Inspect the audio stream: packet types, sizes, and whether the payload
+//! looks like plaintext Opus.
+//!
+//! ```text
+//! cargo run -p gsa-backend-moonlight --example audioprobe -- 192.168.50.184:47989 881448767
+//! ```
+
+use gsa_backend_moonlight::{ClientIdentity, PairedSession, StreamMode};
+
+fn store(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(name)
+}
+
+#[tokio::main]
+async fn main() {
+    let mut args = std::env::args().skip(1);
+    let (Some(addr), Some(app)) = (args.next(), args.next()) else {
+        eprintln!("usage: audioprobe <host:port> <app-id>");
+        std::process::exit(2);
+    };
+    let addr: std::net::SocketAddr = addr.parse().expect("host:port");
+    let app_id: u32 = app.parse().expect("app id");
+    let client_id = "0123456789ABCDEF";
+
+    let identity = ClientIdentity::from_key_pem(
+        &std::fs::read_to_string(store("gsa-moonlight-dev-key.pem")).expect("identity"),
+    )
+    .expect("load identity");
+    let host_cert =
+        std::fs::read_to_string(store("gsa-moonlight-host-cert.pem")).expect("host cert");
+    let info = gsa_backend_moonlight::probe(addr, client_id)
+        .await
+        .expect("probe");
+    let session = PairedSession::new(
+        std::net::SocketAddr::new(addr.ip(), info.https_port),
+        host_cert,
+        identity,
+        client_id.to_owned(),
+    );
+
+    // Experiment: does asking the host to keep playing its own audio stop it
+    // sending us any?
+    let keep_host_audio = std::env::var("GSA_KEEP_HOST_AUDIO").is_ok();
+    let mode = StreamMode {
+        keep_host_audio,
+        ..StreamMode::default()
+    };
+    println!("keep_host_audio={keep_host_audio}");
+    let launched = match session.launch(app_id, mode).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("launch failed: {e}");
+            return;
+        }
+    };
+
+    let mut rtsp = gsa_backend_moonlight::Rtsp::new(&launched.rtsp_url).expect("rtsp");
+    let negotiated = rtsp
+        .negotiate(gsa_backend_moonlight::StreamRequest {
+            width: mode.width,
+            height: mode.height,
+            fps: mode.fps,
+            bitstream_format: 0,
+            bitrate_kbps: 10_000,
+            packet_size: 1392,
+            channels: 2,
+        })
+        .await
+        .expect("negotiate");
+    println!(
+        "encryption supported={:#x} requested={:#x}",
+        negotiated.encryption_supported, negotiated.encryption_requested
+    );
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
+    let crypto = gsa_backend_moonlight::Crypto::new(launched.riaes_key, negotiated.control_v2());
+    let control_addr = std::net::SocketAddr::new(addr.ip(), negotiated.control_port);
+    let connect_data = negotiated.connect_data.unwrap_or(0);
+    let control = std::thread::spawn(move || {
+        let _ =
+            gsa_backend_moonlight::run_control(control_addr, connect_data, crypto, cmd_rx, evt_tx);
+    });
+
+    let mut media = gsa_backend_moonlight::MediaSocket::bind(
+        std::net::SocketAddr::new(addr.ip(), negotiated.video_port),
+        negotiated.ping_payload,
+    )
+    .expect("socket");
+    let audio_port = negotiated.audio_port;
+
+    let mut buf = vec![0u8; 4096];
+    let mut by_type: std::collections::BTreeMap<u8, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut shown = 0usize;
+    let start = std::time::Instant::now();
+    let mut last_ping = start - std::time::Duration::from_secs(1);
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        if last_ping.elapsed() >= std::time::Duration::from_millis(400) {
+            let _ = media.ping();
+            if std::env::var("GSA_AUDIO_PLAIN").is_ok() {
+                let _ = media.ping_port_plain(audio_port);
+            } else {
+                let _ = media.ping_port(audio_port);
+            }
+            last_ping = std::time::Instant::now();
+        }
+        if let Ok(Some(n)) = media.recv(&mut buf) {
+            if n < 2 {
+                continue;
+            }
+            let packet_type = buf[1];
+            let entry = by_type.entry(packet_type).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += n;
+            // Video is type 0; anything else is what we came to look at.
+            if packet_type != 0 && shown < 3 {
+                shown += 1;
+                println!("--- non-video packet type {packet_type}, {n} bytes ---");
+                let head = &buf[..n.min(40)];
+                let hex: Vec<String> = head.iter().map(|b| format!("{b:02x}")).collect();
+                println!("  {}", hex.join(" "));
+            }
+        }
+    }
+
+    println!("\npacket types seen (type: count, bytes):");
+    for (kind, (count, bytes)) in &by_type {
+        let label = match kind {
+            0 => " (video)",
+            97 => " (audio data)",
+            127 => " (audio FEC)",
+            _ => "",
+        };
+        println!("  {kind}{label}: {count} packets, {bytes} bytes");
+    }
+
+    let _ = cmd_tx.send(gsa_backend_moonlight::Command::Stop);
+    let _ = control.join();
+    let _ = session.cancel().await;
+}
