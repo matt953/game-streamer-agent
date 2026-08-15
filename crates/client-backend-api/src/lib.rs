@@ -176,6 +176,37 @@ pub struct ActiveSession {
     pub codec: gsa_core::media::Codec,
 }
 
+/// What kind of thing a catalog entry launches — enough for the embedder to
+/// group and label a unified library without knowing the protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CatalogKind {
+    /// A specific game or application.
+    Game,
+    /// The host's whole desktop.
+    Desktop,
+    /// A launcher/shell in its own right (Steam Big Picture, a console's
+    /// dashboard) — the user browses their real library inside the stream.
+    Shell,
+}
+
+/// One launchable thing on a host. Backends map their own vocabulary onto
+/// this — a Moonlight app, a console's dashboard, a cloud catalog title — so
+/// the embedder can present one library across every backend.
+///
+/// Deliberately thin: a cloud catalog can run to thousands of titles, and
+/// artwork is fetched lazily per entry rather than carried here.
+#[derive(Debug, Clone)]
+pub struct CatalogEntry {
+    /// Backend-defined; goes back in [`SessionRequest::source_id`].
+    pub id: u32,
+    pub title: String,
+    pub kind: CatalogKind,
+    /// This entry is what the host is already running, so starting it
+    /// resumes rather than launches.
+    pub running: bool,
+}
+
 /// What the embedder asked for. A backend honours what its protocol supports
 /// and reports the truth back through [`SessionCaps`].
 #[derive(Debug, Clone)]
@@ -199,6 +230,15 @@ pub struct SessionRequest {
 /// Runtime selection happens above, over the [`ActiveSession`] each backend
 /// returns.
 pub trait StreamBackend: std::fmt::Debug + Send {
+    /// What this host can launch. The embedder merges the catalogs of every
+    /// paired host into one library, which is why the entries are neutral:
+    /// a PC app, a console dashboard, and a cloud title must be presentable
+    /// side by side without the UI knowing which is which.
+    ///
+    /// Backends whose catalog is a single fixed destination (a console you
+    /// simply connect to) return one [`CatalogKind::Shell`] entry.
+    fn catalog(&mut self) -> impl std::future::Future<Output = Result<Vec<CatalogEntry>>> + Send;
+
     /// Connect to an already-paired host and begin streaming.
     ///
     /// Pairing is deliberately **not** on this trait: enrolment differs too
