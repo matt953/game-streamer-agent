@@ -236,7 +236,10 @@ pub struct GsaSession {
 /// Handed back from `session_loop` once it knows the outcome: whether the
 /// session reached the streaming state, plus its input sink and negotiated codec.
 pub(crate) enum SessionReady {
-    Failed,
+    /// The session never reached streaming. The string is for the user, so it
+    /// must say what actually went wrong — "could not connect" for a failure
+    /// the host explained is the kind of message that costs an hour.
+    Failed(String),
     Streaming {
         input: Option<Arc<dyn gsa_client_core::InputSink>>,
         knobs: Option<Arc<dyn gsa_client_core::SessionKnobs>>,
@@ -308,7 +311,7 @@ pub unsafe extern "C" fn gsa_session_start(
         {
             Ok(rt) => rt,
             Err(_) => {
-                let _ = ready_tx.send(SessionReady::Failed);
+                let _ = ready_tx.send(SessionReady::Failed(String::new()));
                 return;
             }
         };
@@ -685,7 +688,7 @@ async fn session_loop(
     {
         Ok(c) => c,
         Err(_) => {
-            let _ = ready_tx.send(SessionReady::Failed);
+            let _ = ready_tx.send(SessionReady::Failed(String::new()));
             return;
         }
     };
@@ -693,7 +696,7 @@ async fn session_loop(
     let audio_rx = match client.take_audio_output() {
         Ok(rx) => rx,
         Err(_) => {
-            let _ = ready_tx.send(SessionReady::Failed);
+            let _ = ready_tx.send(SessionReady::Failed(String::new()));
             return;
         }
     };
@@ -703,7 +706,7 @@ async fn session_loop(
     {
         Ok(p) => p,
         Err(_) => {
-            let _ = ready_tx.send(SessionReady::Failed);
+            let _ = ready_tx.send(SessionReady::Failed(String::new()));
             return;
         }
     };

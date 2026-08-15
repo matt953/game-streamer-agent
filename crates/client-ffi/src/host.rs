@@ -234,26 +234,34 @@ pub unsafe extern "C" fn gsa_host_session_start(
     target_id: u32,
     bitrate_kbps: u32,
     callbacks: crate::GsaCallbacks,
+    err: *mut c_char,
+    err_cap: usize,
 ) -> *mut crate::GsaSession {
     crate::devlog::init();
+    // Every failure below says why: a bare NULL turns a host that explained
+    // itself ("permission denied") into a mystery for whoever is holding the
+    // phone.
+    let fail = |reason: &str| -> *mut crate::GsaSession {
+        write_out(reason, err, err_cap);
+        std::ptr::null_mut()
+    };
+
     // SAFETY: caller contract.
     let Some(host) = (unsafe { read_str(host) }) else {
-        return std::ptr::null_mut();
+        return fail("no host given");
     };
     let Some(host) = HostRef::decode(host) else {
-        return std::ptr::null_mut();
+        return fail("this host's saved details are unreadable — pair again");
     };
     if host.backend != GSA_BACKEND_MOONLIGHT {
-        // The gsa backend still has its own entry point; routing it through
-        // here as well is a later cleanup, not something to fake now.
-        return std::ptr::null_mut();
+        return fail("this kind of host cannot be streamed from yet");
     }
     let (Some(key), Some(cert), Some(client_id)) = (
         host.field("key"),
         host.field("cert"),
         host.field("client_id"),
     ) else {
-        return std::ptr::null_mut();
+        return fail("this host's saved details are incomplete — pair again");
     };
 
     let opts = crate::moonlight::MoonlightOpts {
@@ -300,10 +308,14 @@ pub unsafe extern "C" fn gsa_host_session_start(
         })),
         // Either the session failed or the thread died; join so its failure is
         // not left running behind a NULL return.
-        _ => {
+        other => {
             stop.notify_waiters();
             let _ = thread.join();
-            std::ptr::null_mut()
+            let reason = match other {
+                Ok(crate::SessionReady::Failed(reason)) if !reason.is_empty() => reason,
+                _ => "the host did not start the session".to_owned(),
+            };
+            fail(&reason)
         }
     }
 }

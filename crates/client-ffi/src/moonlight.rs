@@ -161,7 +161,9 @@ pub(crate) fn run_session(
         .on_thread_start(crate::boost_thread_qos)
         .build()
     else {
-        let _ = ready_tx.send(crate::SessionReady::Failed);
+        let _ = ready_tx.send(crate::SessionReady::Failed(
+            "could not start a runtime".into(),
+        ));
         return;
     };
 
@@ -170,14 +172,17 @@ pub(crate) fn run_session(
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(error = %e, "moonlight session failed to start");
-                let _ = ready_tx.send(crate::SessionReady::Failed);
+                // Pass the host's own words through: "Permission denied" is
+                // actionable, "could not connect" sends someone hunting the
+                // network for an hour.
+                let _ = ready_tx.send(crate::SessionReady::Failed(e.to_string()));
                 return;
             }
         };
 
         let audio_rx = stream.audio_channel();
         let Some(frames) = stream.take_frames() else {
-            let _ = ready_tx.send(crate::SessionReady::Failed);
+            let _ = ready_tx.send(crate::SessionReady::Failed("frames already claimed".into()));
             return;
         };
         let mut core = gsa_client_core::StreamSession::with_capture_clock(
