@@ -7,7 +7,7 @@
 //! shared, so a second protocol inherits the field tuning instead of
 //! reinventing it.
 
-use gsa_client_backend_api::{BackendFrame, RecoverySink};
+use gsa_client_backend_api::{BackendFrame, CaptureClock, RecoverySink};
 use gsa_core::Result;
 use gsa_core::time::MediaClock;
 
@@ -19,6 +19,12 @@ use crate::{EncodedFrame, FrameOutput, PresentedSink, stats};
 pub struct StreamSession {
     clock: MediaClock,
     clock_sync: ClockSync,
+    /// What the backend's capture stamps actually mean. When they are a
+    /// stream clock rather than a synchronised capture instant, *differences*
+    /// are real but the absolute value is not — so de-jitter still works and
+    /// glass-to-glass latency is reported as unmeasured rather than as a
+    /// number that looks precise and is wrong.
+    capture_clock: CaptureClock,
     /// Complete frames from the backend, stamped at true arrival.
     frames_rx: tokio::sync::mpsc::UnboundedReceiver<BackendFrame>,
     /// How the gate asks the host to repair a broken reference chain.
@@ -69,10 +75,34 @@ impl StreamSession {
         dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
         recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
+        Self::with_capture_clock(
+            frames_rx,
+            recovery,
+            clock,
+            clock_sync,
+            dropped,
+            recovered,
+            CaptureClock::HostSynced,
+        )
+    }
+
+    /// As [`StreamSession::new`], for backends whose stamps are a stream
+    /// clock rather than a synchronised capture instant.
+    #[must_use]
+    pub fn with_capture_clock(
+        frames_rx: tokio::sync::mpsc::UnboundedReceiver<BackendFrame>,
+        recovery: std::sync::Arc<dyn RecoverySink>,
+        clock: MediaClock,
+        clock_sync: ClockSync,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        capture_clock: CaptureClock,
+    ) -> Self {
         let presented = tokio::sync::mpsc::unbounded_channel();
         Self {
             clock,
             clock_sync,
+            capture_clock,
             frames_rx,
             recovery,
             stats: LatencyStats::default(),
@@ -119,6 +149,20 @@ impl StreamSession {
         self.last_jitter_us
     }
 
+    /// Whether glass-to-glass latency means anything for this backend.
+    #[must_use]
+    pub fn latency_is_absolute(&self) -> bool {
+        self.capture_clock == CaptureClock::HostSynced
+    }
+
+    /// Latency against the capture stamp, or `None` when the stamp is a
+    /// stream clock and the answer would be a fiction.
+    fn absolute_latency_us(&self, now_us: u64, capture_ts_us: u32) -> Option<u32> {
+        self.latency_is_absolute()
+            .then(|| self.clock_sync.frame_latency_us(now_us, capture_ts_us))
+            .flatten()
+    }
+
     /// Shared de-jitter switch for the embedder (default enabled).
     #[must_use]
     pub fn dejitter_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
@@ -144,7 +188,7 @@ impl StreamSession {
     /// session.
     pub fn frame_presented(&mut self, capture_ts_us: u32) {
         let now = self.clock.now_us();
-        let latency = self.clock_sync.frame_latency_us(now, capture_ts_us);
+        let latency = self.absolute_latency_us(now, capture_ts_us);
         self.present.on_presented(latency, capture_ts_us, now);
     }
 
@@ -156,7 +200,7 @@ impl StreamSession {
                 .clock
                 .now_us()
                 .saturating_sub(at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
-            let latency = self.clock_sync.frame_latency_us(now, capture_ts);
+            let latency = self.absolute_latency_us(now, capture_ts);
             self.present.on_presented(latency, capture_ts, now);
         }
     }
@@ -182,7 +226,7 @@ impl StreamSession {
             return Ok(None);
         };
         let now = self.clock.now_us();
-        let latency_us = self.clock_sync.frame_latency_us(now, gated.capture_ts_us);
+        let latency_us = self.absolute_latency_us(now, gated.capture_ts_us);
         // Decode happens app-side; record it as zero in the stats window.
         self.stats.on_frame_decoded(latency_us, 0);
         Ok(Some(EncodedFrame {
@@ -208,7 +252,7 @@ impl StreamSession {
                 Ok(Some(frame)) => {
                     let now = self.clock.now_us();
                     let decode_us = (now - decode_start) as u32;
-                    let latency_us = self.clock_sync.frame_latency_us(now, gated.capture_ts_us);
+                    let latency_us = self.absolute_latency_us(now, gated.capture_ts_us);
                     self.stats.on_frame_decoded(latency_us, decode_us);
                     return Ok(Some(FrameOutput {
                         frame,

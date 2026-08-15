@@ -73,14 +73,18 @@ async fn main() {
     eprintln!("streaming; driving the shared client core for {seconds}s");
 
     // Everything past this point is backend-agnostic.
+    // Audio goes through the same injected-loss path as video, so its
+    // behaviour under stress can be measured rather than assumed.
+    let audio = stream.audio_channel();
     let frames = stream.take_frames().expect("frames not yet taken");
-    let mut core = StreamSession::new(
+    let mut core = StreamSession::with_capture_clock(
         frames,
         stream.recovery.clone(),
         gsa_core::time::MediaClock::new(),
         ClockSync::default(),
         stream.dropped.clone(),
         stream.recovered.clone(),
+        gsa_client_core::CaptureClock::StreamPts,
     );
 
     // Where the pictures go. stdout is for piping into a player, so every
@@ -132,6 +136,23 @@ async fn main() {
             Err(_) => break, // ran out the clock
         }
     }
+
+    let mut audio_frames = 0usize;
+    let mut audio_samples = 0usize;
+    let mut audio_peak = 0i32;
+    while let Ok(pcm) = audio.try_recv() {
+        audio_frames += 1;
+        audio_samples += pcm.len();
+        for s in &pcm {
+            audio_peak = audio_peak.max(i32::from(s.abs()));
+        }
+    }
+    eprintln!("  audio: {audio_frames} frames, {audio_samples} samples, peak {audio_peak}");
+
+    let (invalidations, keyframe_requests) = stream.repairs.requests();
+    eprintln!(
+        "  repairs asked for: {invalidations} reference invalidations, {keyframe_requests} keyframes"
+    );
 
     let stats = core.stats();
     let present = core.present_stats();

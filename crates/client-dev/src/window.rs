@@ -151,13 +151,16 @@ fn moonlight_loop(
             .context("start moonlight session")?;
 
             // Everything from here is the shared core.
-            let mut core = gsa_client_core::StreamSession::new(
+            let mut core = gsa_client_core::StreamSession::with_capture_clock(
                 stream.take_frames().context("frames already taken")?,
                 stream.recovery.clone(),
                 gsa_core::time::MediaClock::new(),
                 gsa_client_core::ClockSync::default(),
                 stream.dropped.clone(),
                 stream.recovered.clone(),
+                // The host's stamps are a stream clock, so latency figures
+                // from them would be fiction; cadence and jitter are real.
+                gsa_client_core::CaptureClock::StreamPts,
             );
 
             // Play whatever audio arrives. The host may send none — that is a
@@ -200,6 +203,7 @@ fn moonlight_loop(
                         low1_fps = f64::from(present.low1_fps_x100) / 100.0,
                         freezes = present.freezes,
                         stutters = present.stutters,
+                        latency_absolute = core.latency_is_absolute(),
                         dropped = stats.frames_dropped_incomplete,
                         recovered = stats.frames_recovered,
                         "moonlight stream stats"

@@ -37,6 +37,10 @@ const REORDER_DEPTH: u32 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardHeader {
     pub sequence: u16,
+    /// Host-side stream clock, 90 kHz. Its absolute value has no fixed
+    /// relation to our clock, but differences between frames are real
+    /// host-side timing — which is what a de-jitter window needs.
+    pub timestamp: u32,
     pub frame_index: u32,
     pub flags: u8,
     pub block_index: u8,
@@ -72,6 +76,7 @@ pub fn parse_header(datagram: &[u8]) -> Option<ShardHeader> {
     let blocks = datagram[27];
     Some(ShardHeader {
         sequence: u16::from_be_bytes([datagram[2], datagram[3]]),
+        timestamp: u32::from_be_bytes([datagram[4], datagram[5], datagram[6], datagram[7]]),
         frame_index: le32(20),
         flags: datagram[24],
         block_index: (blocks >> 4) & 0x3,
@@ -112,6 +117,9 @@ pub struct VideoFrame {
     /// Some of this frame was rebuilt from parity — loss that cost nothing
     /// visible. Worth counting separately from loss that did.
     pub recovered: bool,
+    /// The host's 90 kHz stream clock for this frame, if any shard carried
+    /// one. Relative timing only — see [`ShardHeader::timestamp`].
+    pub timestamp: u32,
 }
 
 /// Why a frame did not survive.
@@ -192,6 +200,8 @@ impl Block {
 struct Assembly {
     blocks: std::collections::BTreeMap<u8, Block>,
     last_block_index: u8,
+    /// Taken from the first shard seen; every shard of a frame carries it.
+    timestamp: u32,
     /// True once any shard of this frame arrived with the start flag.
     seen_start: bool,
 }
@@ -236,6 +246,9 @@ impl Depacketizer {
         let assembly = self.frames.entry(header.frame_index).or_default();
         assembly.last_block_index = assembly.last_block_index.max(header.last_block_index);
         assembly.seen_start |= header.flags & 0x04 != 0;
+        if assembly.timestamp == 0 {
+            assembly.timestamp = header.timestamp;
+        }
         let block = assembly
             .blocks
             .entry(header.block_index)
@@ -289,7 +302,14 @@ impl Depacketizer {
             }
         }
         Some(
-            match parse_frame(frame_index, &payload, shard_width, shard_count, recovered) {
+            match parse_frame(
+                frame_index,
+                &payload,
+                shard_width,
+                shard_count,
+                recovered,
+                assembly.timestamp,
+            ) {
                 Some(frame) => Received::Frame(frame),
                 None => Received::Lost(FrameLoss::Unrecoverable { frame_index }),
             },
@@ -326,6 +346,7 @@ fn parse_frame(
     shard_width: usize,
     shard_count: usize,
     recovered: bool,
+    timestamp: u32,
 ) -> Option<VideoFrame> {
     if payload.len() <= FRAME_HEADER_LEN {
         return None;
@@ -354,6 +375,7 @@ fn parse_frame(
         data: payload[FRAME_HEADER_LEN..end].to_vec(),
         host_latency_us: (latency_units != 0).then(|| u32::from(latency_units) * 100),
         recovered,
+        timestamp,
     })
 }
 
@@ -374,6 +396,9 @@ mod tests {
         datagram.extend_from_slice(&[0u8; 16]);
         let h = parse_header(&datagram).unwrap();
         assert_eq!(h.sequence, 0);
+        // Captured value: the host does stamp a real stream clock, unlike
+        // some implementations which send zeros.
+        assert_eq!(h.timestamp, 0xa71c);
         assert_eq!(h.frame_index, 1);
         assert_eq!(h.shard_index, 0);
         assert_eq!(h.data_shards, 11);

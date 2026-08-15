@@ -12,32 +12,66 @@ use gsa_core::{Error, Result};
 
 /// Asks the host to repair the reference chain, via the control channel.
 ///
-/// The host advertises whether it can invalidate references without a full
-/// keyframe; when it cannot, the default falls back to asking for an IDR.
+/// **Always asks for a keyframe**, even though hosts advertise the cheaper
+/// reference-invalidation path. Invalidation needs the host to tell the
+/// client which frame is safe to resume from; this protocol has no such
+/// message, so the client stays frozen until a keyframe happens to arrive.
+/// Measured at 8% packet loss: invalidation decoded 65 of 393 frames, while
+/// asking for keyframes decoded 336 of 363. A cheaper repair that leaves the
+/// picture frozen is not cheaper.
+///
+/// (Our own protocol takes the cheap path safely because the agent announces
+/// a recovery point — the frame from which references are clean again.)
 #[derive(Debug)]
 pub struct MoonlightRecovery {
     commands: std::sync::Mutex<std::sync::mpsc::Sender<Command>>,
     reference_invalidation: bool,
+    /// How many repairs were asked for each way. Worth counting separately:
+    /// invalidation is the cheap path, and if a host answers every one with a
+    /// full keyframe anyway then the distinction is costing us nothing and
+    /// buying us nothing.
+    invalidations: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    keyframes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MoonlightRecovery {
+    /// Repair requests sent: (reference invalidations, full keyframes).
+    #[must_use]
+    pub fn requests(&self) -> (u64, u64) {
+        (
+            self.invalidations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.keyframes.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
 }
 
 impl RecoverySink for MoonlightRecovery {
     fn request_keyframe(&self) {
+        self.keyframes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(tx) = self.commands.lock() {
             let _ = tx.send(Command::RequestIdr);
         }
     }
 
     fn request_recovery(&self, last_good_frame_id: u32) {
-        if !self.reference_invalidation {
-            self.request_keyframe();
+        let _ = last_good_frame_id;
+        // Deliberately the blunt instrument — see the type's documentation.
+        // The opt-in below exists to re-measure if a host ever gains a
+        // resume-point signal.
+        if self.reference_invalidation {
+            self.invalidations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(tx) = self.commands.lock() {
+                let _ = tx.send(Command::InvalidateReferenceFrames {
+                    first: last_good_frame_id.wrapping_add(1),
+                    last: last_good_frame_id.wrapping_add(1),
+                });
+            }
             return;
         }
-        if let Ok(tx) = self.commands.lock() {
-            let _ = tx.send(Command::InvalidateReferenceFrames {
-                first: last_good_frame_id.wrapping_add(1),
-                last: last_good_frame_id.wrapping_add(1),
-            });
-        }
+        self.request_keyframe();
     }
 }
 
@@ -75,6 +109,8 @@ pub struct MoonlightStream {
     /// receive threads alive.
     frames: Option<tokio::sync::mpsc::UnboundedReceiver<BackendFrame>>,
     pub recovery: std::sync::Arc<dyn RecoverySink>,
+    /// The same object, typed, for reading the repair counters.
+    pub repairs: std::sync::Arc<MoonlightRecovery>,
     /// Where to send keyboard, mouse and controller input.
     pub input: std::sync::Arc<dyn InputSink>,
     /// Frames the wire could not deliver whole, for the shared health stats.
@@ -270,6 +306,16 @@ async fn connect(
 
     let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
     let (audio_rx, audio_pcm) = crate::AudioReceive::new()?;
+    let recovery = std::sync::Arc::new(MoonlightRecovery {
+        commands: std::sync::Mutex::new(command_tx.clone()),
+        // Off unless explicitly asked for: it measurably makes loss worse
+        // on every host tested. The host's advertised capability is recorded
+        // in the negotiation, not acted on here.
+        reference_invalidation: negotiated.reference_invalidation
+            && std::env::var("GSA_MOONLIGHT_INVALIDATE").is_ok(),
+        invalidations: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        keyframes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    });
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let recovered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let datagrams = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -308,10 +354,8 @@ async fn connect(
     Ok(MoonlightStream {
         frames: Some(frames_rx),
         events: event_rx,
-        recovery: std::sync::Arc::new(MoonlightRecovery {
-            commands: std::sync::Mutex::new(command_tx.clone()),
-            reference_invalidation: negotiated.reference_invalidation,
-        }),
+        recovery: recovery.clone(),
+        repairs: recovery,
         input: std::sync::Arc::new(MoonlightInput {
             commands: command_tx.clone(),
             encoder: std::sync::Mutex::new(crate::InputEncoder::new()),
@@ -327,6 +371,57 @@ async fn connect(
             stop,
         },
     })
+}
+
+/// Deterministic packet-loss injection for chaos runs.
+///
+/// Drops a share of received datagrams before anything looks at them, which
+/// exercises FEC recovery, the reference gate and the repair path against a
+/// real host without needing to degrade the network. Deterministic so a
+/// failure can be re-run; off unless `GSA_MOONLIGHT_LOSS` asks for it.
+#[derive(Debug)]
+struct LossInjector {
+    /// Drop probability in parts per thousand.
+    per_mille: u32,
+    state: u32,
+    dropped: u64,
+}
+
+impl LossInjector {
+    fn from_env() -> Option<Self> {
+        let per_mille: u32 = std::env::var("GSA_MOONLIGHT_LOSS").ok()?.parse().ok()?;
+        (per_mille > 0).then(|| {
+            tracing::warn!(per_mille, "injecting packet loss for a chaos run");
+            Self {
+                per_mille: per_mille.min(1000),
+                state: 0x2545_f491,
+                dropped: 0,
+            }
+        })
+    }
+
+    /// True when this datagram should be discarded.
+    fn drops(&mut self) -> bool {
+        // xorshift: cheap, and repeatable from a fixed seed so a chaos run
+        // that finds a bug can be replayed exactly.
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 17;
+        self.state ^= self.state << 5;
+        let drop = self.state % 1000 < self.per_mille;
+        if drop {
+            self.dropped += 1;
+        }
+        drop
+    }
+}
+
+/// Convert the host's 90 kHz stream clock to microseconds.
+///
+/// Wraps with the field, which the shared clock handling already expects.
+fn stream_clock_us(ticks: u32) -> u32 {
+    // 90 kHz → µs is ×100/9; done in 64-bit so the multiply cannot overflow
+    // before the division brings it back into range.
+    ((u64::from(ticks) * 100 / 9) & u64::from(u32::MAX)) as u32
 }
 
 /// Video datagrams carry packet type 0; audio uses its own types.
@@ -365,6 +460,7 @@ fn receive_media(
 ) {
     const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     let clock = gsa_core::time::MediaClock::new();
+    let mut loss = LossInjector::from_env();
     let mut depacketizer = Depacketizer::new();
     let mut buf = vec![0u8; 4096];
     let mut last_ping = std::time::Instant::now() - PING_INTERVAL;
@@ -388,6 +484,13 @@ fn receive_media(
                 return;
             }
         };
+        // Drop before anything inspects the packet, so the rest of the path
+        // cannot tell an injected loss from a real one.
+        if let Some(injector) = loss.as_mut()
+            && injector.drops()
+        {
+            continue;
+        }
         let arrival_us = clock.now_us();
         Counters::bump(&counters.datagrams);
         // Both streams share this socket, so each is routed by packet type.
@@ -409,11 +512,14 @@ fn receive_media(
                         data: frame.data,
                         frame_id: frame.frame_index,
                         keyframe: frame.keyframe,
-                        // The host exposes no capture clock, so the frame is
-                        // stamped with its arrival. Differences are real
-                        // (cadence, jitter); the absolute value is not
-                        // glass-to-glass and must not be reported as such.
-                        capture_ts_us: arrival_us as u32,
+                        // The host's own 90 kHz stream clock, in µs. Its
+                        // origin is unknown to us, so absolute latency from
+                        // it is meaningless — but the *gaps* between frames
+                        // are real host-side timing, which is exactly what a
+                        // de-jitter window measures. Stamping arrival here
+                        // instead would make every frame look perfectly
+                        // timed and the window would never engage.
+                        capture_ts_us: stream_clock_us(frame.timestamp),
                         arrival_us,
                     };
                     if frames.send(out).is_err() {

@@ -73,13 +73,14 @@ async fn main() {
         };
 
     let input = stream.input.clone();
-    let mut core = StreamSession::new(
+    let mut core = StreamSession::with_capture_clock(
         stream.take_frames().expect("frames"),
         stream.recovery.clone(),
         gsa_core::time::MediaClock::new(),
         ClockSync::default(),
         stream.dropped.clone(),
         stream.recovered.clone(),
+        gsa_client_core::CaptureClock::StreamPts,
     );
 
     let path = std::env::temp_dir().join("gsa-moonlight-gamepad.h264");
