@@ -7,6 +7,16 @@
 //! The point of this example is the seam: frames leave the backend as neutral
 //! access units and everything after that — reference gate, de-jitter, health
 //! stats — is the same code the gsa backend uses.
+//!
+//! To **watch** the stream, pipe the elementary stream into a player:
+//!
+//! ```text
+//! GSA_STDOUT=1 cargo run -q -p gsa-backend-moonlight --example stream -- \
+//!     192.168.50.184:47989 881448767 60 | ffplay -fflags nobuffer -f h264 -i -
+//! ```
+//!
+//! Or record it and open the file afterwards with `GSA_RECORD=/path/out.h264`.
+//! Progress and stats always go to stderr, so they never corrupt the video.
 
 use gsa_backend_moonlight::{ClientIdentity, PairedSession, StreamMode};
 use gsa_client_core::{ClockSync, StreamSession};
@@ -60,7 +70,7 @@ async fn main() {
                 return;
             }
         };
-    println!("streaming; driving the shared client core for {seconds}s");
+    eprintln!("streaming; driving the shared client core for {seconds}s");
 
     // Everything past this point is backend-agnostic.
     let frames = stream.take_frames().expect("frames not yet taken");
@@ -72,6 +82,13 @@ async fn main() {
         stream.dropped.clone(),
         stream.recovered.clone(),
     );
+
+    // Where the pictures go. stdout is for piping into a player, so every
+    // human-readable line in this example goes to stderr.
+    let to_stdout = std::env::var("GSA_STDOUT").is_ok();
+    let mut recording = std::env::var("GSA_RECORD")
+        .ok()
+        .map(|path| std::io::BufWriter::new(std::fs::File::create(path).expect("record file")));
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let mut frames = 0usize;
@@ -88,12 +105,24 @@ async fn main() {
                 // Report it as presented: without this the health stats have
                 // no display truth and every frame looks dropped.
                 core.frame_presented(frame.capture_ts_us);
+                if to_stdout {
+                    use std::io::Write;
+                    let mut out = std::io::stdout().lock();
+                    if out.write_all(&frame.data).is_err() {
+                        break; // player went away
+                    }
+                    let _ = out.flush();
+                }
+                if let Some(file) = recording.as_mut() {
+                    use std::io::Write;
+                    let _ = file.write_all(&frame.data);
+                }
                 if first.is_none() {
                     first = Some(frame.data);
                 }
             }
             Ok(Ok(None)) => {
-                println!("stream ended");
+                eprintln!("stream ended");
                 break;
             }
             Ok(Err(e)) => {
@@ -106,15 +135,15 @@ async fn main() {
 
     let stats = core.stats();
     let present = core.present_stats();
-    println!("frames {frames} ({keyframes} key)");
-    println!(
+    eprintln!("frames {frames} ({keyframes} key)");
+    eprintln!(
         "  core stats: complete={} decoded={} dropped_incomplete={} recovered={}",
         stats.frames_complete,
         stats.frames_decoded,
         stats.frames_dropped_incomplete,
         stats.frames_recovered
     );
-    println!(
+    eprintln!(
         "  presented: {} at {:.1} fps (1% low {:.1}), freezes {}, stutters {}",
         present.presented,
         f64::from(present.fps_x100) / 100.0,
@@ -122,17 +151,21 @@ async fn main() {
         present.freezes,
         present.stutters
     );
+    if let Some(file) = recording.as_mut() {
+        use std::io::Write;
+        let _ = file.flush();
+    }
     if let Some(data) = first {
         let path = std::env::temp_dir().join("gsa-moonlight-core-frame.h264");
         std::fs::write(&path, data).ok();
-        println!("  first frame written to {}", path.display());
+        eprintln!("  first frame written to {}", path.display());
     }
 
     drop(core);
     // Dropping this stops the receive threads and ends the session.
     drop(stream);
     match session.cancel().await {
-        Ok(()) => println!("cancelled"),
+        Ok(()) => eprintln!("cancelled"),
         Err(e) => eprintln!("cancel failed: {e}"),
     }
 }
