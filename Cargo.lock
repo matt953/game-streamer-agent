@@ -1147,11 +1147,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gsa-client-backend-api"
+version = "0.1.0"
+dependencies = [
+ "gsa-core",
+ "gsa-protocol",
+ "tokio",
+]
+
+[[package]]
 name = "gsa-client-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "gsa-audio",
+ "gsa-client-backend-api",
  "gsa-core",
  "gsa-protocol",
  "gsa-transport",

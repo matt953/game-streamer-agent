@@ -10,6 +10,10 @@ mod reassembly;
 pub mod stats;
 
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
+pub use gsa_client_backend_api::{
+    ActiveSession, BackendEvent, BackendFrame, CaptureClock, InputSink, RecoverySink, SessionCaps,
+    SessionKnobs, StreamBackend,
+};
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
 pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
 pub use reassembly::Reassembler;
@@ -162,6 +166,32 @@ impl InputSender {
     }
 }
 
+/// The gsa backend's half of the recovery seam: reference invalidation over
+/// the control stream, which the agent answers with a clean recovery point
+/// rather than a full IDR when it can.
+#[derive(Debug)]
+struct GsaRecovery {
+    control_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<C2A>>>>,
+}
+
+impl GsaRecovery {
+    fn send(&self, msg: C2A) {
+        if let Some(tx) = self.control_tx.lock().expect("control tx").as_ref() {
+            let _ = tx.send(msg);
+        }
+    }
+}
+
+impl RecoverySink for GsaRecovery {
+    fn request_keyframe(&self) {
+        self.send(C2A::RequestKeyframe);
+    }
+
+    fn request_recovery(&self, last_good_frame_id: u32) {
+        self.send(C2A::RequestRecovery { last_good_frame_id });
+    }
+}
+
 /// Fire-and-forget presentation reporter, decoupled from the frame-receive
 /// loop: the embedder calls [`PresentedSink::presented`] from its display
 /// path each time a frame is handed to the screen; the client folds the
@@ -193,7 +223,10 @@ pub struct Client {
     /// Moves into the receive task when it spawns.
     reassembler: Option<Reassembler>,
     /// Completed frames from the receive task, awaiting the gate.
-    frames_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ArrivedFrame>>,
+    frames_rx: Option<tokio::sync::mpsc::UnboundedReceiver<BackendFrame>>,
+    /// How the gate asks the agent to repair a broken reference chain — the
+    /// same seam every backend uses (spec 16).
+    recovery: std::sync::Arc<dyn RecoverySink>,
     /// Reassembler drop/recovery counters, mirrored out of the receive task.
     reassembly_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     reassembly_recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -235,13 +268,6 @@ pub struct Client {
     /// Audio receive+decode, set by [`Client::take_audio_output`] and read by
     /// the receive task; `None` means audio datagrams are dropped.
     audio: std::sync::Arc<std::sync::Mutex<Option<audio::AudioReceive>>>,
-}
-
-/// One reassembled frame plus its true arrival time, sent from the receive
-/// task to the gate.
-struct ArrivedFrame {
-    frame: reassembly::CompletedFrame,
-    arrival_us: u64,
 }
 
 impl std::fmt::Debug for Client {
@@ -305,12 +331,16 @@ impl Client {
 
         let clock = MediaClock::new();
         let presented_channel = tokio::sync::mpsc::unbounded_channel();
+        let control_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
         let mut client = Self {
             endpoint,
             conn,
             control_send: Some(control_send),
             control_recv: Some(control_recv),
-            control_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            recovery: std::sync::Arc::new(GsaRecovery {
+                control_tx: control_tx.clone(),
+            }),
+            control_tx,
             clock,
             clock_sync: ClockSync::default(),
             reassembler: Some(Reassembler::new()),
@@ -445,7 +475,25 @@ impl Client {
     /// the client can no longer send control messages afterward (it only
     /// receives frames + control replies).
     pub fn take_input_sender(&mut self) -> Option<InputSender> {
-        let mut stream = self.control_send.take()?;
+        self.ensure_control_writer();
+        let tx = self.control_tx.lock().expect("control tx").clone()?;
+        Some(InputSender { tx })
+    }
+
+    /// Move the control send-stream into a background writer task, once.
+    ///
+    /// Everything that talks to the agent mid-stream — input, NACKs, packet
+    /// feedback, stats reports, recovery requests — goes through this one
+    /// writer, so those paths are plain synchronous sends. Called before the
+    /// first frame as well as by [`Client::take_input_sender`]: the recovery
+    /// seam must work whether or not the embedder wants an input sink.
+    fn ensure_control_writer(&mut self) {
+        if self.control_tx.lock().expect("control tx").is_some() {
+            return;
+        }
+        let Some(mut stream) = self.control_send.take() else {
+            return;
+        };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<C2A>();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
@@ -454,9 +502,7 @@ impl Client {
                 }
             }
         });
-        // Keep a clone so recv_frame and the receive task can send too.
-        *self.control_tx.lock().expect("control tx") = Some(tx.clone());
-        Some(InputSender { tx })
+        *self.control_tx.lock().expect("control tx") = Some(tx);
     }
 
     /// Take the audio output channel — interleaved-i16 PCM frames for the
@@ -527,6 +573,9 @@ impl Client {
         if self.frames_rx.is_some() {
             return;
         }
+        // The receive task and the gate both send on it; start it first so no
+        // NACK or recovery request is dropped for want of a writer.
+        self.ensure_control_writer();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let task = ReceiveTask {
             conn: self.conn.clone(),
@@ -550,7 +599,7 @@ impl Client {
     /// Next video frame past the loss-recovery gate, with its header and
     /// reassembled access unit. `None` when the connection closes. Shared by
     /// `recv_frame` (decode path) and `recv_encoded` (embedder passthrough).
-    async fn next_gated_frame(&mut self) -> Result<Option<(VideoDatagramHeader, Vec<u8>)>> {
+    async fn next_gated_frame(&mut self) -> Result<Option<BackendFrame>> {
         self.ensure_receiver();
         loop {
             let rx = self.frames_rx.as_mut().expect("receiver running");
@@ -572,15 +621,8 @@ impl Client {
     /// (lost frame), hold the last good picture and skip P-frames until a
     /// keyframe resyncs — decoding a P-frame against a stale reference
     /// corrupts output. Requests the keyframe immediately.
-    async fn gate(
-        &mut self,
-        f: ArrivedFrame,
-        backlog: bool,
-    ) -> Result<Option<(VideoDatagramHeader, Vec<u8>)>> {
-        let ArrivedFrame {
-            frame: f,
-            arrival_us,
-        } = f;
+    async fn gate(&mut self, f: BackendFrame, backlog: bool) -> Result<Option<BackendFrame>> {
+        let arrival_us = f.arrival_us;
         self.stats.on_frame_complete(f.data.len(), arrival_us);
         // A decoder-rejected frame breaks the chain even though delivery
         // looked clean: freeze and request recovery like any gap.
@@ -591,9 +633,9 @@ impl Client {
         {
             tracing::debug!("embedder reported decode error; freezing");
             self.awaiting_idr = true;
-            self.request_keyframe_throttled().await?;
+            self.request_keyframe_throttled();
         }
-        let is_idr = f.kind == gsa_core::media::FrameKind::Idr;
+        let is_idr = f.keyframe;
         if is_idr {
             self.awaiting_idr = false;
         }
@@ -606,7 +648,7 @@ impl Client {
             } else if delta != 1 && !is_idr && !self.awaiting_idr {
                 tracing::debug!(gap_after = last, got = f.frame_id, "frame gap; freezing");
                 self.awaiting_idr = true;
-                self.request_keyframe_throttled().await?;
+                self.request_keyframe_throttled();
             }
         }
 
@@ -626,7 +668,7 @@ impl Client {
                 // Skip P-frames (a broken reference is the corruption);
                 // advance the id so the gap isn't re-flagged, keep asking.
                 self.last_frame_id = Some(f.frame_id);
-                self.request_keyframe_throttled().await?;
+                self.request_keyframe_throttled();
                 return Ok(None);
             }
         }
@@ -637,18 +679,7 @@ impl Client {
         self.last_delivered_id = Some(f.frame_id);
         self.dejitter_release(f.capture_ts_us, arrival_us, backlog)
             .await;
-        let header = VideoDatagramHeader {
-            seq: 0,
-            session_epoch: 0,
-            frame_id: f.frame_id,
-            kind: f.kind,
-            chunk_index: 0,
-            chunk_count: 1,
-            parity_count: 0,
-            frame_len: 0,
-            capture_ts_us: f.capture_ts_us,
-        };
-        Ok(Some((header, f.data)))
+        Ok(Some(f))
     }
 
     /// Receive datagrams until the next complete frame decodes.
@@ -658,21 +689,21 @@ impl Client {
         decoder: &mut dyn VideoDecoder,
     ) -> Result<Option<FrameOutput>> {
         loop {
-            let Some((header, frame_data)) = self.next_gated_frame().await? else {
+            let Some(gated) = self.next_gated_frame().await? else {
                 return Ok(None);
             };
             let decode_start = self.clock.now_us();
-            match decoder.decode(&frame_data) {
+            match decoder.decode(&gated.data) {
                 Ok(Some(frame)) => {
                     let now = self.clock.now_us();
                     let decode_us = (now - decode_start) as u32;
-                    let latency_us = self.clock_sync.frame_latency_us(now, header.capture_ts_us);
+                    let latency_us = self.clock_sync.frame_latency_us(now, gated.capture_ts_us);
                     self.stats.on_frame_decoded(latency_us, decode_us);
                     self.report_stats_if_due();
                     return Ok(Some(FrameOutput {
                         frame,
-                        frame_id: header.frame_id,
-                        capture_ts_us: header.capture_ts_us,
+                        frame_id: gated.frame_id,
+                        capture_ts_us: gated.capture_ts_us,
                         latency_us,
                         decode_us,
                     }));
@@ -686,7 +717,7 @@ impl Client {
                     // request a healing keyframe.
                     tracing::debug!(error = %e, "decode error; freezing until keyframe");
                     self.awaiting_idr = true;
-                    self.request_keyframe_throttled().await?;
+                    self.request_keyframe_throttled();
                 }
             }
         }
@@ -697,19 +728,19 @@ impl Client {
     /// loss-recovery gate as `recv_frame`; audio routes as a side effect.
     /// `None` when the connection closes.
     pub async fn recv_encoded(&mut self) -> Result<Option<EncodedFrame>> {
-        let Some((header, frame_data)) = self.next_gated_frame().await? else {
+        let Some(gated) = self.next_gated_frame().await? else {
             return Ok(None);
         };
         let now = self.clock.now_us();
-        let latency_us = self.clock_sync.frame_latency_us(now, header.capture_ts_us);
+        let latency_us = self.clock_sync.frame_latency_us(now, gated.capture_ts_us);
         // Decode happens app-side; record it as zero in the stats window.
         self.stats.on_frame_decoded(latency_us, 0);
         self.report_stats_if_due();
         Ok(Some(EncodedFrame {
-            data: frame_data,
-            frame_id: header.frame_id,
-            keyframe: header.kind == gsa_core::media::FrameKind::Idr,
-            capture_ts_us: header.capture_ts_us,
+            data: gated.data,
+            frame_id: gated.frame_id,
+            keyframe: gated.keyframe,
+            capture_ts_us: gated.capture_ts_us,
             latency_us,
         }))
     }
@@ -758,32 +789,20 @@ impl Client {
     }
 
     /// Request a healing keyframe, rate-limited so a burst of gaps/errors
-    /// doesn't spam the agent (one keyframe fixes them all).
-    async fn request_keyframe_throttled(&mut self) -> Result<()> {
+    /// doesn't spam the host (one keyframe fixes them all). Throttling lives
+    /// here, not in the backend, so every protocol inherits it.
+    fn request_keyframe_throttled(&mut self) {
         const MIN_INTERVAL_US: u64 = 250_000;
         let now = self.clock.now_us();
         if now.saturating_sub(self.last_keyframe_request_us) < MIN_INTERVAL_US {
-            return Ok(());
+            return;
         }
         self.last_keyframe_request_us = now;
-        self.send_keyframe_request().await
-    }
-
-    async fn send_keyframe_request(&mut self) -> Result<()> {
-        // With a known-good frame the agent can clean references instead of
+        // With a known-good frame the host can clean references instead of
         // resetting the world with an IDR (spec 04 rung 2).
-        let msg = match self.last_delivered_id {
-            Some(last_good_frame_id) => C2A::RequestRecovery { last_good_frame_id },
-            None => C2A::RequestKeyframe,
-        };
-        let tx = self.control_tx.lock().expect("control tx").clone();
-        if let Some(tx) = tx {
-            let _ = tx.send(msg);
-            Ok(())
-        } else if let Some(stream) = self.control_send.as_mut() {
-            send_msg(stream, &msg).await
-        } else {
-            Ok(())
+        match self.last_delivered_id {
+            Some(last_good) => self.recovery.request_recovery(last_good),
+            None => self.recovery.request_keyframe(),
         }
     }
 
@@ -927,7 +946,7 @@ struct ReceiveTask {
     reassembler: Reassembler,
     control_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<C2A>>>>,
     audio: std::sync::Arc<std::sync::Mutex<Option<audio::AudioReceive>>>,
-    frames_tx: tokio::sync::mpsc::UnboundedSender<ArrivedFrame>,
+    frames_tx: tokio::sync::mpsc::UnboundedSender<BackendFrame>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Pending per-packet arrival samples (seq, arrival µs) for the next
@@ -978,11 +997,14 @@ impl ReceiveTask {
                     };
                     let arrival_us = self.clock.now_us();
                     for frame in self.reassembler.push(header, payload) {
-                        if self
-                            .frames_tx
-                            .send(ArrivedFrame { frame, arrival_us })
-                            .is_err()
-                        {
+                        let frame = BackendFrame {
+                            data: frame.data,
+                            frame_id: frame.frame_id,
+                            keyframe: frame.kind == gsa_core::media::FrameKind::Idr,
+                            capture_ts_us: frame.capture_ts_us,
+                            arrival_us,
+                        };
+                        if self.frames_tx.send(frame).is_err() {
                             return; // client gone
                         }
                     }
