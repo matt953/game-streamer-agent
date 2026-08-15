@@ -1208,6 +1208,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "fec-rs",
+ "gsa-audio",
  "gsa-client-backend-api",
  "gsa-client-core",
  "gsa-core",

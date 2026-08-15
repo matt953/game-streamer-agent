@@ -12,6 +12,7 @@ description = "Moonlight-protocol client backend (Sunshine/Apollo/Wolf hosts) â€
 gsa-core = { workspace = true }
 gsa-client-backend-api = { workspace = true }
 gsa-protocol = { workspace = true }
+gsa-audio = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 rcgen = { workspace = true }

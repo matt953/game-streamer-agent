@@ -160,6 +160,13 @@ fn moonlight_loop(
                 stream.recovered.clone(),
             );
 
+            // Play whatever audio arrives. The host may send none — that is a
+            // host-side condition, not a client failure — so video continues
+            // regardless.
+            let _audio = crate::audio_playback::start(stream.audio_channel())
+                .inspect_err(|e| tracing::warn!(error = %e, "audio playback unavailable"))
+                .ok();
+
             // Input goes over the same control channel; the host exposes no
             // live quality knobs, so none are offered rather than shown and
             // silently ignored.

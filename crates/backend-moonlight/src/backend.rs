@@ -87,6 +87,8 @@ pub struct MoonlightStream {
     datagrams: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Whether this started the app or rejoined one already running.
     pub origin: SessionOrigin,
+    /// Decoded interleaved PCM, in the same shape every backend produces.
+    pub audio: std::sync::mpsc::Receiver<Vec<i16>>,
     /// What the host says over the control channel: rumble, termination, and
     /// features we do not act on yet. Drain it — a caller that ignores this
     /// still gets a stream, but loses the host's own account of what happened.
@@ -109,6 +111,15 @@ impl MoonlightStream {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// Take the decoded PCM channel.
+    ///
+    /// Replaced with a disconnected channel, so a second caller gets silence
+    /// rather than a panic or a stolen stream.
+    pub fn audio_channel(&mut self) -> std::sync::mpsc::Receiver<Vec<i16>> {
+        let (_, empty) = std::sync::mpsc::channel();
+        std::mem::replace(&mut self.audio, empty)
     }
 
     /// Claim the frame stream. Returns `None` if already taken.
@@ -258,6 +269,7 @@ async fn connect(
         .map_err(|e| Error::Transport(format!("spawn control thread: {e}")))?;
 
     let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (audio_rx, audio_pcm) = crate::AudioReceive::new()?;
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let recovered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let datagrams = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -274,20 +286,21 @@ async fn connect(
     let audio_port = negotiated.audio_port;
 
     let worker_stop = stop.clone();
-    let worker_dropped = dropped.clone();
-    let worker_recovered = recovered.clone();
-    let worker_datagrams = datagrams.clone();
+    let worker_counters = Counters {
+        dropped: dropped.clone(),
+        recovered: recovered.clone(),
+        datagrams: datagrams.clone(),
+    };
     std::thread::Builder::new()
         .name("moonlight-video".into())
         .spawn(move || {
-            receive_video(
+            receive_media(
                 media,
                 audio_port,
+                audio_rx,
                 &frames_tx,
                 &worker_stop,
-                &worker_dropped,
-                &worker_recovered,
-                &worker_datagrams,
+                &worker_counters,
             );
         })
         .map_err(|e| Error::Transport(format!("spawn video thread: {e}")))?;
@@ -308,6 +321,7 @@ async fn connect(
         datagrams,
         // Overwritten by `start`, which knows how the session began.
         origin: SessionOrigin::Launched,
+        audio: audio_pcm,
         _worker: Worker {
             commands: command_tx,
             stop,
@@ -325,14 +339,29 @@ fn is_video(datagram: &[u8]) -> bool {
 /// Arrival is stamped here, on the receive side, and never on the way out:
 /// a frame stamped when it is released would make a paced present look like
 /// network delay to anything reasoning about the link.
-fn receive_video(
+/// Counters the receive loop keeps for the shared health stats.
+struct Counters {
+    /// Frames the wire could not deliver whole.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Frames rebuilt from parity — loss that cost nothing visible.
+    recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Any media datagram, used to tell streaming from silence.
+    datagrams: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Counters {
+    fn bump(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn receive_media(
     mut media: MediaSocket,
     audio_port: u16,
+    mut audio: crate::AudioReceive,
     frames: &tokio::sync::mpsc::UnboundedSender<BackendFrame>,
     stop: &std::sync::atomic::AtomicBool,
-    dropped: &std::sync::atomic::AtomicU64,
-    recovered: &std::sync::atomic::AtomicU64,
-    datagrams: &std::sync::atomic::AtomicU64,
+    counters: &Counters,
 ) {
     const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     let clock = gsa_core::time::MediaClock::new();
@@ -360,9 +389,12 @@ fn receive_video(
             }
         };
         let arrival_us = clock.now_us();
-        datagrams.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Both streams share this socket now, so only video goes to the
-        // video reassembler; audio is told apart by its packet type.
+        Counters::bump(&counters.datagrams);
+        // Both streams share this socket, so each is routed by packet type.
+        if crate::AudioReceive::owns(&buf[..n]) {
+            audio.handle(&buf[..n]);
+            continue;
+        }
         if !is_video(&buf[..n]) {
             continue;
         }
@@ -371,7 +403,7 @@ fn receive_video(
             match event {
                 Received::Frame(frame) => {
                     if frame.recovered {
-                        recovered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Counters::bump(&counters.recovered);
                     }
                     let out = BackendFrame {
                         data: frame.data,
@@ -390,7 +422,7 @@ fn receive_video(
                 }
                 Received::Lost(loss) => {
                     tracing::debug!(?loss, "frame lost");
-                    dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Counters::bump(&counters.dropped);
                 }
                 Received::Nothing => {}
             }
