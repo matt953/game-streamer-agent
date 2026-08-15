@@ -11,17 +11,13 @@
 
 use std::ffi::{CStr, c_char};
 
-/// Which protocol a host speaks. Values are part of the C ABI, so they are
-/// fixed once shipped.
+/// Which protocol a host speaks.
 ///
-/// The gsa backend keeps its own entry point for now, so this value is not
-/// yet produced by any enrolment call — it exists so the encoding does not
-/// have to change when that path moves here.
+/// No enrolment call produces [`GSA_BACKEND_GSA`] yet — the gsa agent still has
+/// its own entry point — but the blob names the backend so the neutral calls
+/// can tell them apart the moment it moves here.
 pub const GSA_BACKEND_GSA: u32 = 0;
 pub const GSA_BACKEND_MOONLIGHT: u32 = 1;
-
-#[allow(dead_code, reason = "reserved ABI value; see the note above")]
-const _: u32 = GSA_BACKEND_GSA;
 
 /// An enrolled host: how to reach it, and the credentials to prove we may.
 #[derive(Debug, Clone)]

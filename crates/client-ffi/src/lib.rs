@@ -187,8 +187,8 @@ pub struct GsaCallbacks {
     pub on_audio: Option<unsafe extern "C" fn(ctx: *mut c_void, pcm: *const i16, samples: usize)>,
     /// A user-facing notification pushed by the host (a toast, etc.). `kind` is
     /// a `GSA_NOTIFY_*` value; `arg` is kind-specific (the gamepad seat for the
-    /// gamepad kinds). Fires on a dedicated thread. Unknown kinds should be
-    /// ignored so new ones stay backward-compatible.
+    /// gamepad kinds). Fires on a dedicated thread. Ignore kinds you do not
+    /// handle rather than treating them as an error.
     pub on_notification: Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32, arg: u32)>,
     /// The host asked a controller to do something: rumble, trigger motors, an
     /// LED colour, or to start sending motion. `kind` is a
@@ -197,8 +197,8 @@ pub struct GsaCallbacks {
     ///
     /// Render only what the pad actually has: the session's capabilities
     /// (`gsa_session_pad_caps`) say what the wire carries, not what is in the
-    /// user's hands. Unknown kinds must be ignored so later ones stay
-    /// backward-compatible.
+    /// user's hands. Ignore kinds you do not handle rather than treating them
+    /// as an error.
     pub on_pad_feedback: Option<
         unsafe extern "C" fn(ctx: *mut c_void, kind: u32, seat: u32, a: u32, b: u32, c: u32),
     >,
@@ -220,14 +220,8 @@ pub struct GsaCallbacks {
     >,
 }
 
-/// `on_notification` kinds. Stable across the ABI; append new values.
+/// `on_notification` kinds.
 pub const GSA_NOTIFY_GAMEPAD_CONNECTED: u32 = 1;
-/// The host asked a controller to rumble; `arg` is the seat.
-///
-/// Magnitudes are not carried yet: this callback shape passes a single `u32`,
-/// and packing two 16-bit levels into it would be a trap for the next reader.
-/// A richer feedback callback is the right fix (see spec 16, task 52).
-pub const GSA_NOTIFY_RUMBLE: u32 = 3;
 pub const GSA_NOTIFY_GAMEPAD_DISCONNECTED: u32 = 2;
 
 /// Kinds for [`GsaCallbacks::on_pad_feedback`].

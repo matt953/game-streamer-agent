@@ -258,13 +258,6 @@ pub(crate) fn run_session(
                 // The full effect, not just its existence: amplitudes, colours
                 // and motion requests all reach the embedder here.
                 crate::fire_pad_feedback(&cbs, &event);
-                if let gsa_client_core::BackendEvent::Feedback(
-                    gsa_client_core::GamepadFeedback::Rumble { seat, .. },
-                ) = event
-                {
-                    // Kept for embedders written against the older callback.
-                    crate::fire_notification(&cbs, crate::GSA_NOTIFY_RUMBLE, u32::from(seat));
-                }
             }
         }
 
