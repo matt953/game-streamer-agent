@@ -25,6 +25,7 @@ mod media;
 mod pair;
 mod rtsp;
 mod tls;
+mod video;
 
 pub use control::{Crypto, message, message_type, msg};
 pub use enet::{Command, HostMessage, run as run_control};
@@ -33,6 +34,7 @@ pub use identity::ClientIdentity;
 pub use media::MediaSocket;
 pub use pair::{PairedHost, pair, random_pin};
 pub use rtsp::{Negotiated, Rtsp, StreamRequest};
+pub use video::{Depacketizer, FrameLoss, Received, ShardHeader, VideoFrame, parse_header};
 
 /// The client certificate in the hex-encoded-PEM form the `/pair` endpoint
 /// expects. Exposed for reproducing a handshake step by hand when a host

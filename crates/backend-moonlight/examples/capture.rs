@@ -96,6 +96,12 @@ async fn capture(
         video.local_port()
     );
 
+    let mut depacketizer = gsa_backend_moonlight::Depacketizer::new();
+    let mut frames = 0usize;
+    let mut keyframes = 0usize;
+    let mut lost = 0usize;
+    let mut frame_bytes = 0usize;
+    let mut first_frame: Option<Vec<u8>> = None;
     let mut buf = vec![0u8; 4096];
     let mut seen = 0usize;
     let mut bytes = 0usize;
@@ -113,11 +119,34 @@ async fn capture(
         if let Some(n) = video.recv(&mut buf)? {
             seen += 1;
             bytes += n;
-            // Dump the head of the first few, and one later packet to see
-            // how the fields advance.
-            if seen <= 4 || seen == 60 {
-                println!("--- datagram #{seen}, {n} bytes ---");
-                dump(&buf[..n.min(64)]);
+            depacketizer.push(&buf[..n]);
+            while let Some(event) = depacketizer.next_event() {
+                match event {
+                    gsa_backend_moonlight::Received::Frame(f) => {
+                        frames += 1;
+                        frame_bytes += f.data.len();
+                        if f.keyframe {
+                            keyframes += 1;
+                        }
+                        if first_frame.is_none() {
+                            println!(
+                                "first frame: index={} keyframe={} {} bytes, starts:",
+                                f.frame_index,
+                                f.keyframe,
+                                f.data.len()
+                            );
+                            dump(&f.data[..f.data.len().min(32)]);
+                            first_frame = Some(f.data);
+                        }
+                    }
+                    gsa_backend_moonlight::Received::Lost(l) => {
+                        lost += 1;
+                        if lost <= 3 {
+                            println!("lost: {l:?}");
+                        }
+                    }
+                    gsa_backend_moonlight::Received::Nothing => {}
+                }
             }
         }
     }
@@ -126,6 +155,14 @@ async fn capture(
         "received {seen} datagrams, {bytes} bytes in {:.1}s",
         start.elapsed().as_secs_f32()
     );
+    println!(
+        "frames: {frames} ({keyframes} key), {frame_bytes} bytes of access units, {lost} lost"
+    );
+    if let Some(f) = &first_frame {
+        let path = std::env::temp_dir().join("gsa-moonlight-frame.h264");
+        std::fs::write(&path, f).ok();
+        println!("wrote first frame to {}", path.display());
+    }
     let _ = cmd_tx.send(gsa_backend_moonlight::Command::Stop);
     let _ = control.join();
     Ok(())

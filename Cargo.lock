@@ -929,6 +929,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "fec-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a86d2bb0db9647ee5dece2ea54a808c14428db009ad751f95b091598835cd0b"
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1201,6 +1207,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "fec-rs",
  "gsa-client-backend-api",
  "gsa-core",
  "rand_core 0.6.4",
