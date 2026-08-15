@@ -57,13 +57,15 @@ impl HostMessage {
                 controller,
                 low_frequency,
                 high_frequency,
-            } => Some(gsa_client_backend_api::BackendEvent::Rumble {
-                // Controller numbers are u16 on this wire and a u8 seat index
-                // everywhere else; there is no seat above 255.
-                seat: controller.min(u16::from(u8::MAX)) as u8,
-                low: low_frequency,
-                high: high_frequency,
-            }),
+            } => Some(gsa_client_backend_api::BackendEvent::Feedback(
+                gsa_client_backend_api::GamepadFeedback::Rumble {
+                    // Controller numbers are u16 on this wire and a u8 seat
+                    // index everywhere else; there is no seat above 255.
+                    seat: controller.min(u16::from(u8::MAX)) as u8,
+                    low: low_frequency,
+                    high: high_frequency,
+                },
+            )),
             _ => None,
         }
     }

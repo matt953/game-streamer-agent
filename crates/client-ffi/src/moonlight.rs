@@ -205,6 +205,7 @@ pub(crate) fn run_session(
             decode_error: core.decode_error_flag(),
             dejitter: core.dejitter_flag(),
             codec: crate::GSA_CODEC_H264,
+            pad_caps: u32::from(stream.pad_caps().bits()),
         });
 
         // Audio drains on its own thread so PCM keeps flowing while the frame
@@ -251,7 +252,9 @@ pub(crate) fn run_session(
             // Host feedback (rumble today) is drained off the frame path so a
             // quiet stream cannot delay it indefinitely.
             while let Ok(message) = stream.events.try_recv() {
-                if let Some(gsa_client_core::BackendEvent::Rumble { seat, .. }) = message.neutral()
+                if let Some(gsa_client_core::BackendEvent::Feedback(
+                    gsa_client_core::GamepadFeedback::Rumble { seat, .. },
+                )) = message.neutral()
                 {
                     crate::fire_notification(&cbs, crate::GSA_NOTIFY_RUMBLE, u32::from(seat));
                 }

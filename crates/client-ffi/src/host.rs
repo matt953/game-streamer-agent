@@ -291,6 +291,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
             decode_error,
             dejitter,
             codec,
+            pad_caps,
         }) => Box::into_raw(Box::new(crate::GsaSession {
             stop,
             thread: Some(thread),
@@ -300,6 +301,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
             decode_error,
             dejitter,
             codec,
+            pad_caps,
         })),
         // Either the session failed or the thread died; join so its failure is
         // not left running behind a NULL return.

@@ -20,6 +20,9 @@
 //! session it returns is plain data plus small synchronous sinks, with frames
 //! arriving over a channel.
 
+pub mod gamepad;
+
+pub use gamepad::{GamepadFeedback, GamepadProfile, PadCaps, PadKind, TriggerEffect};
 use gsa_core::Result;
 pub use gsa_protocol::input::InputEvent;
 
@@ -73,6 +76,10 @@ pub struct SessionCaps {
     pub reference_invalidation: bool,
     /// How to read [`BackendFrame::capture_ts_us`].
     pub capture_clock: CaptureClock,
+    /// What of a controller this session carries, in both directions. The
+    /// embedder enables a pad feature only where this and the pad's own
+    /// [`GamepadProfile::caps`] agree — see [`gamepad`].
+    pub pads: PadCaps,
 }
 
 /// Asks the host to repair a broken reference chain. The core calls this on a
@@ -119,6 +126,15 @@ pub trait SessionKnobs: std::fmt::Debug + Send + Sync {
 /// a UI event loop — and the backend owns ordering and delivery.
 pub trait InputSink: std::fmt::Debug + Send + Sync {
     fn send(&self, events: Vec<InputEvent>);
+
+    /// Tell the host what pad occupies `seat`, so it can present a matching
+    /// virtual device and enable the features the pad actually has.
+    ///
+    /// Announce on connect and on any change. Backends whose protocol has no
+    /// announcement keep the default and infer the pad from its input.
+    fn announce_pad(&self, seat: u8, profile: GamepadProfile) {
+        let _ = (seat, profile);
+    }
 }
 
 /// A host-side event the embedder may surface. Backend-neutral: a variant here
@@ -130,8 +146,10 @@ pub enum BackendEvent {
     GamepadConnected { seat: u8 },
     /// The host's virtual pad for `seat` went away.
     GamepadDisconnected { seat: u8 },
-    /// Rumble for `seat`, 16-bit amplitudes.
-    Rumble { seat: u8, low: u16, high: u16 },
+    /// The game asked a pad to do something — rumble, trigger resistance, an
+    /// LED colour. The embedder renders what the pad supports and drops the
+    /// rest ([`GamepadFeedback::requires`]).
+    Feedback(GamepadFeedback),
     /// Periodic host encoder telemetry (bits/s). A field the backend cannot
     /// know is 0, meaning unmeasured: display it as "—", not as zero.
     EncodeStats {

@@ -161,6 +161,16 @@ impl MoonlightStream {
     pub fn take_frames(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<BackendFrame>> {
         self.frames.take()
     }
+
+    /// What of a controller this session carries.
+    ///
+    /// Rumble only for now: the protocol also defines pad announcement,
+    /// motion, touchpad and battery, but claiming a capability the encoder
+    /// does not send would have the embedder capture for nothing.
+    #[must_use]
+    pub fn pad_caps(&self) -> gsa_client_backend_api::PadCaps {
+        gsa_client_backend_api::PadCaps::RUMBLE
+    }
 }
 
 /// Owns the receive threads and stops them on drop.

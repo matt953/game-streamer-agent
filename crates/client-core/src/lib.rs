@@ -12,8 +12,9 @@ pub mod stats;
 
 pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
 pub use gsa_client_backend_api::{
-    ActiveSession, BackendEvent, BackendFrame, CaptureClock, CatalogEntry, CatalogKind, InputSink,
-    RecoverySink, SessionCaps, SessionKnobs, SessionOrigin, StreamBackend,
+    ActiveSession, BackendEvent, BackendFrame, CaptureClock, CatalogEntry, CatalogKind,
+    GamepadFeedback, GamepadProfile, InputSink, PadCaps, PadKind, RecoverySink, SessionCaps,
+    SessionKnobs, SessionOrigin, StreamBackend, TriggerEffect,
 };
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
 pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
@@ -183,6 +184,10 @@ impl SessionKnobs for InputSender {
             // The agent stamps frames with its own capture clock and we keep
             // an offset estimate, so latency here is true glass-to-glass.
             capture_clock: CaptureClock::HostSynced,
+            // Rumble rides the control stream and motion has its own input
+            // event (spec 07). The richer pad features are not on the wire
+            // yet, so they are not claimed here.
+            pads: PadCaps::RUMBLE | PadCaps::MOTION,
         }
     }
 

@@ -37,6 +37,21 @@ pub const GSA_CODEC_H264: u32 = 1 << 0;
 pub const GSA_CODEC_HEVC: u32 = 1 << 1;
 pub const GSA_CODEC_AV1: u32 = 1 << 2;
 
+/// Controller capability flags, from `gsa_session_pad_caps` (spec 07, 16).
+///
+/// One vocabulary for every backend. The embedder enables a pad feature only
+/// where the session carries it *and* the pad has it: capture nothing
+/// transmits costs battery for nothing, and an effect the pad cannot render
+/// is silence the user reads as a fault.
+pub const GSA_PAD_RUMBLE: u32 = 1 << 0;
+pub const GSA_PAD_TRIGGER_RUMBLE: u32 = 1 << 1;
+pub const GSA_PAD_GYRO: u32 = 1 << 2;
+pub const GSA_PAD_ACCEL: u32 = 1 << 3;
+pub const GSA_PAD_TOUCHPAD: u32 = 1 << 4;
+pub const GSA_PAD_ADAPTIVE_TRIGGERS: u32 = 1 << 5;
+pub const GSA_PAD_LED: u32 = 1 << 6;
+pub const GSA_PAD_BATTERY: u32 = 1 << 7;
+
 fn codecs_from_flags(flags: u32) -> Vec<Codec> {
     let mut codecs = Vec::new();
     if flags & GSA_CODEC_HEVC != 0 {
@@ -231,6 +246,9 @@ pub struct GsaSession {
     dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The negotiated codec (a `GSA_CODEC_*` flag), for `gsa_session_codec`.
     codec: u32,
+    /// What of a controller this session carries (`GSA_PAD_*` flags), for
+    /// `gsa_session_pad_caps`.
+    pad_caps: u32,
 }
 
 /// Handed back from `session_loop` once it knows the outcome: whether the
@@ -247,6 +265,7 @@ pub(crate) enum SessionReady {
         decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
         codec: u32,
+        pad_caps: u32,
     },
 }
 
@@ -337,6 +356,7 @@ pub unsafe extern "C" fn gsa_session_start(
             decode_error,
             dejitter,
             codec,
+            pad_caps,
         }) => Box::into_raw(Box::new(GsaSession {
             stop,
             thread: Some(thread),
@@ -346,6 +366,7 @@ pub unsafe extern "C" fn gsa_session_start(
             decode_error,
             dejitter,
             codec,
+            pad_caps,
         })),
         _ => {
             let _ = thread.join();
@@ -366,6 +387,27 @@ pub unsafe extern "C" fn gsa_session_codec(session: *const GsaSession) -> u32 {
     }
     // SAFETY: caller contract guarantees a live handle.
     unsafe { &*session }.codec
+}
+
+/// What of a controller this session carries, as `GSA_PAD_*` flags. NULL
+/// returns 0.
+///
+/// Gate every pad feature on this **and** on what the physical pad has: motion
+/// capture nothing transmits drains battery, and an effect the pad cannot
+/// render reads as a fault. Backends differ widely here — a console protocol
+/// carries a pad whole, a PC host takes rumble — so nothing may be assumed
+/// from the fact that a session started.
+///
+/// # Safety
+/// `session` must be a live handle from [`gsa_session_start`] or
+/// [`gsa_host_session_start`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_pad_caps(session: *const GsaSession) -> u32 {
+    if session.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract guarantees a live handle.
+    unsafe { &*session }.pad_caps
 }
 
 /// Stop a session started by [`gsa_session_start`], join its threads, and free
@@ -734,6 +776,7 @@ async fn session_loop(
     let codec = client
         .negotiated_codec()
         .map_or(GSA_CODEC_H264, codec_to_flag);
+    let knob_caps = knobs.as_ref().map(|k| k.caps());
     let _ = ready_tx.send(SessionReady::Streaming {
         input,
         knobs,
@@ -741,6 +784,9 @@ async fn session_loop(
         decode_error,
         dejitter,
         codec,
+        // The agent's own pad support, straight from the backend seam rather
+        // than restated here, so the two cannot drift.
+        pad_caps: knob_caps.map_or(0, |caps| u32::from(caps.pads.bits())),
     });
 
     // Audio drains on its own thread: PCM must flow steadily even while the
@@ -849,3 +895,28 @@ pub(crate) fn fire_notification(cbs: &GsaCallbacks, kind: u32, arg: u32) {
 pub(crate) struct SendPtr(pub(crate) *mut c_void);
 // SAFETY: see `GsaCallbacks` threading contract.
 unsafe impl Send for SendPtr {}
+
+#[cfg(test)]
+mod tests {
+    use gsa_client_core::PadCaps;
+
+    /// The `GSA_PAD_*` flags are the C ABI's copy of [`PadCaps`]. They are
+    /// declared twice (here and in the app's header) and shipped, so a
+    /// renumbered bit would silently enable the wrong feature on a device.
+    #[test]
+    fn pad_flags_match_the_seam_bit_for_bit() {
+        let pairs = [
+            (super::GSA_PAD_RUMBLE, PadCaps::RUMBLE),
+            (super::GSA_PAD_TRIGGER_RUMBLE, PadCaps::TRIGGER_RUMBLE),
+            (super::GSA_PAD_GYRO, PadCaps::GYRO),
+            (super::GSA_PAD_ACCEL, PadCaps::ACCEL),
+            (super::GSA_PAD_TOUCHPAD, PadCaps::TOUCHPAD),
+            (super::GSA_PAD_ADAPTIVE_TRIGGERS, PadCaps::ADAPTIVE_TRIGGERS),
+            (super::GSA_PAD_LED, PadCaps::LED),
+            (super::GSA_PAD_BATTERY, PadCaps::BATTERY),
+        ];
+        for (flag, cap) in pairs {
+            assert_eq!(flag, u32::from(cap.bits()));
+        }
+    }
+}
