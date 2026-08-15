@@ -15,6 +15,8 @@
 //! - Our own packet captures against the dev host
 //!
 
+mod control;
+mod enet;
 mod hex;
 mod host;
 mod http;
@@ -23,6 +25,8 @@ mod pair;
 mod rtsp;
 mod tls;
 
+pub use control::{Crypto, message, message_type, msg};
+pub use enet::{Command, HostMessage, run as run_control};
 pub use host::{LaunchedSession, PairedSession, StreamMode};
 pub use identity::ClientIdentity;
 pub use pair::{PairedHost, pair, random_pin};

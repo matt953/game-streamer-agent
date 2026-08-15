@@ -88,6 +88,45 @@ async fn main() {
                     println!("    ref invalidation: {}", n.reference_invalidation);
                     println!("    ping payload: {:?}", n.ping_payload.is_some());
                     println!("    connect data: {:?}", n.connect_data);
+
+                    // Bring up the control channel. This is the real test of
+                    // whether a stock Rust ENet talks to the host's fork.
+                    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+                    let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+                    let control_addr = std::net::SocketAddr::new(addr.ip(), n.control_port);
+                    let crypto =
+                        gsa_backend_moonlight::Crypto::new(launched.riaes_key, n.control_v2());
+                    let worker = std::thread::spawn(move || {
+                        gsa_backend_moonlight::run_control(
+                            control_addr,
+                            n.connect_data.unwrap_or(0),
+                            crypto,
+                            cmd_rx,
+                            evt_tx,
+                        )
+                    });
+                    println!("  control channel: connecting to {control_addr} …");
+                    let watch = std::time::Duration::from_secs(8);
+                    let start = std::time::Instant::now();
+                    let mut heard = 0usize;
+                    while start.elapsed() < watch {
+                        match evt_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                            Ok(m) => {
+                                heard += 1;
+                                println!("    host: {m:?}");
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = cmd_tx.send(gsa_backend_moonlight::Command::Stop);
+                    match worker.join() {
+                        Ok(Ok(())) => {
+                            println!("  control channel closed cleanly ({heard} messages)")
+                        }
+                        Ok(Err(e)) => println!("  control channel error: {e}"),
+                        Err(_) => println!("  control thread panicked"),
+                    }
                 }
                 Err(e) => eprintln!("  rtsp failed: {e}"),
             }
