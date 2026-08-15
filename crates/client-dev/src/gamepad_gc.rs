@@ -32,6 +32,10 @@ const RAD_TO_DEG: f32 = 180.0 / std::f32::consts::PI;
 /// One G in m/s². The wire wants acceleration including gravity.
 const G_TO_MS2: f32 = 9.806_65;
 
+/// Polls to allow for the motion sensors to start reporting before treating
+/// silence as a fault. At the poll rate this is a fraction of a second.
+const MOTION_WAKE_POLLS: u32 = 60;
+
 /// Sticks below this fraction of travel read as centred, matching the
 /// portable path so the two feel the same.
 const STICK_DEADZONE: f32 = 0.05;
@@ -52,8 +56,10 @@ pub struct GcCapture {
     /// Last battery reading sent; charge moves slowly and would otherwise
     /// repeat every poll.
     last_battery: Option<(BatteryState, Option<u8>)>,
-    /// Whether the first motion sample has been reported, as a unit check.
+    /// Whether a real motion sample has been reported, as a unit check.
     logged_motion: bool,
+    /// Polls spent waiting for the sensors to produce anything.
+    motion_polls: u32,
 }
 
 impl std::fmt::Debug for GcCapture {
@@ -65,6 +71,17 @@ impl std::fmt::Debug for GcCapture {
 }
 
 impl GcCapture {
+    /// Whether the framework can see any controller at all.
+    ///
+    /// Cheap, and the basis for keeping the portable path quiet: while this is
+    /// true the platform path owns the pad, even in the instants before it has
+    /// finished opening it. A time window cannot do this job — a controller
+    /// plugged in mid-session arrives long after any startup grace period.
+    pub fn any_controller() -> bool {
+        // SAFETY: a class-method property read on the framework.
+        unsafe { GCController::controllers() }.count() > 0
+    }
+
     /// The first connected controller the framework reports, or `None`.
     pub fn new() -> Option<Self> {
         // SAFETY: every call here is a plain property read on a framework
@@ -72,18 +89,38 @@ impl GcCapture {
         // call and requires only that we are on the main thread, which the
         // caller guarantees by polling from the event loop.
         unsafe {
+            // Prefer the most capable pad rather than whichever the framework
+            // lists first — that order follows connection time, so with two
+            // controllers attached the harness would exercise whichever
+            // happened to be switched on first, which is never what is wanted
+            // when one of them has motion and a touch surface and the other
+            // does not.
             let controllers = GCController::controllers();
-            let controller = controllers.iter().next()?;
+            let controller = controllers
+                .iter()
+                .filter(|c| c.extendedGamepad().is_some())
+                .max_by_key(|c| {
+                    usize::from(c.motion().is_some())
+                        + usize::from(dualsense_touchpad(c).is_some())
+                        + usize::from(c.battery().is_some())
+                })?;
             let pad = controller.extendedGamepad()?;
 
             let motion = controller.motion();
             if let Some(motion) = &motion {
-                // Some pads report a flawless zero until the sensors are
-                // switched on, which is indistinguishable from a pad held
-                // perfectly still.
-                if motion.sensorsRequireManualActivation() {
-                    motion.setSensorsActive(true);
-                }
+                // Switch the sensors on unconditionally rather than only when
+                // the framework says activation is required: the flag reports
+                // whether the pad *needs* asking, not whether the sensors are
+                // already running, and an inactive sensor reports a flawless
+                // zero that looks exactly like a pad held perfectly still.
+                motion.setSensorsActive(true);
+                tracing::info!(
+                    requires_activation = motion.sensorsRequireManualActivation(),
+                    active = motion.sensorsActive(),
+                    has_rotation = motion.hasRotationRate(),
+                    has_gravity = motion.hasGravityAndUserAcceleration(),
+                    "motion sensors"
+                );
             }
             let touchpad = dualsense_touchpad(&controller);
 
@@ -120,6 +157,7 @@ impl GcCapture {
                 touching: false,
                 last_battery: None,
                 logged_motion: false,
+                motion_polls: 0,
             })
         }
     }
@@ -127,6 +165,27 @@ impl GcCapture {
     /// What to announce to the host before sending anything else.
     pub fn profile(&self) -> GamepadProfile {
         self.profile
+    }
+
+    /// How many controllers the framework can see, for reporting the ones
+    /// this harness ignores. They can arrive at any time, so this is checked
+    /// while running rather than once at startup.
+    pub fn controller_count() -> usize {
+        // SAFETY: a class-method property read on the framework.
+        unsafe { GCController::controllers() }.count()
+    }
+
+    /// Whether this controller is still attached.
+    ///
+    /// The framework hands out an object that stays valid after the pad goes
+    /// away; polling it keeps returning the last state, which reads as a
+    /// controller being held perfectly still. Presence has to be checked
+    /// against the framework's own list.
+    pub fn is_connected(&self) -> bool {
+        // SAFETY: a class-method property read on the framework.
+        unsafe { GCController::controllers() }
+            .iter()
+            .any(|c| std::ptr::eq(&*c, &*self.controller))
     }
 
     /// Everything that changed since the last poll.
@@ -152,16 +211,36 @@ impl GcCapture {
             if motion && let Some(m) = &self.motion {
                 let rate = m.rotationRate();
                 let accel = m.acceleration();
-                // The first sample is worth seeing: a pad lying still should
-                // read about 9.81 in total acceleration. Zero means the
-                // sensors never woke; ~1.0 means the G conversion was missed.
+                // Report the first sample that actually carries data, not the
+                // first sample full stop: sensors take a moment to spin up
+                // after being switched on, so an immediate reading is all
+                // zeros and says nothing. A pad lying still reads ~9.81 in
+                // total acceleration — zero means the sensors never woke,
+                // ~1.0 means the G conversion was missed.
                 if !self.logged_motion {
-                    self.logged_motion = true;
                     let (g, a) = to_wire_frame(
                         [rate.x as f32, rate.y as f32, rate.z as f32],
                         [accel.x as f32, accel.y as f32, accel.z as f32],
                     );
                     let magnitude = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+                    // Gravity is always present, so a live sensor can never
+                    // read zero for long.
+                    if magnitude > 1.0 {
+                        self.logged_motion = true;
+                    } else if self.motion_polls < MOTION_WAKE_POLLS {
+                        self.motion_polls += 1;
+                        // Still waking; say nothing yet.
+                        return events;
+                    } else {
+                        self.logged_motion = true;
+                        tracing::warn!(
+                            active = m.sensorsActive(),
+                            has_rotation = m.hasRotationRate(),
+                            "motion reads zero after {MOTION_WAKE_POLLS} polls: the sensors \
+                             never woke, so the host is being sent nothing useful"
+                        );
+                        return events;
+                    }
                     tracing::info!(
                         gyro_deg_s = format!("{:.1},{:.1},{:.1}", g[0], g[1], g[2]),
                         accel_ms2 = format!("{:.2},{:.2},{:.2}", a[0], a[1], a[2]),

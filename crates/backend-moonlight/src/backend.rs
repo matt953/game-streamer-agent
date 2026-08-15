@@ -119,10 +119,25 @@ impl InputSink for MoonlightInput {
     }
 
     fn announce_pad(&self, seat: u8, profile: gsa_client_backend_api::GamepadProfile) {
-        let Ok(encoder) = self.encoder.lock() else {
+        let Ok(mut encoder) = self.encoder.lock() else {
             return;
         };
         tracing::info!(seat, ?profile, "announcing controller to host");
+        // Unplug the seat first. The host plugs a *default* pad the moment any
+        // state arrives for a slot, and then ignores an arrival for a slot it
+        // already has — so a snapshot that beat this call (a pad connected
+        // mid-session, a second capture path) would otherwise leave the seat
+        // stuck as the wrong device for the rest of the session, with motion,
+        // touch and battery silently dropped. Clearing it first makes
+        // announcing idempotent and recoverable rather than order-dependent.
+        if let Some(clear) = encoder
+            .encode(&gsa_client_backend_api::InputEvent::GamepadDisconnect { seat, ts_us: 0 })
+        {
+            let _ = self.commands.send(Command::Input {
+                bytes: clear.bytes,
+                delivery: clear.delivery,
+            });
+        }
         let message = encoder.arrival_message(seat, profile);
         let _ = self.commands.send(Command::Input {
             bytes: message.bytes,

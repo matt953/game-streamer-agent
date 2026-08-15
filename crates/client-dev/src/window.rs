@@ -568,9 +568,9 @@ struct App {
     motion_hz: u16,
     /// Announce this family rather than the pad's own, for interop testing.
     pad_kind_override: Option<gsa_client_core::PadKind>,
-    /// How long to wait for the platform framework to find the controller
-    /// before falling back to the portable path. `None` once the window is up.
-    portable_pad_after: Option<std::time::Instant>,
+    /// Controllers reported as ignored, so the warning is said once per count
+    /// rather than every poll.
+    reported_extra_pads: usize,
     toast: Option<Toast>,
     /// Client-side view of the live encode bitrate (bps), stepped by the [ / ]
     /// dev keybinds to exercise the manual bitrate knob (spec 04 ABR actuator).
@@ -645,6 +645,39 @@ impl ApplicationHandler<AppEvent> for App {
         if self.platform_pad.is_none() && self.input.is_some() {
             self.platform_pad = crate::gamepad_gc::GcCapture::new();
         }
+        // A pad that has gone away must be reported: the host keeps its
+        // virtual controller plugged in until told otherwise, and a game then
+        // sees a pad frozen at its last state rather than a removal.
+        #[cfg(target_os = "macos")]
+        if let (Some(pad), Some(input)) = (&self.platform_pad, &self.input)
+            && !pad.is_connected()
+        {
+            tracing::info!("controller disconnected");
+            input.send(vec![gsa_client_core::InputEvent::GamepadDisconnect {
+                seat: 0,
+                ts_us: 0,
+            }]);
+            self.platform_pad = None;
+            // A reconnect is a new pad and must announce itself again.
+            self.pad_announced = false;
+            self.motion_hz = 0;
+        }
+        // A second controller can arrive at any time, so this is checked here
+        // rather than when the first was opened.
+        #[cfg(target_os = "macos")]
+        if self.platform_pad.is_some() {
+            let count = crate::gamepad_gc::GcCapture::controller_count();
+            if count > 1 && count != self.reported_extra_pads {
+                self.reported_extra_pads = count;
+                // One seat, one pad here. Real clients assign a seat per pad
+                // (spec 07); saying so beats a second controller silently
+                // doing nothing.
+                tracing::warn!(
+                    controllers = count,
+                    "more than one controller connected; this harness drives only the first"
+                );
+            }
+        }
         #[cfg(target_os = "macos")]
         if let (Some(pad), Some(input)) = (&mut self.platform_pad, &self.input) {
             if !self.pad_announced {
@@ -687,9 +720,20 @@ impl ApplicationHandler<AppEvent> for App {
                 false
             }
         };
-        let waiting_for_platform = self
-            .portable_pad_after
-            .is_some_and(|at| std::time::Instant::now() < at);
+        // While the platform framework can see a controller, the portable
+        // path must stay silent — even before the platform one has finished
+        // opening it. Whoever speaks first for a seat decides what the host
+        // builds, and a snapshot builds the wrong thing.
+        let waiting_for_platform = {
+            #[cfg(target_os = "macos")]
+            {
+                crate::gamepad_gc::GcCapture::any_controller()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
         if !platform_active
             && !waiting_for_platform
             && let (Some(gamepad), Some(input)) = (&mut self.gamepad, &self.input)
@@ -718,16 +762,6 @@ impl ApplicationHandler<AppEvent> for App {
                 self.motion_hz = rate_hz;
             }
             AppEvent::Ready(input, knobs, bitrate) => {
-                // The race starts here, not when the window opened: nothing
-                // can be sent before this. The platform framework needs a few
-                // run-loop turns to find the pad, and until it has, the
-                // portable path stays quiet — because **the first message a
-                // seat sends must be its arrival**. A state snapshot plugs a
-                // default pad for that slot, and the host then ignores the
-                // arrival that follows, losing motion, touch and battery for
-                // the whole session.
-                self.portable_pad_after =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                 self.input = Some(input);
                 self.knobs = knobs;
                 self.bitrate_bps = bitrate;
