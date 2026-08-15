@@ -1,17 +1,13 @@
 //! Audio receive: RTP depacketization into the shared Opus decoder.
 //!
-//! Audio shares the video socket (see [`crate::MediaSocket`]) and is told
-//! apart by its packet type. Unlike video there is no reference chain, so a
-//! lost packet costs one frame of sound rather than everything until the next
-//! keyframe — which is why a small gap is concealed and a large one simply
-//! resumes.
+//! Audio shares the video socket (see [`crate::MediaSocket`]) and is
+//! distinguished by packet type. There is no reference chain, so a lost packet
+//! costs one frame of sound: short gaps are concealed, long ones resume
+//! directly.
 //!
-//! Verified against a real host (2026-08-15): 798 packets decoded to 798 PCM
-//! frames with no gaps — 3.99 s of 48 kHz stereo, matching the packet count
-//! exactly — and the samples carry real programme material rather than
-//! silence. Audio only appears when the host's capture can actually hear
-//! something: an application holding the audio device exclusively makes the
-//! host send nothing at all, which is a host condition and not a client
+//! The stream is 48 kHz stereo, one Opus frame per packet. A host whose
+//! capture device is held exclusively by another application sends no audio
+//! packets at all; silence here can be a host condition rather than a client
 //! fault.
 
 use gsa_audio::OpusDecoder;
@@ -27,8 +23,9 @@ pub const AUDIO_DATA: u8 = 97;
 /// Packet type carrying Reed-Solomon parity for the audio stream.
 pub const AUDIO_PARITY: u8 = 127;
 
-/// Beyond this many consecutive lost packets a gap is a break in the stream,
-/// not a blip; synthesising more would invent sound that never existed.
+/// Maximum consecutive packets to conceal. Past this the gap is a break in the
+/// stream rather than a blip, and concealment would synthesise sound the host
+/// never sent.
 const MAX_CONCEAL: u16 = 5;
 
 /// Decodes the audio stream into interleaved PCM for the embedder to play.
@@ -47,7 +44,7 @@ impl std::fmt::Debug for AudioReceive {
 }
 
 impl AudioReceive {
-    /// Create the receiver and the PCM channel handed to the embedder.
+    /// Create the receiver and the PCM channel the embedder plays from.
     pub fn new() -> Result<(Self, Receiver<Vec<i16>>)> {
         let (out, rx) = channel();
         Ok((
@@ -71,10 +68,8 @@ impl AudioReceive {
         if datagram.len() <= HEADER_LEN {
             return;
         }
-        // Parity packets carry a different header and are only useful for
-        // rebuilding lost data packets. Recovering from them is not
-        // implemented, and guessing at it against a host that sends no audio
-        // would be untestable; concealment covers the same gaps audibly.
+        // Parity packets carry a different header and are not Opus. FEC
+        // recovery is not implemented; concealment covers the same gaps.
         if datagram[1] != AUDIO_DATA {
             return;
         }
@@ -82,7 +77,9 @@ impl AudioReceive {
         if let Some(last) = self.last_seq {
             let delta = seq.wrapping_sub(last);
             if delta == 0 || delta > u16::MAX / 2 {
-                return; // duplicate, or reordered so late it is useless
+                // Duplicate, or so far behind that the wrap-aware delta reads
+                // as backwards: replaying it would stutter the output.
+                return;
             }
             for _ in 0..(delta - 1).min(MAX_CONCEAL) {
                 if let Ok(pcm) = self.decoder.conceal() {

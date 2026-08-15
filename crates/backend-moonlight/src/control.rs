@@ -1,15 +1,15 @@
 //! The encrypted control channel (ENet over UDP).
 //!
-//! Every message is wrapped in an AES-GCM envelope keyed by the value we sent
-//! at launch. Two nonce constructions exist in the wild and they are not
-//! interchangeable, so which one to use is read from the host's SDP rather
-//! than assumed — see [`Crypto::new`].
+//! Every message is wrapped in an AES-GCM envelope keyed by the value sent at
+//! launch. Two nonce constructions exist and they are not interchangeable;
+//! which one applies is read from the host's SDP, not assumed — see
+//! [`Crypto::new`].
 
 use gsa_core::{Error, Result};
 
-/// Message types. Only the ones we actually send or act on are named; an
-/// unknown type is ignored rather than treated as an error, because hosts
-/// send controller features we have not wired up yet.
+/// Message types. Only the ones sent or acted on are named. An unknown type is
+/// ignored rather than treated as an error: hosts send controller features this
+/// client does not implement.
 pub mod msg {
     pub const ENCRYPTED: u16 = 0x0001;
     pub const START_A: u16 = 0x0305;
@@ -19,7 +19,7 @@ pub mod msg {
     pub const INPUT_DATA: u16 = 0x0206;
     pub const INVALIDATE_REF_FRAMES: u16 = 0x0301;
     pub const RUMBLE: u16 = 0x010b;
-    /// The specification and every implementation disagree here, so both are
+    /// Implementations disagree with the specification here; both values are
     /// accepted on receive.
     pub const TERMINATION: u16 = 0x0109;
     pub const TERMINATION_ALT: u16 = 0x0100;
@@ -28,10 +28,12 @@ pub mod msg {
 /// Which nonce layout the control channel uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
-    /// 16-byte IV whose first byte is the sequence number. Older hosts.
+    /// Older hosts. 16-byte IV, all zero except byte 0 = sequence & 0xff.
+    /// No direction tag, so both directions build the same IV.
     Legacy,
-    /// 12-byte IV: sequence little-endian, then a per-direction tag so the
-    /// two directions never share a nonce.
+    /// 12-byte IV: bytes 0..4 sequence little-endian, bytes 4..10 zero,
+    /// bytes 10..12 the direction tag — `CC` client-to-host, `HC`
+    /// host-to-client — so the two directions never share a nonce.
     V2,
 }
 
@@ -40,7 +42,8 @@ pub enum Scheme {
 pub struct Crypto {
     key: [u8; 16],
     scheme: Scheme,
-    /// Ours to choose and increment; the host tracks it as replay protection.
+    /// Chosen and incremented locally; the host tracks it for replay
+    /// protection.
     next_seq: u32,
 }
 
@@ -59,13 +62,13 @@ impl Crypto {
         }
     }
 
-    /// `from_host` selects the direction tag; the two directions must never
-    /// use the same nonce with the same key.
+    /// `from_host` selects the direction tag. Under V2 the two directions must
+    /// never produce the same nonce under the same key.
     fn nonce(&self, seq: u32, from_host: bool) -> Vec<u8> {
         match self.scheme {
             Scheme::Legacy => {
-                // Only the low byte of the sequence survives here, which is
-                // the scheme's own limitation, not ours.
+                // The scheme carries only the low byte of the sequence; the
+                // remaining 15 bytes stay zero.
                 let mut iv = vec![0u8; 16];
                 iv[0] = (seq & 0xff) as u8;
                 iv
@@ -97,7 +100,8 @@ impl Crypto {
             )
             .map_err(|_| Error::Session("control encryption failed".into()))?;
 
-        // type, length-of-everything-after-length, sequence, tag, ciphertext.
+        // Envelope, all little-endian: type u16, length u16 covering
+        // everything after itself, sequence u32, 16-byte tag, ciphertext.
         let mut out = Vec::with_capacity(24 + buffer.len());
         out.extend_from_slice(&msg::ENCRYPTED.to_le_bytes());
         out.extend_from_slice(&((4 + 16 + buffer.len()) as u16).to_le_bytes());
@@ -172,11 +176,10 @@ mod tests {
         let mut tx = Crypto::new([7u8; 16], true);
         let plaintext = message(msg::START_B, &[1, 0, 0]);
         let frame = tx.seal(&plaintext).unwrap();
-        // The receiving side derives its nonce from the frame, so opening
-        // with a fresh context must work — the host has no shared counter.
+        // The nonce is derived from the frame's own sequence field, so a fresh
+        // context opens it; there is no counter shared with the host.
         let rx = Crypto::new([7u8; 16], true);
-        // Our own frames carry the client direction tag, so decrypt with a
-        // context that expects the same direction.
+        // Locally sealed frames carry the client direction tag.
         let opened = open_as_client(&rx, &frame).unwrap();
         assert_eq!(opened, plaintext);
         assert_eq!(message_type(&opened), Some(msg::START_B));
@@ -221,8 +224,8 @@ mod tests {
         let b = c.seal(b"aaaaaaaa").unwrap();
         assert_eq!(u32::from_le_bytes([a[4], a[5], a[6], a[7]]), 0);
         assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 1);
-        // Same plaintext, different nonce, so the ciphertext must differ —
-        // otherwise the stream would leak repeats.
+        // Same plaintext under a different nonce must produce different
+        // ciphertext, or the stream leaks repeats.
         assert_ne!(a[24..], b[24..]);
     }
 
@@ -234,11 +237,10 @@ mod tests {
         assert_eq!(legacy.scheme_for_test(), Scheme::Legacy);
         assert_eq!(v2.nonce_for_test(1, false).len(), 12);
         assert_eq!(legacy.nonce_for_test(1, false).len(), 16);
-        // Direction must change the nonce under v2, or both directions would
+        // Under V2 the direction tag must change the nonce, or both directions
         // encrypt different data under the same key and counter.
         assert_ne!(v2.nonce_for_test(1, false), v2.nonce_for_test(1, true));
-        // Legacy has no direction tag; recorded so the difference is not a
-        // surprise if a host ever needs it.
+        // Legacy has no direction tag: both directions build the same IV.
         assert_eq!(
             legacy.nonce_for_test(1, false),
             legacy.nonce_for_test(1, true)

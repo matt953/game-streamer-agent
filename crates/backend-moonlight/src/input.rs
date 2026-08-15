@@ -1,16 +1,19 @@
-//! Turning our input events into the host's wire format.
+//! Encoding [`InputEvent`]s into the host's input wire format.
 //!
-//! Two things make this fiddlier than it looks. Endianness is **mixed** —
-//! the envelope's size field is big-endian, the type is little-endian, mouse
-//! and key bodies disagree with each other — so every field is written
-//! explicitly rather than by deriving a layout. And keyboards are described
-//! by Windows virtual-key codes here, while we carry HID usages internally,
-//! so keys are translated rather than passed through.
+//! The format is **mixed-endian** and no layout may be derived: the envelope
+//! is `u16` message type (LE), `u16` payload length (LE), `u32` data size
+//! (BE), `u32` input type (LE), then the body. Bodies disagree with each
+//! other too — mouse coordinates are big-endian, controller fields are
+//! little-endian — so every field is written explicitly.
 //!
-//! Gamepad state is a **snapshot**, not a stream of edges: each packet
-//! carries the full button/stick state *and* the set of pads that should
-//! remain plugged in. A packet with a stale set silently unplugs a
-//! controller, so the set is tracked here rather than left to callers.
+//! Keyboards are described by Windows virtual-key codes, with the high bit
+//! (0x8000) set on the code word. Internally we carry HID usages, so keys are
+//! translated, not passed through.
+//!
+//! Gamepad state is a snapshot, not a stream of edges: each packet carries the
+//! full button/stick state *and* the bitmask of pads that should remain
+//! plugged in. A packet with a stale mask unplugs a controller, so the mask is
+//! tracked here rather than left to callers.
 
 use crate::control::{message, msg};
 use gsa_protocol::input::{InputEvent, MouseButton, MouseMove, gamepad};
@@ -28,32 +31,29 @@ mod kind {
     pub const MOUSE_HSCROLL: u32 = 0x5500_0001;
 }
 
-/// Reference surface for absolute pointer positions.
-///
-/// The host scales whatever we send against the width and height we declare,
-/// so the units are ours to choose; the largest positive `i16` gives the
-/// finest resolution the field can carry.
+/// Reference surface width/height declared with every absolute position. The
+/// host scales the coordinates against it, so the units are ours to choose;
+/// `i16::MAX` is the finest resolution the field can carry.
 const ABS_REFERENCE: i16 = i16::MAX;
 
 /// Wheel units per detent, matching the desktop convention the host expects.
 const WHEEL_DETENT: f32 = 120.0;
 
-/// Constants the wire carries in every controller packet. Hosts do not read
-/// them; real clients send them, so we do too rather than discover which
-/// host one day starts checking.
+/// Fixed words every controller packet carries. Known hosts ignore them, but
+/// real clients send them, so we match the wire rather than rely on that.
 const PAD_HEADER: u16 = 0x001a;
 const PAD_MID: u16 = 0x0014;
 const PAD_TAIL_A: u16 = 0x009c;
 const PAD_TAIL_B: u16 = 0x0055;
 
-/// Encodes input events, carrying the small amount of state the wire format
-/// requires the client to remember.
+/// Encodes input events, holding the state the wire format requires the client
+/// to remember.
 #[derive(Debug, Default)]
 pub struct InputEncoder {
-    /// Modifier bits to stamp on every key event while they are held — the
-    /// host re-applies them per event rather than tracking them itself.
+    /// Modifier bits stamped on every key event while held: the host applies
+    /// them per event rather than tracking them itself.
     modifiers: u8,
-    /// Which controller slots should stay plugged in.
+    /// Bitmask of controller slots that should stay plugged in.
     active_pads: u16,
 }
 
@@ -63,16 +63,16 @@ impl InputEncoder {
         Self::default()
     }
 
-    /// Encode one event, or `None` for events this protocol has no place for.
+    /// Encode one event, or `None` if this protocol has no message for it.
     pub fn encode(&mut self, event: &InputEvent) -> Option<Vec<u8>> {
         match event {
             InputEvent::Key { usage, down, .. } => {
                 let vk = hid_usage_to_virtual_key(*usage)?;
                 self.track_modifier(*usage, *down);
                 let mut body = Vec::with_capacity(6);
-                // Flags: unused by hosts, and real clients send zero.
+                // Flags byte: hosts ignore it, real clients send zero.
                 body.push(0);
-                // Clients set the high bit; hosts mask it off again.
+                // Clients set the high bit on the key code; hosts mask it off.
                 body.extend_from_slice(&(0x8000u16 | u16::from(vk)).to_le_bytes());
                 body.push(self.modifiers);
                 body.extend_from_slice(&[0, 0]);
@@ -105,14 +105,14 @@ impl InputEncoder {
                 &[mouse_button(*button)],
             )),
             InputEvent::MouseWheel { dx, dy, .. } => {
-                // Vertical is the common case; a horizontal-only event uses
-                // the separate kind, so a diagonal scroll sends the vertical
-                // part and drops the rest rather than inventing two events.
+                // Vertical and horizontal are separate message kinds with no
+                // combined form, so a diagonal scroll sends only its vertical
+                // component.
                 if *dy != 0.0 {
                     let amount = clamp_i16(*dy * WHEEL_DETENT);
                     let mut body = Vec::with_capacity(6);
                     body.extend_from_slice(&amount.to_be_bytes());
-                    // Hosts ignore the second copy; real clients duplicate it.
+                    // The amount appears twice; hosts read only the first.
                     body.extend_from_slice(&amount.to_be_bytes());
                     body.extend_from_slice(&[0, 0]);
                     Some(input_message(kind::MOUSE_SCROLL, &body))
@@ -129,8 +129,8 @@ impl InputEncoder {
             }
             InputEvent::GamepadDisconnect { seat, .. } => {
                 self.active_pads &= !(1u16 << (seat & 0x0f));
-                // Removal is signalled by a normal state packet whose active
-                // set no longer includes this slot, so send a neutral one.
+                // There is no unplug message: removal is a normal state packet
+                // whose active mask no longer includes the slot.
                 let idle = gsa_protocol::input::GamepadInput {
                     seat: *seat,
                     buttons: 0,
@@ -139,8 +139,7 @@ impl InputEncoder {
                 };
                 Some(self.controller_message(&idle))
             }
-            // Touch, pen and motion have wire kinds we have not implemented;
-            // dropping them is better than sending a malformed packet.
+            // Touch, pen and motion have wire kinds that are not implemented.
             _ => None,
         }
     }
@@ -152,8 +151,8 @@ impl InputEncoder {
         body.extend_from_slice(&u16::from(pad.seat & 0x0f).to_le_bytes());
         body.extend_from_slice(&self.active_pads.to_le_bytes());
         body.extend_from_slice(&PAD_MID.to_le_bytes());
-        // Our low 16 button bits are XInput's, which is the same numbering
-        // this wire uses — so the mapping is an identity, not a table.
+        // Our low 16 button bits use XInput numbering, which is what this wire
+        // uses: the mapping is the identity, not a table.
         body.extend_from_slice(&((pad.buttons & 0xffff) as u16).to_le_bytes());
         body.push(trigger_to_u8(axis(gamepad::Axis::LeftTrigger)));
         body.push(trigger_to_u8(axis(gamepad::Axis::RightTrigger)));
@@ -166,15 +165,15 @@ impl InputEncoder {
             body.extend_from_slice(&axis(a).to_le_bytes());
         }
         body.extend_from_slice(&PAD_TAIL_A.to_le_bytes());
-        // The extended buttons (paddles, touchpad, misc) live here; our event
-        // model reserves its high bits, so they pass through unchanged.
+        // Extended buttons (paddles, touchpad, misc). Our event model reserves
+        // its high 16 bits for exactly these, so they pass through unchanged.
         body.extend_from_slice(&((pad.buttons >> 16) as u16).to_le_bytes());
         body.extend_from_slice(&PAD_TAIL_B.to_le_bytes());
         input_message(kind::CONTROLLER_MULTI, &body)
     }
 
-    /// Keep the modifier byte current. Hosts expect it stamped on every key
-    /// event while a modifier is held, not just when it changes.
+    /// Update the modifier byte. It is stamped on every key event while a
+    /// modifier is held, not only when it changes.
     fn track_modifier(&mut self, usage: u16, down: bool) {
         let bit = match usage {
             0xe0 | 0xe4 => 0x02, // control
@@ -193,9 +192,9 @@ impl InputEncoder {
 
 /// Wrap one input body in the control-message envelope.
 ///
-/// The size field counts the type word as well as the body, and is
-/// big-endian while the type beside it is little-endian — a quirk of the
-/// format, not a mistake here.
+/// `data_size` counts the input-type word as well as the body, and is
+/// big-endian while the input type beside it is little-endian. That mismatch
+/// is the wire format, not a bug here.
 fn input_message(input_type: u32, body: &[u8]) -> Vec<u8> {
     let data_size = (4 + body.len()) as u32;
     let mut payload = Vec::with_capacity(8 + body.len());
@@ -209,12 +208,13 @@ fn clamp_i16(v: f32) -> i16 {
     v.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
 }
 
-/// Map a 0..1 position onto the reference surface we declare to the host.
+/// Map a 0..1 position onto [`ABS_REFERENCE`].
 fn normalised_to_abs(v: f32) -> i16 {
     (v.clamp(0.0, 1.0) * f32::from(ABS_REFERENCE)) as i16
 }
 
-/// Triggers are unipolar `0..=i16::MAX` for us and a byte on the wire.
+/// Triggers are unipolar `0..=i16::MAX` internally and a single byte on the
+/// wire.
 fn trigger_to_u8(v: i16) -> u8 {
     (v.max(0) >> 7) as u8
 }
@@ -226,17 +226,17 @@ fn mouse_button(button: MouseButton) -> u8 {
         MouseButton::Right => 3,
         MouseButton::Back => 4,
         MouseButton::Forward => 5,
-        // The enum is non-exhaustive; an unknown button is better sent as a
-        // left-click than as a value the host will reject outright.
+        // The enum is non-exhaustive and the wire has no "other" code; an
+        // unknown button falls back to left rather than a rejected value.
         _ => 1,
     }
 }
 
 /// HID usage (page 0x07) to Windows virtual-key code.
 ///
-/// The host speaks virtual keys; we carry HID usages because they are what
-/// platforms hand us. Unmapped usages return `None` and are dropped rather
-/// than sent as some arbitrary key.
+/// The wire carries virtual keys; platforms hand us HID usages. Unmapped
+/// usages return `None` and the event is dropped — there is no safe default
+/// key to substitute.
 fn hid_usage_to_virtual_key(usage: u16) -> Option<u8> {
     let vk = match usage {
         0x04..=0x1d => 0x41 + (usage - 0x04) as u8, // a-z

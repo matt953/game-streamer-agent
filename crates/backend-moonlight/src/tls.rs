@@ -1,17 +1,19 @@
 //! Mutual TLS to a paired host.
 //!
-//! Both certificates here are self-signed, so ordinary web PKI has nothing to
-//! say about either of them. Instead we pin: the host is trusted if and only
-//! if it presents the exact certificate we received during pairing, and it
-//! trusts us because we present the certificate it stored then. That is a
-//! stronger guarantee than a CA chain — it names one specific machine.
+//! Both certificates are self-signed, so web PKI does not apply. Trust is by
+//! pinning: the host is accepted only if it presents byte-for-byte the
+//! certificate received during pairing, and it accepts us because we present
+//! the certificate it stored then. This authenticates one specific machine,
+//! not a chain — replacing it with chain validation would weaken it.
 
 use crate::http;
 use crate::identity::ClientIdentity;
 use gsa_core::{Error, Result};
 use std::sync::Arc;
 
-/// Accepts exactly one certificate: the one pairing gave us.
+/// Accepts exactly one certificate: an exact DER match against the one
+/// pairing stored. Intermediates, server name, OCSP and expiry are all
+/// deliberately ignored — pinning, not chain validation.
 #[derive(Debug)]
 struct PinnedHost {
     expected: Vec<u8>,
@@ -104,8 +106,8 @@ pub(crate) async fn get(
         .await
         .map_err(|e| Error::Transport(format!("connect {addr}: {e}")))?;
     let _ = tcp.set_nodelay(true);
-    // The certificate is pinned, so the name is only an SNI formality; hosts
-    // are reached by address and their certs carry no useful name anyway.
+    // The name is an SNI formality only: the pin does the authentication, and
+    // host certificates carry no usable name.
     let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
     let mut tls = connector
         .connect(server_name, tcp)

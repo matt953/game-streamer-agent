@@ -1,9 +1,9 @@
 //! Assembling a running session from the pieces.
 //!
-//! This is where the protocol stops. Everything below is Moonlight-specific —
-//! launch, RTSP, ENet, shards, FEC — and everything the caller receives is
-//! backend-neutral: complete access units stamped at true arrival, plus a way
-//! to ask for repairs. The shared client core takes it from there.
+//! The backend boundary. Everything below is Moonlight-specific — launch,
+//! RTSP, ENet, shards, FEC — and everything handed to the caller is
+//! backend-neutral: complete access units stamped at arrival, plus a sink for
+//! repair requests. The shared client core takes it from there.
 
 use crate::host::{LaunchedSession, PairedSession, StreamMode};
 use crate::{Command, Crypto, Depacketizer, MediaSocket, Received, Rtsp, StreamRequest};
@@ -12,24 +12,21 @@ use gsa_core::{Error, Result};
 
 /// Asks the host to repair the reference chain, via the control channel.
 ///
-/// **Always asks for a keyframe**, even though hosts advertise the cheaper
-/// reference-invalidation path. Invalidation needs the host to tell the
-/// client which frame is safe to resume from; this protocol has no such
-/// message, so the client stays frozen until a keyframe happens to arrive.
-/// Measured at 8% packet loss: invalidation decoded 65 of 393 frames, while
-/// asking for keyframes decoded 336 of 363. A cheaper repair that leaves the
-/// picture frozen is not cheaper.
+/// **Always asks for a keyframe**, even where the host advertises the cheaper
+/// reference-invalidation path. Invalidation requires the host to name the
+/// frame that is safe to resume from; this protocol has no such message, so
+/// the picture stays frozen until a keyframe happens to arrive. At 8% packet
+/// loss: invalidation decoded 65 of 393 frames, keyframe requests 336 of 363.
 ///
-/// (Our own protocol takes the cheap path safely because the agent announces
-/// a recovery point — the frame from which references are clean again.)
+/// The native protocol can take the cheap path because its agent announces a
+/// recovery point — the frame from which references are clean again.
 #[derive(Debug)]
 pub struct MoonlightRecovery {
     commands: std::sync::Mutex<std::sync::mpsc::Sender<Command>>,
     reference_invalidation: bool,
-    /// How many repairs were asked for each way. Worth counting separately:
-    /// invalidation is the cheap path, and if a host answers every one with a
-    /// full keyframe anyway then the distinction is costing us nothing and
-    /// buying us nothing.
+    /// Repair requests by kind. Counted separately because a host may answer
+    /// an invalidation with a full keyframe anyway, which makes the cheap
+    /// path no cheaper.
     invalidations: std::sync::Arc<std::sync::atomic::AtomicU64>,
     keyframes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -57,9 +54,9 @@ impl RecoverySink for MoonlightRecovery {
 
     fn request_recovery(&self, last_good_frame_id: u32) {
         let _ = last_good_frame_id;
-        // Deliberately the blunt instrument — see the type's documentation.
-        // The opt-in below exists to re-measure if a host ever gains a
-        // resume-point signal.
+        // A keyframe by default; see the type's documentation. The opt-in
+        // below exists to re-measure if a host ever gains a resume-point
+        // signal.
         if self.reference_invalidation {
             self.invalidations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -77,8 +74,8 @@ impl RecoverySink for MoonlightRecovery {
 
 /// Sends the embedder's input over the control channel.
 ///
-/// The encoder is stateful — it remembers held modifiers and which pads are
-/// plugged in — so it lives here rather than being rebuilt per event.
+/// The encoder is stateful — held modifiers, which pads are plugged in — so
+/// it is retained here rather than rebuilt per event.
 #[derive(Debug)]
 pub struct MoonlightInput {
     commands: std::sync::mpsc::Sender<Command>,
@@ -92,8 +89,8 @@ impl InputSink for MoonlightInput {
         };
         for event in &events {
             if let Some(message) = encoder.encode(event) {
-                // Fire-and-forget: a full queue means the session is going
-                // away, and blocking a UI thread on it would be worse.
+                // Fire-and-forget: a full queue means the session is ending,
+                // and this runs on the embedder's UI thread.
                 let _ = self.commands.send(Command::Input(message));
             }
         }
@@ -103,10 +100,10 @@ impl InputSink for MoonlightInput {
 /// A live Moonlight stream, reduced to the neutral pieces.
 #[derive(Debug)]
 pub struct MoonlightStream {
-    /// Complete access units, stamped when they truly arrived. Taken once,
-    /// through [`MoonlightStream::take_frames`], so that claiming the frames
-    /// cannot move the struct apart and drop the guard that keeps the
-    /// receive threads alive.
+    /// Complete access units, stamped at arrival. Claimed through
+    /// [`MoonlightStream::take_frames`] rather than by move, so taking the
+    /// frames cannot drop the worker guard that keeps the receive threads
+    /// alive.
     frames: Option<tokio::sync::mpsc::UnboundedReceiver<BackendFrame>>,
     pub recovery: std::sync::Arc<dyn RecoverySink>,
     /// The same object, typed, for reading the repair counters.
@@ -115,19 +112,18 @@ pub struct MoonlightStream {
     pub input: std::sync::Arc<dyn InputSink>,
     /// Frames the wire could not deliver whole, for the shared health stats.
     pub dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Frames rebuilt from parity — loss that cost nothing visible.
+    /// Frames rebuilt from parity: loss with no visible cost.
     pub recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Video datagrams seen. Used to tell "the host is streaming" from "the
-    /// handshake succeeded and nothing is coming", which look identical from
-    /// every other signal.
+    /// Video datagrams seen. The only signal that separates a streaming host
+    /// from one whose handshake succeeded and which sends nothing.
     datagrams: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Whether this started the app or rejoined one already running.
     pub origin: SessionOrigin,
     /// Decoded interleaved PCM, in the same shape every backend produces.
     pub audio: std::sync::mpsc::Receiver<Vec<i16>>,
-    /// What the host says over the control channel: rumble, termination, and
-    /// features we do not act on yet. Drain it — a caller that ignores this
-    /// still gets a stream, but loses the host's own account of what happened.
+    /// Host control-channel messages: rumble, termination, and features not
+    /// acted on yet. Must be drained; ignoring it leaves the stream running
+    /// but discards the host's own account of what happened.
     pub events: std::sync::mpsc::Receiver<crate::HostMessage>,
     /// Dropping this tears the session down.
     _worker: Worker,
@@ -151,8 +147,8 @@ impl MoonlightStream {
 
     /// Take the decoded PCM channel.
     ///
-    /// Replaced with a disconnected channel, so a second caller gets silence
-    /// rather than a panic or a stolen stream.
+    /// The field is replaced with a disconnected channel, so a second caller
+    /// gets silence rather than a panic or a stolen stream.
     pub fn audio_channel(&mut self) -> std::sync::mpsc::Receiver<Vec<i16>> {
         let (_, empty) = std::sync::mpsc::channel();
         std::mem::replace(&mut self.audio, empty)
@@ -191,20 +187,20 @@ pub async fn start(
     mode: StreamMode,
     bitrate_kbps: u32,
 ) -> Result<MoonlightStream> {
-    // How long a healthy host takes to start sending. Generous: a slow host
-    // starting an app is normal, a host that will never send is not.
+    // Upper bound on how long a healthy host takes to start sending; a slow
+    // app launch is normal.
     const FIRST_MEDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    // A host that just lost a client needs a moment before it will serve the
-    // next one, and how long varies; back off rather than hammering it.
+    // Seconds to wait before each attempt. A host that just lost a client
+    // needs a variable moment before it will serve the next one.
     const SETTLE: [u64; 3] = [0, 2, 4];
 
     for (attempt, settle) in SETTLE.iter().enumerate() {
         if *settle > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(*settle)).await;
         }
-        // Only the first attempt honours a session the host is already
-        // running. Once one has failed to deliver, rejoining it again just
-        // reproduces the failure — start something new instead.
+        // Only the first attempt rejoins a session the host is already
+        // running: a session that failed to deliver reproduces the failure on
+        // rejoin, so later attempts start a new one.
         let (launched, origin) = if attempt == 0 {
             begin(session, app_id, mode).await?
         } else {
@@ -230,9 +226,9 @@ pub async fn start(
 
 /// Start the app, or rejoin the one the host is already running.
 ///
-/// Asking the host what it is doing first is the whole point: launching over
-/// a session the host still holds gets a session that handshakes and never
-/// streams, and resuming when nothing is running has nothing to resume.
+/// The host's state must be read first: launching over a session the host
+/// still holds yields one that handshakes and never streams, and resuming
+/// with nothing running has nothing to resume.
 async fn begin(
     session: &PairedSession,
     app_id: u32,
@@ -308,9 +304,9 @@ async fn connect(
     let (audio_rx, audio_pcm) = crate::AudioReceive::new()?;
     let recovery = std::sync::Arc::new(MoonlightRecovery {
         commands: std::sync::Mutex::new(command_tx.clone()),
-        // Off unless explicitly asked for: it measurably makes loss worse
-        // on every host tested. The host's advertised capability is recorded
-        // in the negotiation, not acted on here.
+        // Off unless explicitly requested: it makes recovery from loss worse
+        // on every host measured. The host's advertised capability is
+        // recorded during negotiation, not acted on here.
         reference_invalidation: negotiated.reference_invalidation
             && std::env::var("GSA_MOONLIGHT_INVALIDATE").is_ok(),
         invalidations: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -321,12 +317,12 @@ async fn connect(
     let datagrams = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // One socket for every media stream. A host binds a stream to whichever
-    // address pinged its port, so a second socket sharing the session steals
-    // the first stream's binding: video then arrives on the audio socket and
-    // reads exactly like "the host sent nothing". With a single socket there
-    // is nothing to steal, and both ports still get the ping they need to
-    // keep the session alive.
+    // One socket for every media stream, and it must stay one. A host binds a
+    // stream to whichever address pinged its port, so a second socket in the
+    // same session takes the first stream's binding: video then arrives on
+    // the audio socket and is indistinguishable from a host sending nothing.
+    // Both ports are still pinged, from this single socket, because a stream
+    // the host cannot deliver tears the session down after ten seconds.
     let video_addr = std::net::SocketAddr::new(host_ip, negotiated.video_port);
     let media = MediaSocket::bind(video_addr, negotiated.ping_payload)?;
     let audio_port = negotiated.audio_port;
@@ -375,10 +371,10 @@ async fn connect(
 
 /// Deterministic packet-loss injection for chaos runs.
 ///
-/// Drops a share of received datagrams before anything looks at them, which
+/// Drops a share of received datagrams before anything inspects them, which
 /// exercises FEC recovery, the reference gate and the repair path against a
-/// real host without needing to degrade the network. Deterministic so a
-/// failure can be re-run; off unless `GSA_MOONLIGHT_LOSS` asks for it.
+/// real host without degrading the network. Deterministic so a failure can be
+/// re-run; off unless `GSA_MOONLIGHT_LOSS` is set.
 #[derive(Debug)]
 struct LossInjector {
     /// Drop probability in parts per thousand.
@@ -402,8 +398,8 @@ impl LossInjector {
 
     /// True when this datagram should be discarded.
     fn drops(&mut self) -> bool {
-        // xorshift: cheap, and repeatable from a fixed seed so a chaos run
-        // that finds a bug can be replayed exactly.
+        // xorshift from a fixed seed: cheap, and repeatable, so a chaos run
+        // that finds a bug replays exactly.
         self.state ^= self.state << 13;
         self.state ^= self.state >> 17;
         self.state ^= self.state << 5;
@@ -429,16 +425,11 @@ fn is_video(datagram: &[u8]) -> bool {
     datagram.len() > 1 && datagram[1] == 0
 }
 
-/// Read datagrams, reassemble, and publish frames at their arrival time.
-///
-/// Arrival is stamped here, on the receive side, and never on the way out:
-/// a frame stamped when it is released would make a paced present look like
-/// network delay to anything reasoning about the link.
 /// Counters the receive loop keeps for the shared health stats.
 struct Counters {
     /// Frames the wire could not deliver whole.
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Frames rebuilt from parity — loss that cost nothing visible.
+    /// Frames rebuilt from parity: loss with no visible cost.
     recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Any media datagram, used to tell streaming from silence.
     datagrams: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -450,6 +441,11 @@ impl Counters {
     }
 }
 
+/// Read datagrams, reassemble, and publish frames stamped with their arrival.
+///
+/// Arrival is stamped here on the receive side, never on release: a frame
+/// stamped when it is released would make paced presentation look like
+/// network delay to anything reasoning about the link.
 fn receive_media(
     mut media: MediaSocket,
     audio_port: u16,
@@ -467,9 +463,9 @@ fn receive_media(
 
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
         if last_ping.elapsed() >= PING_INTERVAL {
-            // Both ports, one socket. Skipping the audio port is not an
-            // option: a host with a media stream it cannot deliver tears the
-            // whole session down after ten seconds.
+            // Both ports, one socket. The audio port cannot be skipped: a
+            // host holding a media stream it cannot deliver tears the whole
+            // session down after ten seconds.
             if let Err(e) = media.ping().and_then(|()| media.ping_port(audio_port)) {
                 tracing::warn!(error = %e, "media ping failed");
                 return;
@@ -512,13 +508,13 @@ fn receive_media(
                         data: frame.data,
                         frame_id: frame.frame_index,
                         keyframe: frame.keyframe,
-                        // The host's own 90 kHz stream clock, in µs. Its
-                        // origin is unknown to us, so absolute latency from
-                        // it is meaningless — but the *gaps* between frames
-                        // are real host-side timing, which is exactly what a
-                        // de-jitter window measures. Stamping arrival here
-                        // instead would make every frame look perfectly
-                        // timed and the window would never engage.
+                        // The host's 90 kHz stream clock, in µs. Its origin
+                        // is unknown, so absolute latency from it is
+                        // meaningless; the *gaps* between frames are real
+                        // host-side timing, which is what the de-jitter
+                        // window measures. Stamping arrival here instead
+                        // would make every frame look perfectly timed and the
+                        // window would never engage.
                         capture_ts_us: stream_clock_us(frame.timestamp),
                         arrival_us,
                     };

@@ -5,10 +5,10 @@
 //! a per-protocol path for those, or it starts knowing which backend it is
 //! talking to, which is the thing the seam exists to prevent.
 //!
-//! Enrolment *is* per backend, and that is not a failure: pairing with a PIN
-//! typed on a PC, an OAuth round trip plus a console PIN, and a vendor token
-//! exchange are different flows with different inputs and different UI. What
-//! they share is their output — the opaque host blob the neutral calls take.
+//! Enrolment is per backend by design: a PIN typed on a PC, an OAuth round
+//! trip, and a vendor token exchange take different inputs and different UI.
+//! All they share is their output — the opaque host blob the neutral calls
+//! take.
 //!
 //! Two things the embedder must persist, both inside that blob:
 //!
@@ -172,9 +172,8 @@ pub(crate) fn run_session(
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(error = %e, "moonlight session failed to start");
-                // Pass the host's own words through: "Permission denied" is
-                // actionable, "could not connect" sends someone hunting the
-                // network for an hour.
+                // The host's own words: it knows causes we cannot infer, such
+                // as this device lacking permission.
                 let _ = ready_tx.send(crate::SessionReady::Failed(e.to_string()));
                 return;
             }
@@ -238,10 +237,9 @@ pub(crate) fn run_session(
                                     f.data.len(),
                                     f.keyframe,
                                     f.capture_ts_us,
-                                    // No glass-to-glass latency exists for this
-                                    // backend: the host's stamp is a stream
-                                    // clock. Zero reads as "unmeasured" here,
-                                    // and the HUD must show "—" rather than 0.
+                                    // Always 0 here: the host's stamp is a
+                                    // stream clock, so there is no absolute
+                                    // latency. 0 means unmeasured, not instant.
                                     f.latency_us.unwrap_or(0),
                                 );
                             }

@@ -1,57 +1,55 @@
 //! Driving the control channel's ENet connection.
 //!
-//! Hosts in this family run a fork of ENet, but the fork's changes are all
-//! local behaviour — timers, IPv6 addressing, a lower default MTU — and its
-//! wire structures are byte-identical to upstream, so a stock Rust ENet
-//! interoperates. The MTU is negotiated down to whatever the host proposes,
-//! so nothing here should assume 1392.
+//! Hosts run a fork of ENet whose changes are local behaviour only — timers,
+//! IPv6 addressing, a lower default MTU. Its wire structures are byte-identical
+//! to upstream, so a stock Rust ENet interoperates. The MTU is negotiated down
+//! to whatever the host proposes; do not assume 1392.
 //!
-//! ENet is a poll-driven library rather than an async one, so this runs on
-//! its own thread and talks to the rest of the client over channels.
+//! ENet is poll-driven rather than async, so this runs on its own thread and
+//! talks to the rest of the client over channels.
 
 use crate::control::{Crypto, message, message_type, msg};
 use gsa_core::{Error, Result};
 use rusty_enet as enet;
 
-/// How often to tell the host we are still here. Hosts drop a session after
-/// several seconds without one, and ENet's own keepalives do not count.
+/// Application-level keepalive period. Hosts drop a session after several
+/// seconds without one; ENet's own keepalives do not count.
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Poll interval. ENet needs servicing regularly to retransmit and to
 /// surface received packets.
 const SERVICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 
-/// Channel count to request. Reference clients open many and place some
-/// controller streams on the higher ones.
+/// Channel count to request. Reference clients open this many and place some
+/// controller streams on the higher channels.
 const CHANNELS: usize = 48;
 
 /// Something the host told us over the control channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostMessage {
-    /// The control channel is up and the host accepted our session binding.
-    /// Reported rather than inferred: everything else depends on it, and a
-    /// silent failure to connect looks exactly like a quiet host.
+    /// The control channel is up and the host accepted the session binding.
+    /// Reported explicitly: a failure to connect is otherwise indistinguishable
+    /// from a host that has nothing to say.
     Connected,
-    /// The host said the session is over, with its own reason code.
+    /// The host ended the session and supplied a reason code.
     Terminated { reason: u32 },
-    /// The ENet peer went away without the host saying why — a timeout or a
-    /// reset. Distinct from `Terminated` because the causes and the fixes are
-    /// completely different.
+    /// The ENet peer went away without a reason — a timeout or a reset.
+    /// Distinct from `Terminated`, which carries a host reason code.
     Disconnected,
     Rumble {
         controller: u16,
         low_frequency: u16,
         high_frequency: u16,
     },
-    /// Anything we do not act on yet, kept so callers can log it rather than
-    /// silently discarding host behaviour we have not implemented.
+    /// A message type not acted on here, surfaced so callers can log it rather
+    /// than discard it silently.
     Other { kind: u16 },
 }
 
 impl HostMessage {
-    /// The backend-neutral form, for embedders that should not care which
-    /// protocol produced it. `None` for messages that carry no meaning
-    /// outside this backend (connection lifecycle, unimplemented features).
+    /// The backend-neutral form, for embedders that do not know which protocol
+    /// produced it. `None` for messages with no meaning outside this backend
+    /// (connection lifecycle, unimplemented features).
     #[must_use]
     pub fn neutral(&self) -> Option<gsa_client_backend_api::BackendEvent> {
         match *self {
@@ -60,8 +58,8 @@ impl HostMessage {
                 low_frequency,
                 high_frequency,
             } => Some(gsa_client_backend_api::BackendEvent::Rumble {
-                // Controller numbers are u16 on this wire and a seat index
-                // everywhere else; pads past 255 do not exist.
+                // Controller numbers are u16 on this wire and a u8 seat index
+                // everywhere else; there is no seat above 255.
                 seat: controller.min(u16::from(u8::MAX)) as u8,
                 low: low_frequency,
                 high: high_frequency,
@@ -74,10 +72,10 @@ impl HostMessage {
 /// What the caller can ask the control channel to send.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// Ask for a fresh keyframe — the blunt recovery instrument.
+    /// Request a fresh keyframe. Full-cost recovery.
     RequestIdr,
-    /// Ask the host to invalidate references in a frame range instead, which
-    /// costs far less bitrate on a link that is already struggling.
+    /// Invalidate references over a frame range instead; far cheaper in
+    /// bitrate than a keyframe on a constrained link.
     InvalidateReferenceFrames {
         first: u32,
         last: u32,
@@ -109,8 +107,8 @@ pub fn run(
     )
     .map_err(|e| Error::Transport(format!("create control host: {e}")))?;
 
-    // The connect data binds this ENet peer to our RTSP session, so the host
-    // does not have to identify us by source address.
+    // The connect data binds this ENet peer to the RTSP session; the host does
+    // not identify the peer by source address.
     host.connect(addr, CHANNELS, connect_data)
         .map_err(|_| Error::Transport("no ENet peer slot".into()))?;
 
@@ -145,9 +143,8 @@ pub fn run(
                                 }
                             }
                         }
-                        // A frame we cannot authenticate is not fatal on its
-                        // own — log it and keep the session rather than
-                        // dropping a working stream over one bad packet.
+                        // A frame that fails authentication is not fatal; one
+                        // bad packet must not end a working session.
                         Err(e) => tracing::debug!(error = %e, "control frame dropped"),
                     }
                 }
@@ -155,8 +152,8 @@ pub fn run(
         }
 
         if connected && !started {
-            // These two are what actually make a host begin sending media;
-            // pinging the media ports alone leaves some hosts silent.
+            // Media does not start until both of these are sent; pinging the
+            // media ports alone leaves some hosts silent.
             send(&mut host, &mut crypto, &message(msg::START_A, &[]))?;
             send(&mut host, &mut crypto, &message(msg::START_B, &[1, 0, 0]))?;
             started = true;
@@ -219,8 +216,8 @@ fn send<S: enet::Socket>(
     for peer in host.connected_peers_mut() {
         match peer.send(0, &packet) {
             Ok(()) => sent = true,
-            // Silently dropping these would turn a dead control channel into
-            // a mystery: the session simply stops responding.
+            // Logged, not dropped: a dead control channel is otherwise
+            // indistinguishable from an idle one.
             Err(e) => tracing::warn!(error = ?e, "control send failed"),
         }
     }
@@ -235,8 +232,8 @@ fn interpret(plaintext: &[u8]) -> Option<HostMessage> {
     let kind = message_type(plaintext)?;
     let payload = plaintext.get(4..).unwrap_or(&[]);
     if crate::control::is_termination(kind) {
-        // The reason is big-endian here even though the envelope around it
-        // is little-endian.
+        // The reason code is big-endian even though the envelope around it is
+        // little-endian.
         let reason = payload
             .get(..4)
             .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
@@ -259,8 +256,7 @@ mod tests {
 
     #[test]
     fn reads_a_termination_reason_as_big_endian() {
-        // 0x80030023 is the graceful-exit code; parsing it little-endian
-        // would report a nonsense reason to the user.
+        // 0x80030023 is the graceful-exit code; the field is big-endian.
         let m = message(msg::TERMINATION, &0x8003_0023u32.to_be_bytes());
         assert_eq!(
             interpret(&m),
@@ -297,8 +293,7 @@ mod tests {
 
     #[test]
     fn unknown_messages_are_surfaced_not_swallowed() {
-        // Hosts send controller features we have not wired up; reporting the
-        // type keeps them visible instead of silently dropped.
+        // Unimplemented types are reported by kind rather than dropped.
         assert_eq!(
             interpret(&message(0x5502, &[0; 6])),
             Some(HostMessage::Other { kind: 0x5502 })

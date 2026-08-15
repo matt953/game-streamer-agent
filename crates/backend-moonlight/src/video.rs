@@ -2,19 +2,19 @@
 //!
 //! A frame is split into fixed-size shards, grouped into one or more FEC
 //! blocks, and each block carries Reed-Solomon parity so a block survives
-//! losing some of its shards. Everything needed to place a shard —  which
-//! frame, which block, which position, and whether it is data or parity — is
-//! in its header, so the stream can be treated as unordered.
+//! losing some of its shards. Everything needed to place a shard — which
+//! frame, which block, which position, data or parity — is in its header, so
+//! the stream can be treated as unordered.
 //!
-//! Two details are easy to get wrong and are load-bearing here:
+//! Two load-bearing details:
 //!
 //! - **Parity covers only the payload columns.** The sender overwrites parts
 //!   of a parity shard's header *after* computing parity, so those byte
-//!   columns are not recoverable. Recovery therefore runs over the payload
-//!   region alone, which is also cheaper.
+//!   columns are not recoverable. Recovery runs over the payload region
+//!   alone.
 //! - **The parity count is not transmitted.** It is re-derived from the FEC
-//!   percentage, and a shard index beyond that derivation is treated as
-//!   evidence the derivation was low rather than as a bad packet.
+//!   percentage, and a shard index beyond that derivation means the
+//!   derivation was low, not that the packet is bad.
 
 use gsa_core::{Error, Result};
 
@@ -38,8 +38,8 @@ const REORDER_DEPTH: u32 = 4;
 pub struct ShardHeader {
     pub sequence: u16,
     /// Host-side stream clock, 90 kHz. Its absolute value has no fixed
-    /// relation to our clock, but differences between frames are real
-    /// host-side timing — which is what a de-jitter window needs.
+    /// relation to the local clock; differences between frames are real
+    /// host-side timing, which is what a de-jitter window needs.
     pub timestamp: u32,
     pub frame_index: u32,
     pub flags: u8,
@@ -90,9 +90,9 @@ pub fn parse_header(datagram: &[u8]) -> Option<ShardHeader> {
 /// How many parity shards a block has.
 ///
 /// The wire carries the percentage, not the count, so this re-derives the
-/// sender's arithmetic. `observed_max_index` lets a shard we actually
-/// received correct an under-estimate — trusting the formula over the
-/// evidence would drop recoverable blocks.
+/// sender's arithmetic. `observed_max_index` raises the result when a
+/// received shard sits past it; trusting the formula over a shard actually
+/// held would drop recoverable blocks.
 fn parity_shards(data_shards: usize, percentage: u8, observed_max_index: usize) -> usize {
     let from_percentage = data_shards
         .saturating_mul(usize::from(percentage))
@@ -114,8 +114,8 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
     /// The host's own encode-latency estimate, in µs, when it reported one.
     pub host_latency_us: Option<u32>,
-    /// Some of this frame was rebuilt from parity — loss that cost nothing
-    /// visible. Worth counting separately from loss that did.
+    /// Some of this frame was rebuilt from parity: loss with no visible cost,
+    /// counted separately from loss that killed a frame.
     pub recovered: bool,
     /// The host's 90 kHz stream clock for this frame, if any shard carried
     /// one. Relative timing only — see [`ShardHeader::timestamp`].
@@ -166,8 +166,8 @@ impl Block {
         let observed_max = self.shards.keys().copied().max().unwrap_or(0) as usize;
         let parity = parity_shards(self.data_shards, self.fec_percentage, observed_max);
         let total = self.data_shards + parity;
-        // Every present shard must be the same length for recovery to work;
-        // a host that stops padding would otherwise corrupt silently.
+        // Recovery requires every present shard to be the same length; a host
+        // that stops padding would otherwise corrupt silently.
         let width = self
             .shards
             .values()
@@ -264,9 +264,8 @@ impl Depacketizer {
         if let Some(finished) = self.try_finish(header.frame_index) {
             self.events.push_back(finished);
         }
-        // Independently of that, anything left far behind the newest frame
-        // will never complete — a stream that keeps finishing frames must
-        // still report the ones it abandoned.
+        // Frames left far behind the newest will never complete, and must
+        // still be reported rather than silently abandoned.
         self.expire();
     }
 
@@ -338,8 +337,8 @@ impl Depacketizer {
 /// Strip the per-frame prefix and drop the sender's padding.
 ///
 /// Shards are a fixed width, so the last one is zero-padded; the header says
-/// how much of it is real. Without that trim the decoder would be handed
-/// trailing zeroes as if they were part of the access unit.
+/// how much of it is real. Untrimmed, those trailing zeroes reach the decoder
+/// as part of the access unit.
 fn parse_frame(
     frame_index: u32,
     payload: &[u8],
@@ -360,9 +359,9 @@ fn parse_frame(
         .saturating_sub(1)
         .saturating_mul(shard_width)
         .saturating_add(last_payload_len);
-    // Fall back to everything we assembled if the header's length is absent
-    // or implausible — truncating to a wrong value would corrupt the frame
-    // more surely than a little trailing padding.
+    // Fall back to the whole assembly when the header's length is absent or
+    // implausible: truncating to a wrong value corrupts the frame, whereas
+    // trailing padding does not.
     let end = if (FRAME_HEADER_LEN..=payload.len()).contains(&real_len) {
         real_len
     } else {
@@ -396,8 +395,8 @@ mod tests {
         datagram.extend_from_slice(&[0u8; 16]);
         let h = parse_header(&datagram).unwrap();
         assert_eq!(h.sequence, 0);
-        // Captured value: the host does stamp a real stream clock, unlike
-        // some implementations which send zeros.
+        // This host stamps a real stream clock; some implementations send
+        // zeros here.
         assert_eq!(h.timestamp, 0xa71c);
         assert_eq!(h.frame_index, 1);
         assert_eq!(h.shard_index, 0);
@@ -432,9 +431,8 @@ mod tests {
         assert_eq!(parity_shards(11, 20, 0), 3);
         // Small frames still get the negotiated minimum.
         assert_eq!(parity_shards(2, 20, 0), 2);
-        // A shard we actually received outranks the formula: dropping a
-        // recoverable block because our arithmetic was low would be worse
-        // than trusting the evidence.
+        // A received shard index outranks the formula, so a low derivation
+        // does not drop a recoverable block.
         assert_eq!(parity_shards(11, 20, 14), 4);
     }
 

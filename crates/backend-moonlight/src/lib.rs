@@ -3,11 +3,11 @@
 //!
 //! # Provenance (read before editing)
 //!
-//! This is a **clean-room** implementation. The reference
-//! clients for this protocol (moonlight-common-c and the moonlight-* apps)
-//! are GPL-3.0
+//! Clean-room implementation. The reference clients for this protocol
+//! (moonlight-common-c and the moonlight-* apps) are GPL-3.0 and must not be
+//! opened or copied from.
 //!
-//! Permitted references, all consulted rather than copied:
+//! Permitted references, consulted rather than copied:
 //!
 //! - Wolf's protocol documentation (MIT) — <https://games-on-whales.github.io/wolf/stable/protocols/>
 //! - `moonshine` (BSD-2-Clause), a Rust implementation of the *server* side
@@ -43,8 +43,7 @@ pub use rtsp::{Negotiated, Rtsp, StreamRequest};
 pub use video::{Depacketizer, FrameLoss, Received, ShardHeader, VideoFrame, parse_header};
 
 /// The client certificate in the hex-encoded-PEM form the `/pair` endpoint
-/// expects. Exposed for reproducing a handshake step by hand when a host
-/// disagrees with us about the wire format.
+/// expects. Public so a pairing step can be reproduced by hand against a host.
 #[must_use]
 pub fn cert_pem_hex(identity: &ClientIdentity) -> String {
     hex::encode(identity.cert_pem().as_bytes())
@@ -52,17 +51,17 @@ pub fn cert_pem_hex(identity: &ClientIdentity) -> String {
 
 use gsa_core::{Error, Result};
 
-/// What an unpaired host tells us about itself.
+/// What a host reports over the cleartext `/serverinfo` endpoint.
 ///
-/// Hosts withhold detail from unauthenticated callers — the dev host reports
-/// `MaxLumaPixelsHEVC` as 0 and a minimal codec bitfield until the caller
-/// presents a paired client certificate. Treat everything here as a probe
-/// result, and re-read capabilities over mutual TLS before believing them.
+/// Hosts withhold capability detail from unauthenticated callers:
+/// `MaxLumaPixelsHEVC` reads 0 and the codec bitfield is minimal until the
+/// caller presents a paired client certificate. Re-read capabilities over
+/// mutual TLS before relying on them.
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     pub hostname: String,
-    /// Host application version. The pairing hash generation is keyed to
-    /// this, so it is load-bearing rather than cosmetic.
+    /// Host application version. Selects the pairing hash generation, so it is
+    /// load-bearing rather than cosmetic.
     pub app_version: String,
     /// The host's own identifier, stable across restarts.
     pub unique_id: String,
@@ -72,18 +71,18 @@ pub struct ServerInfo {
     pub paired: bool,
     /// Free, or already streaming to someone.
     pub state: String,
-    /// Codec capability bitfield, meaningless until paired (see above).
+    /// Codec capability bitfield, unreliable until paired (see above).
     pub codec_mode_support: u32,
     /// App id the host is currently running, 0 when idle.
     pub current_game: u32,
 }
 
-/// Ask a host to describe itself over the cleartext port. This is the only
-/// exchange that works before pairing, which makes it the reachability check:
-/// if this fails the host is off, firewalled, or not a Moonlight host at all.
+/// Ask a host to describe itself over the cleartext port. The only exchange
+/// that works before pairing, and therefore also the reachability check: a
+/// failure means the host is off, firewalled, or not a Moonlight host.
 ///
-/// `client_id` identifies us to the host and must stay stable across calls —
-/// it is the identity the host will pair with.
+/// `client_id` must stay stable across calls — it is the identity the host
+/// pairs with.
 pub async fn probe(addr: std::net::SocketAddr, client_id: &str) -> Result<ServerInfo> {
     let body = http::get(addr, &format!("/serverinfo?uniqueid={client_id}")).await?;
     parse_server_info(&body)
@@ -100,8 +99,8 @@ pub(crate) fn parse_server_info(body: &[u8]) -> Result<ServerInfo> {
             .and_then(|n| n.text())
             .map(str::to_owned)
     };
-    // A host that answers but omits its identity is not one we can pair with;
-    // fail loudly here rather than carrying empty strings into the handshake.
+    // Hostname and uniqueid are required: the pairing handshake keys off them,
+    // so an empty string here would fail later and less clearly.
     let hostname =
         field("hostname").ok_or_else(|| Error::Session("serverinfo has no hostname".into()))?;
     let unique_id =

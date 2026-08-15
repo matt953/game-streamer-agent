@@ -17,8 +17,8 @@ pub struct PairedSession {
 impl PairedSession {
     /// Bind a stored pairing to a live address.
     ///
-    /// `tls_addr` is the host's TLS port — read it from [`ServerInfo`] rather
-    /// than assuming the default, since hosts can be moved off it.
+    /// `tls_addr` is the host's TLS port. Read it from [`ServerInfo`]; hosts
+    /// can be moved off the default.
     #[must_use]
     pub fn new(
         tls_addr: std::net::SocketAddr,
@@ -34,8 +34,8 @@ impl PairedSession {
         }
     }
 
-    /// The host's own description of itself, authenticated this time — this
-    /// is the copy whose capability fields can be believed.
+    /// The host's description of itself, over mutual TLS. Only this copy's
+    /// capability fields are authenticated; the unpaired one is not.
     pub async fn server_info(&self) -> Result<ServerInfo> {
         let body = self
             .get(&format!("/serverinfo?uniqueid={}", self.client_id))
@@ -45,8 +45,8 @@ impl PairedSession {
 
     /// What this host can launch.
     ///
-    /// The app list carries no "currently running" flag, so the running app
-    /// is resolved from the host's own status instead of being guessed.
+    /// The app list carries no "currently running" flag; the running app id
+    /// comes from `/serverinfo` instead.
     pub async fn catalog(&self) -> Result<Vec<CatalogEntry>> {
         let running = self.server_info().await?.current_game;
         let body = self
@@ -58,10 +58,9 @@ impl PairedSession {
     /// Ask the host to start streaming `app_id`, and get back the session's
     /// RTSP address plus the key the control channel will be encrypted with.
     ///
-    /// `sops` lets the host change the desktop's resolution to match what we
-    /// asked for. Defaulted off here: silently reconfiguring someone's
-    /// monitor is a surprising thing for a client to do, and Apollo can be
-    /// told to override the mode host-side anyway.
+    /// `sops` permits the host to change its desktop resolution to match the
+    /// requested mode. Off by default: it reconfigures a monitor someone may
+    /// be sitting at, and Apollo can override the mode host-side instead.
     pub async fn launch(&self, app_id: u32, mode: StreamMode) -> Result<LaunchedSession> {
         let (riaes_key, riaes_key_id) = new_stream_key();
         let body = self
@@ -88,12 +87,11 @@ impl PairedSession {
         })
     }
 
-    /// Rejoin the session the host is already holding for us.
+    /// Rejoin the session the host is already holding for this certificate.
     ///
-    /// This is the call real clients make when the host still has a session
-    /// for their certificate — it re-keys the streams and restarts delivery.
-    /// Launching again instead silently inherits the old session, which
-    /// handshakes perfectly and never sends a frame.
+    /// Required whenever the host reports an existing session: `/resume`
+    /// re-keys the streams and restarts delivery, while `/launch` inherits the
+    /// old session, which handshakes successfully but never sends a frame.
     pub async fn resume(&self, mode: StreamMode) -> Result<LaunchedSession> {
         let (riaes_key, riaes_key_id) = new_stream_key();
         let body = self
@@ -144,8 +142,8 @@ impl PairedSession {
 
 /// A fresh stream key and its id.
 ///
-/// The id doubles as a key epoch: hosts re-derive their ciphers when it
-/// changes, which is what makes a resume actually restart the streams.
+/// The id is also the key epoch: hosts re-derive their ciphers when it
+/// changes, which is what makes a resume restart the streams.
 fn new_stream_key() -> ([u8; 16], i32) {
     let key = crate::pair::random_16();
     let id_bytes = crate::pair::random_16();
@@ -167,9 +165,9 @@ pub struct StreamMode {
     pub channels: u8,
     /// Leave the host's own speakers working while we stream.
     ///
-    /// Hosts silence themselves by default so a stream does not play twice in
-    /// one room. That is the wrong default for a machine somebody else is
-    /// sitting at: it takes their audio away without asking.
+    /// Hosts mute themselves by default so a stream does not play twice in one
+    /// room. On by default here: muting a machine someone else is using takes
+    /// their audio away without asking.
     pub keep_host_audio: bool,
 }
 
@@ -211,7 +209,8 @@ pub struct LaunchedSession {
     pub riaes_key_id: i32,
 }
 
-/// One element's text from a host reply, erroring with the body when absent.
+/// One element's text from a host reply; a missing element errors with the
+/// body quoted.
 fn xml_field(body: &[u8], name: &str) -> Result<String> {
     let text = std::str::from_utf8(body).map_err(|_| Error::Session("non-UTF-8 reply".into()))?;
     let doc = roxmltree::Document::parse(text)
@@ -221,8 +220,8 @@ fn xml_field(body: &[u8], name: &str) -> Result<String> {
         let message = root
             .attribute("status_message")
             .unwrap_or("no reason given");
-        // Apollo grants only view/list rights to clients past the first, so a
-        // refusal here is usually permissions rather than a protocol fault.
+        // Apollo grants only view/list rights to clients after the first, so
+        // a refusal here is usually permissions, not a protocol fault.
         return Err(Error::Session(format!(
             "host refused: {message} (if this is a permission error, grant this \
              client launch rights host-side)"
@@ -237,10 +236,9 @@ fn xml_field(body: &[u8], name: &str) -> Result<String> {
 
 /// Classify an entry from its title.
 ///
-/// The wire carries no notion of what an app *is*, so this is a presentation
-/// hint rather than a fact: it exists so a unified library can group a host's
-/// desktop and its game launcher sensibly. Anything unrecognised stays a
-/// plain game, which is the harmless default.
+/// The wire carries no app kind, so this is a presentation hint for grouping
+/// in a unified library, not a fact. Unrecognised titles fall back to
+/// [`CatalogKind::Game`].
 fn classify(title: &str) -> CatalogKind {
     if title.eq_ignore_ascii_case("desktop") {
         CatalogKind::Desktop
@@ -267,8 +265,8 @@ fn parse_catalog(body: &[u8], running_id: u32) -> Result<Vec<CatalogEntry>> {
                 .and_then(|n| n.text())
                 .map(str::trim)
         };
-        // Hosts add their own elements here (Apollo carries a UUID and an
-        // ordering index); unknown children are ignored rather than fatal.
+        // Hosts add their own elements (Apollo carries a UUID and an ordering
+        // index); unknown children are ignored, not fatal.
         let (Some(title), Some(id)) = (text_of("AppTitle"), text_of("ID")) else {
             continue;
         };
@@ -313,8 +311,8 @@ mod tests {
 
     #[test]
     fn zero_means_nothing_is_running() {
-        // The host reports 0 when idle; treating that as an app id would
-        // light up any entry that happened to have id 0.
+        // The host reports 0 when idle; treated as an app id it would mark
+        // any entry with id 0 as running.
         assert!(
             parse_catalog(APPLIST, 0)
                 .unwrap()
@@ -334,8 +332,8 @@ mod tests {
             ..StreamMode::default()
         };
         assert_eq!(five_one.surround_audio_info(), (0x3f << 16) | 6);
-        // A host must never be told we have fewer speakers than stereo; the
-        // audio path has no mono mode to fall back to.
+        // The count floors at 2: the audio path has no mono mode, so a host
+        // told otherwise has nothing valid to encode.
         let broken = StreamMode {
             channels: 0,
             ..StreamMode::default()

@@ -3,12 +3,11 @@
 //! Both sides derive an AES key from a PIN that never crosses the wire, then
 //! prove to each other that they hold it. Each side mixes its own certificate
 //! signature into the hash it sends, so a man in the middle who swapped
-//! certificates cannot produce a matching hash even if it learned the PIN.
+//! certificates cannot produce a matching hash even with the PIN.
 //!
-//! The client verifies the host's proof *before* sending its own secret
-//! (see [`verify_host`]); skipping that is what let a tampered host collect
-//! credentials, and it is the difference between detecting a wrong PIN here
-//! and letting the host detect it a round trip later.
+//! Ordering is load-bearing: the host's proof is verified (see [`verify_host`])
+//! *before* the client's secret goes out. Sending first would hand credentials
+//! to a host that has proven nothing.
 
 use crate::identity::{self, ClientIdentity};
 use crate::{hex, http};
@@ -29,9 +28,8 @@ pub struct PairedHost {
 
 /// A PIN for the operator to type into the host.
 ///
-/// Four digits is what host UIs expect. The entropy is low, which is exactly
-/// why the value is never sent: it only ever exists as an input to the key
-/// derivation on both sides.
+/// Four digits, as host UIs expect. The entropy is low; the value is never
+/// transmitted, only used as an input to the key derivation on both sides.
 #[must_use]
 pub fn random_pin() -> String {
     let mut bytes = [0u8; 4];
@@ -47,9 +45,9 @@ pub(crate) fn random_16() -> [u8; 16] {
 
 /// `SHA256(salt || pin)`, truncated to an AES-128 key.
 ///
-/// The salt is the raw random bytes, not their hex text, and the PIN is its
-/// ASCII digits rather than a parsed number — both sides must agree exactly
-/// or every subsequent ciphertext is noise.
+/// The salt is hashed as raw bytes, not as its hex text, and the PIN as its
+/// ASCII digits, not as a parsed number. Both sides must agree exactly or
+/// every subsequent ciphertext is noise.
 fn pin_key(salt: &[u8; 16], pin: &str) -> [u8; 16] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(salt);
@@ -85,14 +83,14 @@ fn aes_ecb(key: &[u8; 16], data: &[u8], encrypt: bool) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// One field out of a host's XML reply, with the body quoted on failure so a
-/// surprise is diagnosable instead of just absent.
+/// One field out of a host's XML reply. Failures quote the body so an
+/// unexpected reply stays diagnosable.
 fn field(body: &[u8], name: &str) -> Result<String> {
     let text = std::str::from_utf8(body).map_err(|_| Error::Session("non-UTF-8 reply".into()))?;
-    // A bare XML declaration with no root is how hosts answer a pairing
-    // request they will not even begin — most often because pairing is
-    // switched off host-side, or the host expects its own PIN to be issued
-    // first. Say that, rather than reporting a parse error.
+    // Host quirk: a bare XML declaration with no root element is how a host
+    // answers a pairing request it will not begin at all — pairing disabled
+    // host-side, or a pairing already pending. Report that rather than a
+    // parse error.
     let doc = roxmltree::Document::parse(text).map_err(|e| {
         if text.trim_start().starts_with("<?xml") && !text.contains("<root") {
             Error::Session(
@@ -106,7 +104,7 @@ fn field(body: &[u8], name: &str) -> Result<String> {
     })?;
     let root = doc.root_element();
     // Hosts disagree on whether a rejection is an HTTP error or a 200 with a
-    // failure body, so the body is the authority.
+    // failure body; the body is the authority.
     if root.attribute("status_code").is_some_and(|c| c != "200") {
         let message = root
             .attribute("status_message")
@@ -130,8 +128,8 @@ fn field(body: &[u8], name: &str) -> Result<String> {
         .ok_or_else(|| Error::Session(format!("pairing reply has no <{name}>: {text}")))
 }
 
-/// Percent-encode a value for a query string, keeping only the characters
-/// that are unambiguous everywhere.
+/// Percent-encode a value for a query string, passing through only the
+/// unreserved set.
 fn query_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -147,13 +145,13 @@ fn query_escape(value: &str) -> String {
 
 /// Run the handshake against a host.
 ///
-/// `device_name` is how we introduce ourselves, and it is **required**: a host
-/// that gets no name answers the first request with an empty document instead
-/// of opening a pairing session, so the PIN never gets a chance to matter.
+/// `device_name` is **required**. Without a `devicename` query parameter the
+/// host discards the phase 1 request and returns an empty document; pairing
+/// never starts and nothing on the wire says why.
 ///
 /// `pin` must be shown to the operator to enter host-side. The first request
 /// **blocks until they do**, so this call can legitimately take minutes;
-/// callers should let the user cancel rather than impose a short timeout.
+/// callers should offer cancellation rather than a short timeout.
 pub async fn pair(
     addr: std::net::SocketAddr,
     client_id: &str,
@@ -226,8 +224,8 @@ pub async fn pair(
         host_hash,
     )?;
 
-    // Phase 4: hand over our secret, signed, now that the host has proven
-    // itself. Only on accepting this does the host remember us.
+    // Phase 4: hand over our secret, signed, only now that the host has
+    // proven itself. Accepting this is what makes the host persist the pairing.
     let mut proof = client_secret.to_vec();
     proof.extend_from_slice(&identity.sign(&client_secret));
     let body = http::get(
@@ -238,7 +236,7 @@ pub async fn pair(
         ),
     )
     .await?;
-    // `paired` is the whole answer here; `field` already fails on a rejection.
+    // `paired` carries the whole answer; `field` already errors on rejection.
     let _ = field(&body, "paired")?;
 
     Ok(PairedHost {
@@ -247,12 +245,13 @@ pub async fn pair(
     })
 }
 
-/// Check the host's half of the proof before trusting it with our secret.
+/// Check the host's half of the proof. Must run before the client secret is
+/// sent.
 ///
-/// Two independent things must hold: the host signed its secret with the key
-/// in the certificate it gave us (so the certificate is really its own), and
-/// the hash it sent earlier commits to that same certificate and secret (so
-/// nobody swapped certificates in the middle).
+/// Two independent conditions: the host signed its secret with the key in the
+/// certificate it gave us (the certificate is its own), and the hash it sent
+/// in phase 2 commits to that same certificate and secret (no certificate was
+/// swapped in the middle).
 fn verify_host(
     pairing_secret: &[u8],
     host_cert_pem: &str,
@@ -301,13 +300,12 @@ mod tests {
     #[test]
     fn key_derivation_is_pinned_to_exact_inputs() {
         let salt = [0u8; 16];
-        // The PIN is hashed as text; a digit change must change the key, and
-        // a wrong salt must too, or pairing would succeed against anything.
+        // Both the PIN digits and the salt must reach the hash; if either
+        // dropped out, pairing would succeed against any PIN.
         assert_ne!(pin_key(&salt, "1234"), pin_key(&salt, "1235"));
         assert_ne!(pin_key(&salt, "1234"), pin_key(&[1u8; 16], "1234"));
-        // Known answer computed independently (Python hashlib) for
-        // SHA-256("\0"*16 || "1234")[..16]: the host derives this same key
-        // from the PIN the operator types, so a drift here is unpairable.
+        // Independently computed known answer for SHA-256("\0"*16 ||
+        // "1234")[..16]. The host derives the same key, so drift is unpairable.
         assert_eq!(
             crate::hex::encode(&pin_key(&salt, "1234")),
             "E4AE0C82639990744974CC3495A82432"
@@ -326,8 +324,8 @@ mod tests {
 
     #[test]
     fn ecb_refuses_partial_blocks() {
-        // Padding is never used on this wire, so a ragged length means we
-        // built the payload wrong — fail rather than silently truncate.
+        // This wire never pads, so a ragged length means the payload was
+        // built wrong. Fail rather than truncate.
         assert!(aes_ecb(&[0u8; 16], &[0u8; 20], true).is_err());
         assert!(aes_ecb(&[0u8; 16], &[], true).is_err());
     }

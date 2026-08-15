@@ -1,11 +1,10 @@
 //! Everything that happens to a frame *after* it is whole (spec 16).
 //!
-//! This is the half of the client that is not protocol-specific: hold early
-//! frames to a jitter target, keep the reference chain honest, and measure
-//! what actually reached the glass. A backend delivers complete access units
-//! with true arrival stamps and a way to ask for repairs; the rest is here,
-//! shared, so a second protocol inherits the field tuning instead of
-//! reinventing it.
+//! The protocol-independent half of the client: hold early frames to a jitter
+//! target, keep the reference chain honest, and measure what reached the
+//! glass. A backend supplies complete access units with true arrival stamps
+//! and a [`RecoverySink`]; everything downstream of that is here and shared by
+//! every backend.
 
 use gsa_client_backend_api::{BackendFrame, CaptureClock, RecoverySink};
 use gsa_core::Result;
@@ -19,11 +18,10 @@ use crate::{EncodedFrame, FrameOutput, PresentedSink, stats};
 pub struct StreamSession {
     clock: MediaClock,
     clock_sync: ClockSync,
-    /// What the backend's capture stamps actually mean. When they are a
-    /// stream clock rather than a synchronised capture instant, *differences*
-    /// are real but the absolute value is not — so de-jitter still works and
-    /// glass-to-glass latency is reported as unmeasured rather than as a
-    /// number that looks precise and is wrong.
+    /// What the backend's capture stamps mean. Under
+    /// [`CaptureClock::StreamPts`] only *differences* are real, so de-jitter
+    /// still works but glass-to-glass latency does not exist and is reported
+    /// as unmeasured rather than as a plausible wrong number.
     capture_clock: CaptureClock,
     /// Complete frames from the backend, stamped at true arrival.
     frames_rx: tokio::sync::mpsc::UnboundedReceiver<BackendFrame>,
@@ -38,8 +36,9 @@ pub struct StreamSession {
     recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Frame id of the last frame handed on (gap detection).
     last_frame_id: Option<u32>,
-    /// Last frame actually DELIVERED: a repair request must cite a frame the
-    /// decoder truly has, and frames skipped while frozen were never decoded.
+    /// Last frame actually delivered. A repair request must cite a frame the
+    /// decoder holds, and frames skipped while frozen were never decoded, so
+    /// this trails `last_frame_id` during a freeze.
     last_delivered_id: Option<u32>,
     last_keyframe_request_us: u64,
     /// True while the reference chain is broken; predicted frames are skipped
@@ -86,8 +85,8 @@ impl StreamSession {
         )
     }
 
-    /// As [`StreamSession::new`], for backends whose stamps are a stream
-    /// clock rather than a synchronised capture instant.
+    /// As [`StreamSession::new`], with an explicit [`CaptureClock`] for
+    /// backends whose stamps are a stream clock.
     #[must_use]
     pub fn with_capture_clock(
         frames_rx: tokio::sync::mpsc::UnboundedReceiver<BackendFrame>,
@@ -114,8 +113,8 @@ impl StreamSession {
             last_frame_id: None,
             last_delivered_id: None,
             last_keyframe_request_us: 0,
-            // Until the first keyframe the decoder has no reference; skip any
-            // predicted frames that arrive ahead of it.
+            // Before the first keyframe the decoder has no reference, so
+            // predicted frames arriving ahead of it must be skipped.
             awaiting_idr: true,
             recovery_point: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decode_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -149,14 +148,15 @@ impl StreamSession {
         self.last_jitter_us
     }
 
-    /// Whether glass-to-glass latency means anything for this backend.
+    /// Whether glass-to-glass latency exists for this backend. False under
+    /// [`CaptureClock::StreamPts`]; a HUD must then show "—", not 0.
     #[must_use]
     pub fn latency_is_absolute(&self) -> bool {
         self.capture_clock == CaptureClock::HostSynced
     }
 
-    /// Latency against the capture stamp, or `None` when the stamp is a
-    /// stream clock and the answer would be a fiction.
+    /// Latency against the capture stamp, or `None` when the stamp is a stream
+    /// clock and no absolute answer exists.
     fn absolute_latency_us(&self, now_us: u64, capture_ts_us: u32) -> Option<u32> {
         self.latency_is_absolute()
             .then(|| self.clock_sync.frame_latency_us(now_us, capture_ts_us))
@@ -169,7 +169,7 @@ impl StreamSession {
         self.dejitter.clone()
     }
 
-    /// Shared flag the embedder sets when its decoder rejects a frame; the
+    /// Shared flag the embedder sets when its decoder rejects a frame. The
     /// gate treats it as a reference break and requests repair.
     #[must_use]
     pub fn decode_error_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
@@ -184,16 +184,17 @@ impl StreamSession {
         }
     }
 
-    /// Direct form of [`PresentedSink::presented`] for harnesses that own the
-    /// session.
+    /// Direct form of [`PresentedSink::presented`], for callers that own the
+    /// session rather than a sink handle.
     pub fn frame_presented(&mut self, capture_ts_us: u32) {
         let now = self.clock.now_us();
         let latency = self.absolute_latency_us(now, capture_ts_us);
         self.present.on_presented(latency, capture_ts_us, now);
     }
 
-    /// Fold queued presentation reports (stamped on the display thread) into
-    /// the health stats.
+    /// Fold queued presentation reports into the health stats. They are
+    /// stamped on the display thread, so each is aged back to its own instant
+    /// rather than counted as having happened now.
     fn drain_presented(&mut self) {
         while let Ok((capture_ts, at)) = self.presented_rx.try_recv() {
             let now = self
@@ -227,7 +228,7 @@ impl StreamSession {
         };
         let now = self.clock.now_us();
         let latency_us = self.absolute_latency_us(now, gated.capture_ts_us);
-        // Decode happens app-side; record it as zero in the stats window.
+        // Decode happens app-side and is unmeasurable here: record 0.
         self.stats.on_frame_decoded(latency_us, 0);
         Ok(Some(EncodedFrame {
             data: gated.data,
@@ -267,8 +268,8 @@ impl StreamSession {
                     // (parameter sets / buffering).
                 }
                 Err(e) => {
-                    // Undecodable (loss-damaged) frame: never fatal. Freeze
-                    // and ask for a healing keyframe.
+                    // An undecodable (loss-damaged) frame is never fatal:
+                    // freeze and ask for a repair, then keep receiving.
                     tracing::debug!(error = %e, "decode error; freezing until keyframe");
                     self.awaiting_idr = true;
                     self.request_keyframe_throttled();
@@ -290,14 +291,15 @@ impl StreamSession {
         }
     }
 
-    /// Reference-chain gate for one released frame (spec 04): on a break,
-    /// hold the last good picture and skip predicted frames until a keyframe
-    /// resyncs — decoding against a stale reference corrupts the output.
+    /// Reference-chain gate for one frame (spec 04). On a break, hold the last
+    /// good picture and skip predicted frames until a keyframe or a
+    /// host-announced recovery point resyncs: decoding against a stale
+    /// reference corrupts the output.
     async fn gate(&mut self, f: BackendFrame, backlog: bool) -> Result<Option<BackendFrame>> {
         let arrival_us = f.arrival_us;
         self.stats.on_frame_complete(f.data.len(), arrival_us);
-        // A decoder-rejected frame breaks the chain even though delivery
-        // looked clean: freeze and request repair like any gap.
+        // A decoder-rejected frame breaks the chain even when delivery looked
+        // clean, so it is handled exactly like a gap.
         if self
             .decode_error
             .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -314,8 +316,8 @@ impl StreamSession {
         if let Some(last) = self.last_frame_id {
             let delta = f.frame_id.wrapping_sub(last);
             if delta == 0 || delta > u32::MAX / 2 {
-                // Backends release in order, so this should be unreachable;
-                // if it fires, ordering is broken upstream.
+                // Backends are required to release in order, so this means
+                // ordering is broken upstream.
                 tracing::warn!(last, got = f.frame_id, "OUT-OF-ORDER frame gated");
             } else if delta != 1 && !is_idr && !self.awaiting_idr {
                 tracing::debug!(gap_after = last, got = f.frame_id, "frame gap; freezing");
@@ -324,8 +326,8 @@ impl StreamSession {
             }
         }
 
-        // Frozen: a host-announced recovery point resumes decoding without a
-        // keyframe — frames from it on reference nothing we are missing.
+        // Frozen. A host-announced recovery point resumes decoding without a
+        // keyframe: frames from it on reference nothing that is missing.
         if self.awaiting_idr && !is_idr {
             let rp = self
                 .recovery_point
@@ -337,16 +339,16 @@ impl StreamSession {
             if safe {
                 self.awaiting_idr = false;
             } else {
-                // Skip predicted frames (a broken reference is the
-                // corruption); advance the id so the gap isn't re-flagged.
+                // Skip the predicted frame, but advance the id so the next
+                // one is not re-flagged as a fresh gap.
                 self.last_frame_id = Some(f.frame_id);
                 self.request_keyframe_throttled();
                 return Ok(None);
             }
         }
 
-        // The frame is consumed regardless of what the caller does with it;
-        // advance so the next frame isn't misread as another gap.
+        // The frame counts as consumed whatever the caller does with it;
+        // advance so the next one is not misread as a gap.
         self.last_frame_id = Some(f.frame_id);
         self.last_delivered_id = Some(f.frame_id);
         self.dejitter_release(f.capture_ts_us, arrival_us, backlog)
@@ -354,9 +356,9 @@ impl StreamSession {
         Ok(Some(f))
     }
 
-    /// Request a healing keyframe, rate-limited so a burst of gaps or errors
-    /// doesn't spam the host. Throttling lives here, not in the backend, so
-    /// every protocol inherits it.
+    /// Request a repair, rate-limited so a burst of gaps or decode errors does
+    /// not spam the host. Throttling lives here rather than in the backend, so
+    /// every protocol gets it.
     fn request_keyframe_throttled(&mut self) {
         const MIN_INTERVAL_US: u64 = 250_000;
         let now = self.clock.now_us();
@@ -364,8 +366,8 @@ impl StreamSession {
             return;
         }
         self.last_keyframe_request_us = now;
-        // With a known-good frame the host can clean references instead of
-        // resetting the world with an IDR (spec 04 rung 2).
+        // With a known-good frame the host can invalidate references instead
+        // of sending a full IDR (spec 04 rung 2).
         match self.last_delivered_id {
             Some(last_good) => self.recovery.request_recovery(last_good),
             None => self.recovery.request_keyframe(),
@@ -373,20 +375,23 @@ impl StreamSession {
     }
 
     /// Absorb delay variance by holding early frames to a capture-anchored
-    /// latency target — the window's p90 — so the spread is spent waiting,
-    /// not stuttering. Anchoring to capture time (never to the previous
-    /// release) makes drift structurally impossible: the release rate equals
-    /// the capture rate. Late frames never wait, a backlog is drained
-    /// unpaced, and a clean link pays nothing.
+    /// latency target (the window's p90), so the spread is spent waiting
+    /// rather than stuttering.
+    ///
+    /// The target must be anchored to capture time and never to the previous
+    /// release: an anchor on the previous release compounds its own error and
+    /// drifts, while a capture anchor forces the release rate to equal the
+    /// capture rate. Late frames never wait, a backlog drains unpaced, and a
+    /// clean link waits not at all.
     async fn dejitter_release(&mut self, capture_ts_us: u32, arrival_us: u64, backlog: bool) {
         const WIN: usize = 32;
         const JITTER_ON_US: u32 = 12_000;
-        /// Hysteresis: a link hovering at the engage threshold must not flap
-        /// the mode (and its log line) every few frames.
+        /// Disengage threshold, deliberately below `JITTER_ON_US`: the
+        /// hysteresis stops a link hovering at the engage point from flapping.
         const JITTER_OFF_US: u32 = 8_000;
         const DEJITTER_MAX_US: u32 = 33_000;
-        /// Startup transient (clock sync settling, burst catch-up) must not
-        /// read as jitter.
+        /// Startup transients (clock sync settling, burst catch-up) must not
+        /// be read as jitter.
         const WARMUP_US: u64 = 2_000_000;
         let now = self.clock.now_us();
         self.first_gate_us.get_or_insert(now);
@@ -404,9 +409,8 @@ impl StreamSession {
         let (p10, p90) = (lat[lat.len() / 10], lat[lat.len() * 9 / 10]);
         let jitter = p90 - p10;
         self.last_jitter_us = jitter;
-        // Pacing is only sound at the queue head with nothing waiting:
-        // holding a frame while more are already queued builds a standing
-        // backlog that can never drain — the opposite of smoothing.
+        // Pacing is only sound with nothing else queued: holding a frame while
+        // others wait builds a standing backlog that never drains.
         if backlog || !self.dejitter.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }

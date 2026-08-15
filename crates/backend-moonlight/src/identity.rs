@@ -2,10 +2,10 @@
 //!
 //! A host remembers a paired client by its certificate, so this key and
 //! certificate must be generated **once** and persisted for the life of the
-//! install: regenerating them silently un-pairs every host, and on Apollo it
-//! also loses the per-client settings and permissions the operator granted.
+//! install. Regenerating them un-pairs every host, and on Apollo also discards
+//! the per-client settings and permissions the operator granted.
 //!
-//! RSA-2048 with a SHA-256 self-signature is not a free choice — hosts verify
+//! RSA-2048 with a SHA-256 self-signature is fixed, not a choice: hosts verify
 //! the pairing signature as PKCS#1 v1.5 over an RSA key, so an ECDSA or
 //! Ed25519 identity cannot pair at all.
 
@@ -20,14 +20,15 @@ const KEY_BITS: usize = 2048;
 pub struct ClientIdentity {
     key_pem: String,
     cert_pem: String,
-    /// The certificate's outer `signatureValue` bytes — an input to the
-    /// pairing hashes, so it is extracted once here rather than re-parsed.
+    /// The certificate's outer `signatureValue` bytes, an input to the pairing
+    /// hashes. Extracted once here rather than re-parsed per use.
     signature: Vec<u8>,
     signing_key: rsa::pkcs1v15::SigningKey<sha2::Sha256>,
 }
 
 impl std::fmt::Debug for ClientIdentity {
-    /// Never render the private key, even by accident.
+    /// Must never render the private key: this type is a field of derived
+    /// `Debug` types such as `PairedSession`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientIdentity")
             .field("cert_signature_len", &self.signature.len())
@@ -49,7 +50,7 @@ impl ClientIdentity {
     }
 
     /// Rebuild an identity from a stored private key, re-deriving the
-    /// certificate. Deterministic given the key, so a stored key alone is
+    /// certificate. Deterministic in the key, so storing the key alone is
     /// enough to stay paired.
     pub fn from_key_pem(key_pem: &str) -> Result<Self> {
         let key = rsa::RsaPrivateKey::from_pkcs8_pem(key_pem)
@@ -58,9 +59,9 @@ impl ClientIdentity {
             .map_err(|e| Error::Session(format!("load key for certificate: {e}")))?;
 
         let mut params = rcgen::CertificateParams::default();
-        // Hosts authenticate by certificate fingerprint and do not check
-        // names, chains, or expiry — but a long validity keeps us honest with
-        // anything stricter that might sit in the path later.
+        // Hosts authenticate by certificate fingerprint and check neither
+        // names, chains, nor expiry. The wide validity window is for stricter
+        // middleboxes that might sit in the path.
         params.not_before = rcgen::date_time_ymd(2020, 1, 1);
         params.not_after = rcgen::date_time_ymd(2060, 1, 1);
         params.distinguished_name = {
@@ -81,7 +82,8 @@ impl ClientIdentity {
         })
     }
 
-    /// PEM private key — persist this, and guard it like a password.
+    /// PEM private key. Persist it; it is the whole identity, so store it
+    /// with the protection a password gets.
     #[must_use]
     pub fn key_pem(&self) -> &str {
         &self.key_pem
@@ -104,8 +106,8 @@ impl ClientIdentity {
     }
 }
 
-/// Pull the outer `signatureValue` out of a DER certificate — the signature
-/// itself, without the algorithm identifier that precedes it.
+/// The outer `signatureValue` of a DER certificate: the signature bytes only,
+/// without the algorithm identifier that precedes them.
 pub(crate) fn cert_signature(der: &[u8]) -> Result<Vec<u8>> {
     let (_, parsed) = x509_parser::parse_x509_certificate(der)
         .map_err(|e| Error::Session(format!("parse certificate: {e}")))?;
@@ -134,7 +136,7 @@ pub(crate) fn cert_signature_from_pem(pem: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::ClientIdentity;
 
-    /// Generating a key is slow, so one identity serves the whole module.
+    /// RSA key generation is slow; keep the number of calls to this low.
     fn identity() -> ClientIdentity {
         ClientIdentity::generate().expect("generate identity")
     }
@@ -144,15 +146,15 @@ mod tests {
         let id = identity();
         assert!(id.cert_pem().starts_with("-----BEGIN CERTIFICATE-----"));
         assert!(id.key_pem().contains("PRIVATE KEY"));
-        // RSA-2048 signs 256-byte values; hosts reject anything shorter.
+        // RSA-2048 signatures are 256 bytes; hosts reject any other length.
         assert_eq!(id.cert_signature().len(), 256);
         assert_eq!(id.sign(b"anything").len(), 256);
     }
 
     #[test]
     fn a_stored_key_reproduces_the_same_identity() {
-        // The host remembers us by certificate, so a restart that reloads the
-        // key must not present a different one.
+        // The host remembers us by certificate, so a reload of the same key
+        // must present the same certificate.
         let first = identity();
         let second = ClientIdentity::from_key_pem(first.key_pem()).unwrap();
         assert_eq!(first.cert_pem(), second.cert_pem());

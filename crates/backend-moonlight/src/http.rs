@@ -1,22 +1,20 @@
 //! Minimal HTTP/1.1 for the Moonlight control endpoints.
 //!
-//! Deliberately hand-rolled rather than pulling a general HTTP client in: the
-//! surface is a handful of GETs returning small XML bodies, the paired path
-//! needs a custom certificate verifier anyway (self-signed certs pinned at
-//! pairing, the same shape `gsa-transport` already solves), and this crate is
-//! embedded in a mobile app where dependency weight is a real cost.
+//! Hand-rolled rather than a general HTTP client: the surface is a handful of
+//! GETs returning small XML bodies, the paired path needs a custom certificate
+//! verifier regardless (certificates pinned at pairing), and this crate is
+//! embedded in a mobile app where dependency weight costs.
 //!
 //! Hosts answer with `Content-Length` and close the connection, so there is no
-//! chunked decoding or connection reuse here. Anything richer is a sign the
-//! host is not what we think it is, and is reported as an error rather than
-//! guessed at.
+//! chunked decoding and no connection reuse. Anything richer is reported as an
+//! error rather than framed on a guess.
 
 use gsa_core::{Error, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Cap on a control response. The largest legitimate body is an app list;
-/// megabytes of it means something is wrong, and an unbounded read from an
-/// unauthenticated port is a denial-of-service waiting to happen.
+/// Cap on a control response. The largest legitimate body is an app list, so
+/// this is far above normal; the bound exists because the cleartext path reads
+/// from an unauthenticated port.
 const MAX_BODY: usize = 4 * 1024 * 1024;
 
 /// One cleartext `GET` against the host's HTTP port.
@@ -26,15 +24,15 @@ pub(crate) async fn get(addr: std::net::SocketAddr, path_and_query: &str) -> Res
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .map_err(|e| Error::Transport(format!("connect {addr}: {e}")))?;
-    // Nagle would sit on this request waiting for more to send.
+    // Nagle would delay this single small request waiting for more to send.
     let _ = stream.set_nodelay(true);
     exchange(&mut stream, addr, path_and_query).await
 }
 
 /// Send raw bytes on a fresh connection and read until the peer closes.
 ///
-/// For protocols that delimit a response by connection close rather than by
-/// a content length — which is how these hosts answer RTSP.
+/// For responses delimited by connection close rather than a content length,
+/// which is how these hosts answer RTSP.
 pub(crate) async fn request_raw(addr: std::net::SocketAddr, request: &[u8]) -> Result<Vec<u8>> {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -63,7 +61,7 @@ pub(crate) async fn request_raw(addr: std::net::SocketAddr, request: &[u8]) -> R
 }
 
 /// Send one `GET` and read the whole response off an already-connected
-/// stream, so the plain and TLS paths share their framing.
+/// stream; the plain and TLS paths share this framing.
 pub(crate) async fn exchange<S>(
     stream: &mut S,
     host: std::net::SocketAddr,
@@ -97,8 +95,13 @@ where
     parse_response(&raw)
 }
 
-/// Split a raw HTTP/1.1 response into its status and body, rejecting anything
-/// that is not a plain `Content-Length`-framed 200.
+/// Split a raw HTTP/1.1 response into status and body, rejecting anything that
+/// is not a plain `Content-Length`-framed 200.
+///
+/// The body is everything after the header terminator, which is correct only
+/// because the connection is read to close and no transfer encoding is in
+/// play. A `Transfer-Encoding` header is therefore an error, not something to
+/// decode: accepting it would hand chunk framing to the caller as body bytes.
 fn parse_response(raw: &[u8]) -> Result<Vec<u8>> {
     let split = raw
         .windows(4)
@@ -146,8 +149,8 @@ mod tests {
 
     #[test]
     fn rejects_non_200() {
-        // The host answers 404 for endpoints that need pairing; surfacing it
-        // as an error is what turns "empty app list" into "not paired yet".
+        // Hosts answer 404 for endpoints that require pairing. Surfacing the
+        // status distinguishes "not paired yet" from an empty app list.
         let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         assert!(parse_response(raw).is_err());
     }

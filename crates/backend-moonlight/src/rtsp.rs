@@ -1,11 +1,10 @@
 //! RTSP negotiation (TCP :48010).
 //!
-//! Text RTSP/1.0, with three deviations that matter:
+//! Text RTSP/1.0, with three deviations from it:
 //!
-//! - **One request per TCP connection.** Hosts close the socket after every
-//!   response, and the response is delimited by that close rather than by a
-//!   content length. Reusing a socket gets it reset — confirmed against the
-//!   dev host.
+//! - **One request per TCP connection.** The host closes the socket after every
+//!   response, and that close — not a content length — delimits the response.
+//!   A reused socket is reset.
 //! - **Request targets are not always URIs.** `SETUP` and `ANNOUNCE` address
 //!   streams as a bare `streamid=video/0/0`, and `PLAY` targets `/`.
 //! - **The host assigns the media ports.** Whatever the client proposes in
@@ -14,7 +13,7 @@
 use crate::http;
 use gsa_core::{Error, Result};
 
-/// Client protocol generation. Hosts branch on this, so it is not cosmetic.
+/// Client protocol generation. Hosts branch on this value.
 const CLIENT_VERSION: &str = "14";
 
 /// One parsed RTSP response.
@@ -43,11 +42,10 @@ pub struct Negotiated {
     /// Session ping payload, echoed so the host can bind a stream to this
     /// session rather than trusting the source address.
     ///
-    /// **Exactly one socket may use it.** The host issues a single payload
-    /// for the whole session and binds by payload, so a second socket
-    /// sending the same value steals the first stream's binding — observed
-    /// live: pinging audio with this payload silently stopped video. Give it
-    /// to the video socket; audio uses the address-matched legacy ping.
+    /// **Exactly one socket may use it.** The host issues one payload per
+    /// session and binds by payload, so a second socket sending the same value
+    /// steals the first stream's binding: pinging audio with it stops video.
+    /// It goes to the video socket; audio uses the address-matched legacy ping.
     pub ping_payload: Option<[u8; 16]>,
     /// Passed as ENet connect data, binding the control channel to this
     /// session for the same reason.
@@ -64,8 +62,8 @@ pub struct Negotiated {
 impl Negotiated {
     /// The control channel must use the newer nonce construction.
     ///
-    /// The two schemes are wire-incompatible and pick different IV layouts,
-    /// so this is read from the host rather than assumed.
+    /// The two schemes use incompatible IV layouts, so this is read from the
+    /// host rather than assumed.
     #[must_use]
     pub fn control_v2(&self) -> bool {
         self.encryption_supported & 0x01 != 0
@@ -81,7 +79,7 @@ pub struct StreamRequest {
     /// 0 = H.264, 1 = HEVC, 2 = AV1.
     pub bitstream_format: u32,
     pub bitrate_kbps: u32,
-    /// Video shard size; hosts observed using 1024 or 1392.
+    /// Video shard size; hosts use 1024 or 1392.
     pub packet_size: u32,
     pub channels: u8,
 }
@@ -100,7 +98,7 @@ impl std::fmt::Debug for Rtsp {
 }
 
 impl Rtsp {
-    /// `rtsp_url` is the `sessionUrl0` the launch endpoint returned; hosts
+    /// `rtsp_url` is the `sessionUrl0` the launch endpoint returned. Hosts
     /// match requests against the host string it carries, so it is reused
     /// verbatim rather than rebuilt from the address.
     pub fn new(rtsp_url: &str) -> Result<Self> {
@@ -180,8 +178,8 @@ impl Rtsp {
             .await?;
         let host_sdp = describe.body;
 
-        // Hosts assign the ports; the proposal is a formality real clients
-        // still send, so send it too rather than discovering which hosts care.
+        // Hosts assign the ports and ignore this proposal, but reference
+        // clients send it, so it stays.
         let transport = "unicast;X-GS-ClientPort=50000-50001";
         let audio = self
             .request(
@@ -191,7 +189,8 @@ impl Rtsp {
                 None,
             )
             .await?;
-        // The session id appears on the first SETUP and must be echoed after.
+        // The session id appears on the first SETUP and must be echoed on
+        // every request after it.
         if let Some(session) = audio.header("Session") {
             self.session = Some(
                 session
@@ -269,8 +268,8 @@ fn sdp_int(sdp: &str, name: &str) -> Option<u32> {
 /// Build the SDP that tells the host what to encode.
 fn announce_sdp(host: &str, want: StreamRequest, host_sdp: &str) -> String {
     let ip = host.split(':').next().unwrap_or("0.0.0.0");
-    // Mirror back only what the host said it supports: enabling a mode it
-    // does not implement is how a session dies at the first packet.
+    // Enable only the intersection of supported and requested: a mode the host
+    // does not implement kills the session at the first packet.
     let encryption = sdp_int(host_sdp, "x-ss-general.encryptionSupported").unwrap_or(0)
         & sdp_int(host_sdp, "x-ss-general.encryptionRequested").unwrap_or(0);
     let mask: u32 = match want.channels {
@@ -323,8 +322,8 @@ fn announce_sdp(host: &str, want: StreamRequest, host_sdp: &str) -> String {
 
 fn parse(raw: &[u8]) -> Result<Response> {
     let text = String::from_utf8_lossy(raw);
-    // Real hosts mix bare LF with CRLF; normalising first keeps the split
-    // from depending on which one this response happened to use.
+    // Hosts mix bare LF with CRLF within one response; normalise before
+    // splitting head from body.
     let text = text.replace("\r\n", "\n");
     let (head, body) = text.split_once("\n\n").unwrap_or((text.as_str(), ""));
     let mut lines = head.lines();
@@ -377,9 +376,8 @@ mod tests {
 
     #[test]
     fn only_enables_encryption_the_host_asked_for() {
-        // supported=5 (control v2 + audio), requested=1 (control v2) — we
-        // must enable exactly the intersection, or the session dies on the
-        // first packet the other side cannot read.
+        // supported=5 (control v2 + audio), requested=1 (control v2); the
+        // announced value is the intersection.
         let sdp = announce_sdp("10.0.0.1:48010", request(), HOST_SDP);
         assert!(sdp.contains("a=x-ss-general.encryptionEnabled:1"), "{sdp}");
     }
@@ -424,8 +422,8 @@ mod tests {
         let r: Response =
             parse(b"RTSP/1.0 200 OK\r\nTransport: server_port=48100\r\n\r\n").unwrap();
         assert_eq!(server_port(&r).unwrap(), 48100);
-        // A host that assigns no port cannot be streamed from; failing here
-        // beats sending media into the default port and seeing nothing.
+        // A response with no server_port must fail rather than fall back to a
+        // default port.
         let missing = parse(b"RTSP/1.0 200 OK\r\nTransport: unicast\r\n\r\n").unwrap();
         assert!(server_port(&missing).is_err());
     }

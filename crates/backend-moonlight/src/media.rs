@@ -1,26 +1,25 @@
 //! The media UDP ports.
 //!
-//! The port a host names during negotiation is where we *send* our ping, not
-//! where it sends media from — the host learns our address from that ping and
-//! streams back to its source port. So the ping must leave the very socket we
-//! intend to receive on, and it must keep going until frames arrive: until
-//! the host has heard from us it has nowhere to send.
+//! The port a host names during negotiation is where the ping is *sent*, not
+//! where media comes from: the host learns the client address from that ping
+//! and streams back from its own source port. The ping must therefore leave
+//! the same socket that will receive, and must repeat until frames arrive —
+//! until the host has heard from us it has nowhere to send.
 //!
-//! Two rules learned the hard way against a real host:
+//! Two protocol rules:
 //!
-//! - **Every media port must be pinged, including one we do not consume.**
-//!   Pinging video alone let video flow, and then the host tore the whole
-//!   session down after ten seconds — video and control both stopped.
-//! - **Only one socket may use the session ping payload.** The host issues a
-//!   single payload per session and binds streams by it, so a second socket
-//!   sending the same value re-binds the first stream to the wrong port.
-//!   Giving audio the same payload as video silently killed video entirely.
-//!   The stream we actually read gets the payload; the other pings by
-//!   address with the legacy form.
+//! - **Every media port must be pinged, including ones whose stream is not
+//!   consumed.** A host holding a media stream it cannot deliver tears the
+//!   whole session down after ten seconds, video and control alike.
+//! - **Only one socket per session may send the session ping payload.** The
+//!   host issues one payload per session and binds streams by it, so a second
+//!   socket sending the same value re-binds the first stream to the wrong
+//!   port. The stream that is actually read gets the payload; other ports are
+//!   pinged by address with the legacy form.
 
 use gsa_core::{Error, Result};
 
-/// The legacy ping: hosts that gave us no payload match us by address.
+/// Legacy ping form: hosts that issue no payload match the client by address.
 const PLAIN_PING: &[u8] = b"PING";
 
 /// Opens a media port and keeps the host informed of where to send.
@@ -28,16 +27,16 @@ const PLAIN_PING: &[u8] = b"PING";
 pub struct MediaSocket {
     socket: std::net::UdpSocket,
     host: std::net::SocketAddr,
-    /// Echoed so the host can bind this stream to our session rather than
-    /// trusting the source address, which NAT may rewrite.
+    /// Echoed so the host binds this stream to the session rather than to the
+    /// source address, which NAT may rewrite.
     payload: Option<[u8; 16]>,
     sequence: u32,
 }
 
 impl MediaSocket {
-    /// `payload` binds this socket to the session; pass `None` to ping by
-    /// address instead. See the module note — at most one socket per session
-    /// may carry the payload.
+    /// `payload` binds this socket to the session; `None` pings by address
+    /// instead. At most one socket per session may carry the payload — see
+    /// the module documentation.
     pub fn bind(host: std::net::SocketAddr, payload: Option<[u8; 16]>) -> Result<Self> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")
             .map_err(|e| Error::Transport(format!("bind media socket: {e}")))?;
@@ -63,11 +62,11 @@ impl MediaSocket {
 
     /// Ping a different port on the same host from this socket.
     ///
-    /// Used to claim every media stream for one socket: a host binds a
-    /// stream to whichever address pinged it, so pinging from two sockets
-    /// lets the later one steal the earlier one's stream. Pinging both ports
-    /// from a single socket leaves nothing to steal — and the streams are
-    /// told apart by their packet type on arrival.
+    /// Claims every media stream for one socket. A host binds a stream to
+    /// whichever address pinged it, so pinging from two sockets lets the
+    /// later one take the earlier one's stream; pinging both ports from a
+    /// single socket leaves nothing to take. The streams are then told apart
+    /// by packet type on arrival.
     pub fn ping_port(&mut self, port: u16) -> Result<()> {
         let target = std::net::SocketAddr::new(self.host.ip(), port);
         let datagram = self.ping_datagram();
@@ -80,8 +79,8 @@ impl MediaSocket {
     /// Ping another port with the address-matched legacy form.
     ///
     /// Some hosts bind a stream from the payload and others from the source
-    /// address; which form a given port wants is not something the wire tells
-    /// us, so it is chosen by the caller and settled by experiment.
+    /// address. The wire does not say which form a given port expects, so the
+    /// caller chooses.
     pub fn ping_port_plain(&self, port: u16) -> Result<()> {
         let target = std::net::SocketAddr::new(self.host.ip(), port);
         self.socket

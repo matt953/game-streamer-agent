@@ -1,15 +1,13 @@
 //! Backend-neutral host references (spec 16).
 //!
-//! The app stores one **opaque blob** per host it has enrolled with, and hands
-//! it back when listing a library or starting a session. It never parses the
-//! blob: a Moonlight host keeps a key and a certificate in there, a console
-//! will keep tokens, and the app is none the wiser. That is what keeps
-//! backend-specific concepts out of the embedding app entirely.
+//! The app stores one **opaque blob** per enrolled host and hands it back when
+//! listing a library or starting a session. It must not parse the blob: what a
+//! backend keeps in there (keys, certificates, tokens) is the backend's
+//! business, and that is what keeps per-backend concepts out of the app.
 //!
-//! The encoding is deliberately boring — newline-separated `key=value`, values
-//! percent-escaped for newlines — because it crosses a C boundary as a string
-//! and gets stored in a keychain. It is a private format between this crate
-//! and itself; nothing else may depend on its shape.
+//! The encoding is newline-separated `key=value` with newlines escaped, so it
+//! survives a C string and a keychain item. It is private to this crate;
+//! nothing else may depend on its shape.
 
 use std::ffi::{CStr, c_char};
 
@@ -95,9 +93,8 @@ impl HostRef {
 /// Copy `text` into a caller-supplied buffer as a NUL-terminated string.
 ///
 /// Returns the byte count *excluding* the terminator, so a caller can size a
-/// buffer by calling with a small one first. A buffer that is too small
-/// returns `-(needed + 1)` rather than truncating — a half-written credential
-/// blob that looks valid is worse than an error.
+/// buffer by calling with a small one first. Too small returns `-(needed + 1)`;
+/// it never truncates, since a partial credential blob still parses.
 pub(crate) fn write_out(text: &str, out: *mut c_char, cap: usize) -> i32 {
     let needed = text.len();
     if out.is_null() || cap == 0 {
@@ -238,9 +235,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
     err_cap: usize,
 ) -> *mut crate::GsaSession {
     crate::devlog::init();
-    // Every failure below says why: a bare NULL turns a host that explained
-    // itself ("permission denied") into a mystery for whoever is holding the
-    // phone.
+    // Every failure path writes `err`; NULL alone is not a diagnosis.
     let fail = |reason: &str| -> *mut crate::GsaSession {
         write_out(reason, err, err_cap);
         std::ptr::null_mut()
