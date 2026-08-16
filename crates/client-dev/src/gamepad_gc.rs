@@ -21,8 +21,9 @@
 use gsa_client_core::{GamepadProfile, PadCaps, PadKind};
 use gsa_protocol::input::{BatteryState, GamepadInput, InputEvent, TouchPhase, gamepad};
 use objc2::rc::Retained;
+use objc2_foundation::ns_string;
 use objc2_game_controller::{
-    GCController, GCControllerDirectionPad, GCDevice, GCDeviceBatteryState, GCExtendedGamepad,
+    GCController, GCControllerTouchpad, GCDevice, GCDeviceBatteryState, GCExtendedGamepad,
     GCMotion, GCTouchState,
 };
 
@@ -47,7 +48,7 @@ pub struct GcCapture {
     pad: Retained<GCExtendedGamepad>,
     motion: Option<Retained<GCMotion>>,
     /// The pad's own touch surface, when it has one.
-    touchpad: Option<Retained<GCControllerDirectionPad>>,
+    touchpad: Option<Retained<GCControllerTouchpad>>,
     profile: GamepadProfile,
     /// Last button/axis state sent, so a resting pad stays quiet.
     last: Option<(u32, [i16; 8])>,
@@ -291,16 +292,14 @@ impl GcCapture {
         let touchpad = self.touchpad.as_ref()?;
         // SAFETY: property reads on a live framework object.
         let (x, y, down) = unsafe {
+            let surface = touchpad.touchSurface();
             (
-                touchpad.xAxis().value(),
-                touchpad.yAxis().value(),
+                surface.xAxis().value(),
+                surface.yAxis().value(),
                 // The surface reports its own contact state; the click button
                 // is a different input, and a finger resting without pressing
                 // must still track.
-                self.controller
-                    .extendedGamepad()
-                    .and_then(|pad| touch_state(&pad))
-                    .is_some_and(|state| state != GCTouchState::Up),
+                touchpad.touchState() != GCTouchState::Up,
             )
         };
 
@@ -404,33 +403,27 @@ unsafe fn pad_kind(controller: &GCController) -> PadKind {
     }
 }
 
-/// The DualSense touch surface, when this controller has one.
+/// The pad's touch surface, when it has one.
+///
+/// `GCDualSenseGamepad::touchpadPrimary` is a direction pad, a sibling of
+/// `GCControllerTouchpad` rather than a subclass, so it carries position but no
+/// contact state and no downcast between the two can ever succeed. The physical
+/// input profile holds the touchpad view of the same surface.
 ///
 /// # Safety
 /// `controller` must be live.
-unsafe fn dualsense_touchpad(
-    controller: &GCController,
-) -> Option<Retained<GCControllerDirectionPad>> {
-    // SAFETY: a downcast the framework itself performs; `None` for every pad
-    // that is not a DualSense.
+unsafe fn dualsense_touchpad(controller: &GCController) -> Option<Retained<GCControllerTouchpad>> {
+    // SAFETY: property reads on a live framework object.
     unsafe {
-        let pad = controller.extendedGamepad()?;
-        let dualsense = pad.downcast_ref::<objc2_game_controller::GCDualSenseGamepad>()?;
-        Some(dualsense.touchpadPrimary())
-    }
-}
-
-/// Whether the touch surface currently has a finger on it.
-///
-/// # Safety
-/// `pad` must be live.
-unsafe fn touch_state(pad: &GCExtendedGamepad) -> Option<GCTouchState> {
-    // SAFETY: downcast + property read on a live framework object.
-    unsafe {
-        let dualsense = pad.downcast_ref::<objc2_game_controller::GCDualSenseGamepad>()?;
-        let surface = dualsense.touchpadPrimary();
-        let touchpad = surface.downcast_ref::<objc2_game_controller::GCControllerTouchpad>()?;
-        Some(touchpad.touchState())
+        let profile = controller.physicalInputProfile();
+        let touchpad = profile
+            .touchpads()
+            .objectForKey(ns_string!("Touchpad 1"))
+            .or_else(|| profile.allTouchpads().anyObject())?;
+        // Without this the surface reports movement relative to wherever the
+        // finger landed, but the wire carries absolute positions.
+        touchpad.setReportsAbsoluteTouchSurfaceValues(true);
+        Some(touchpad)
     }
 }
 
