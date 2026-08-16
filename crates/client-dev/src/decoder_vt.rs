@@ -24,13 +24,14 @@ use std::sync::mpsc;
 
 use block2::RcBlock;
 use objc2_core_foundation::{
-    CFDictionary, CFNumber, CFNumberType, CFRetained, kCFTypeDictionaryKeyCallBacks,
-    kCFTypeDictionaryValueCallBacks,
+    CFData, CFDictionary, CFNumber, CFNumberType, CFRetained, CFString,
+    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
 };
 use objc2_core_media::{
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMTime, CMVideoCodecType,
-    CMVideoFormatDescriptionCreateFromH264ParameterSets,
-    CMVideoFormatDescriptionCreateFromHEVCParameterSets, kCMVideoCodecType_AV1,
+    CMVideoFormatDescriptionCreate, CMVideoFormatDescriptionCreateFromH264ParameterSets,
+    CMVideoFormatDescriptionCreateFromHEVCParameterSets,
+    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, kCMVideoCodecType_AV1,
     kCMVideoCodecType_H264, kCMVideoCodecType_HEVC,
 };
 use objc2_core_video::{
@@ -114,6 +115,83 @@ impl VideoToolboxDecoder {
         })
     }
 
+    /// Build the session for an AV1 stream from its `av1C` record.
+    ///
+    /// AV1 has no parameter-set NALs to hand VideoToolbox; the configuration
+    /// is an `av1C` record carried as a sample-description atom, and the frame
+    /// size comes from the sequence header rather than from the description.
+    fn ensure_av1_session(&mut self, access_unit: &[u8]) -> Result<()> {
+        let Some(header) = crate::av1::sequence_header(access_unit) else {
+            // Normal: hosts send the sequence header with keyframes only.
+            return Ok(());
+        };
+        let obu = crate::av1::sequence_header_obu(access_unit)
+            .ok_or_else(err("sequence header without its OBU"))?;
+        let record = crate::av1::av1c(&header, &obu);
+        if self.session.is_some() && self.param_sets.first().is_some_and(|s| *s == record) {
+            return Ok(());
+        }
+        tracing::info!(?header, "AV1 sequence header");
+
+        // `av1C` is passed the way the container formats carry it: a
+        // sample-description atom keyed by its four-character name.
+        let data = CFData::from_bytes(&record);
+        let key = CFString::from_str("av1C");
+        // SAFETY: single-entry CFType dictionaries; keys and values stay alive
+        // for the call and are retained by the dictionary callbacks.
+        let atoms = unsafe {
+            let mut keys: [*const c_void; 1] = [CFRetained::as_ptr(&key).as_ptr().cast()];
+            let mut values: [*const c_void; 1] = [CFRetained::as_ptr(&data).as_ptr().cast()];
+            CFDictionary::new(
+                None,
+                keys.as_mut_ptr(),
+                values.as_mut_ptr(),
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        }
+        .ok_or_else(err("CFDictionaryCreate failed"))?;
+        // SAFETY: as above — a static framework key and a live dictionary.
+        let extensions = unsafe {
+            let key: *const CFString =
+                kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms;
+            let mut keys: [*const c_void; 1] = [key.cast()];
+            let mut values: [*const c_void; 1] = [CFRetained::as_ptr(&atoms).as_ptr().cast()];
+            CFDictionary::new(
+                None,
+                keys.as_mut_ptr(),
+                values.as_mut_ptr(),
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        }
+        .ok_or_else(err("CFDictionaryCreate failed"))?;
+
+        let mut fmt_raw: *const CMFormatDescription = ptr::null();
+        // SAFETY: valid extensions dictionary and out-pointer; dimensions come
+        // from the stream's own sequence header.
+        let status = unsafe {
+            CMVideoFormatDescriptionCreate(
+                None,
+                kCMVideoCodecType_AV1,
+                header.width as i32,
+                header.height as i32,
+                Some(&extensions),
+                NonNull::from(&mut fmt_raw),
+            )
+        };
+        if status != 0 || fmt_raw.is_null() {
+            return Err(Error::Decode(format!("AV1 format description: {status}")));
+        }
+        // SAFETY: +1 retained out-param; take ownership.
+        let format = unsafe { CFRetained::from_raw(NonNull::new_unchecked(fmt_raw.cast_mut())) };
+        self.open_session(format)?;
+        self.param_sets = vec![record];
+        Ok(())
+    }
+
     fn ensure_session(&mut self, sets: &[&[u8]]) -> Result<()> {
         if self.session.is_some() && self.param_sets.len() == sets.len() {
             let unchanged = self.param_sets.iter().zip(sets).all(|(a, b)| a == b);
@@ -154,6 +232,13 @@ impl VideoToolboxDecoder {
         // SAFETY: +1 retained out-param; take ownership.
         let format = unsafe { CFRetained::from_raw(NonNull::new_unchecked(fmt_raw.cast_mut())) };
 
+        self.open_session(format)?;
+        self.param_sets = sets.iter().map(|s| s.to_vec()).collect();
+        Ok(())
+    }
+
+    /// Open a decompression session against `format`, whichever codec built it.
+    fn open_session(&mut self, format: CFRetained<CMFormatDescription>) -> Result<()> {
         let attrs = bgra_output_attrs()?;
         let mut raw: *mut VTDecompressionSession = ptr::null_mut();
         // SAFETY: valid format + attrs; null callback record (we use the
@@ -176,7 +261,6 @@ impl VideoToolboxDecoder {
 
         self.session = Some(session);
         self.format = Some(format);
-        self.param_sets = sets.iter().map(|s| s.to_vec()).collect();
         tracing::info!(codec = ?self.codec, "VideoToolbox decoder session (re)created");
         Ok(())
     }
@@ -189,6 +273,13 @@ unsafe impl Send for VideoToolboxDecoder {}
 
 impl VideoDecoder for VideoToolboxDecoder {
     fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>> {
+        // AV1 is not Annex-B: no start codes, no parameter-set NALs, and the
+        // sample is the temporal unit exactly as it arrived.
+        if self.codec == Codec::Av1 {
+            self.ensure_av1_session(access_unit)?;
+            return self.decode_sample(access_unit);
+        }
+
         let nals = split_annex_b(access_unit);
         // Parameter sets are held in the order the format description expects:
         // VPS, SPS, PPS for HEVC; SPS, PPS for H.264.
@@ -209,14 +300,29 @@ impl VideoDecoder for VideoToolboxDecoder {
         if found.len() == wanted {
             self.ensure_session(&found)?;
         }
-        let Some(session) = self.session.as_ref() else {
-            return Ok(None); // waiting for the first IDR's parameter sets
-        };
+        if self.session.is_none() {
+            return Ok(None); // waiting for the first keyframe's parameter sets
+        }
         if avcc.is_empty() {
             return Ok(None);
         }
+        self.decode_sample(&avcc)
+    }
+}
 
-        let sample = avcc_sample_buffer(&avcc, self.format.as_ref().expect("format with session"))?;
+impl VideoToolboxDecoder {
+    /// Hand one prepared sample to the session and wait for its frame.
+    fn decode_sample(&mut self, sample_data: &[u8]) -> Result<Option<DecodedFrame>> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(None); // waiting for the first keyframe's configuration
+        };
+        if sample_data.is_empty() {
+            return Ok(None);
+        }
+        let sample = avcc_sample_buffer(
+            sample_data,
+            self.format.as_ref().expect("format with session"),
+        )?;
 
         let (tx, rx) = mpsc::sync_channel::<Option<DecodedFrame>>(1);
         let handler = RcBlock::new(

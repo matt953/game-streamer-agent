@@ -3,6 +3,7 @@
 //! mode); the default mode opens a window and presents the stream.
 
 mod audio_playback;
+mod av1;
 mod decoder;
 #[cfg(target_os = "macos")]
 mod decoder_vt;
