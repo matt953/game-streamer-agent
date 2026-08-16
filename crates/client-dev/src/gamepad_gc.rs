@@ -23,8 +23,8 @@ use gsa_protocol::input::{BatteryState, GamepadInput, InputEvent, TouchPhase, ga
 use objc2::rc::Retained;
 use objc2_foundation::ns_string;
 use objc2_game_controller::{
-    GCController, GCControllerTouchpad, GCDevice, GCDeviceBatteryState, GCExtendedGamepad,
-    GCMotion, GCTouchState,
+    GCController, GCControllerDirectionPad, GCDevice, GCDeviceBatteryState, GCExtendedGamepad,
+    GCMotion,
 };
 
 /// Radians per second to degrees per second.
@@ -43,17 +43,31 @@ const STICK_DEADZONE: f32 = 0.05;
 
 const SEAT: u8 = 0;
 
+/// Contacts the framework tracks separately on a DualSense surface.
+const MAX_CONTACTS: usize = 2;
+
+/// At-rest reads before a contact counts as lifted. The surface reports an
+/// exact (0, 0) with nothing on it, and briefly mid-drag when an axis updates
+/// ahead of its pair.
+const RELEASE_SAMPLES: u8 = 2;
+
 pub struct GcCapture {
     controller: Retained<GCController>,
     pad: Retained<GCExtendedGamepad>,
     motion: Option<Retained<GCMotion>>,
-    /// The pad's own touch surface, when it has one.
-    touchpad: Option<Retained<GCControllerTouchpad>>,
+    /// One direction pad per touch contact, empty without a touch surface.
+    touchpads: Vec<Retained<GCControllerDirectionPad>>,
     profile: GamepadProfile,
     /// Last button/axis state sent, so a resting pad stays quiet.
     last: Option<(u32, [i16; 8])>,
-    /// Whether a contact is currently down, to tell a first touch from a move.
-    touching: bool,
+    /// Whether each contact is down, to tell a first touch from a move.
+    touching: [bool; MAX_CONTACTS],
+    /// Consecutive at-rest reads per contact, so one stray sample mid-drag
+    /// does not lift the finger.
+    at_rest: [u8; MAX_CONTACTS],
+    /// Where each contact last actually was, to report a lift there rather
+    /// than at the origin.
+    last_touch: [(f32, f32); MAX_CONTACTS],
     /// Last battery reading sent; charge moves slowly and would otherwise
     /// repeat every poll.
     last_battery: Option<(BatteryState, Option<u8>)>,
@@ -104,7 +118,7 @@ impl GcCapture {
                 .filter(|c| c.extendedGamepad().is_some())
                 .max_by_key(|c| {
                     usize::from(c.motion().is_some())
-                        + usize::from(dualsense_touchpad(c).is_some())
+                        + usize::from(!touch_surfaces(c).is_empty())
                         + usize::from(c.battery().is_some())
                 })?;
             let pad = controller.extendedGamepad()?;
@@ -125,13 +139,13 @@ impl GcCapture {
                     "motion sensors"
                 );
             }
-            let touchpad = dualsense_touchpad(&controller);
+            let touchpads = touch_surfaces(&controller);
 
             let mut caps = PadCaps::RUMBLE;
             if motion.is_some() {
                 caps |= PadCaps::MOTION;
             }
-            if touchpad.is_some() {
+            if !touchpads.is_empty() {
                 caps |= PadCaps::TOUCHPAD;
             }
             if controller.battery().is_some() {
@@ -147,7 +161,7 @@ impl GcCapture {
             tracing::info!(
                 ?kind,
                 motion = motion.is_some(),
-                touchpad = touchpad.is_some(),
+                touchpads = touchpads.len(),
                 "controller opened through the platform framework"
             );
             let motors = crate::haptics::Rumble::new(&controller);
@@ -155,10 +169,12 @@ impl GcCapture {
                 controller,
                 pad,
                 motion,
-                touchpad,
+                touchpads,
                 profile: GamepadProfile::new(kind, caps),
                 last: None,
-                touching: false,
+                touching: [false; MAX_CONTACTS],
+                at_rest: [0; MAX_CONTACTS],
+                last_touch: [(0.0, 0.0); MAX_CONTACTS],
                 last_battery: None,
                 logged_motion: false,
                 motors,
@@ -274,9 +290,7 @@ impl GcCapture {
                 });
             }
 
-            if let Some(event) = self.poll_touch() {
-                events.push(event);
-            }
+            self.poll_touch(&mut events);
             if let Some(event) = self.poll_battery() {
                 events.push(event);
             }
@@ -284,43 +298,43 @@ impl GcCapture {
         events
     }
 
-    /// One touch event, or `None` while nothing is happening.
+    /// Touch events for whichever contacts changed this poll.
     ///
     /// # Safety
     /// Caller holds the framework objects alive.
-    unsafe fn poll_touch(&mut self) -> Option<InputEvent> {
-        let touchpad = self.touchpad.as_ref()?;
-        // SAFETY: property reads on a live framework object.
-        let (x, y, down) = unsafe {
-            let surface = touchpad.touchSurface();
-            (
-                surface.xAxis().value(),
-                surface.yAxis().value(),
-                // The surface reports its own contact state; the click button
-                // is a different input, and a finger resting without pressing
-                // must still track.
-                touchpad.touchState() != GCTouchState::Up,
-            )
-        };
+    unsafe fn poll_touch(&mut self, events: &mut Vec<InputEvent>) {
+        for pointer in 0..self.touchpads.len() {
+            // SAFETY: property reads on a live framework object.
+            let (x, y) = unsafe {
+                let surface = &self.touchpads[pointer];
+                (surface.xAxis().value(), surface.yAxis().value())
+            };
 
-        let phase = match (self.touching, down) {
-            (false, true) => TouchPhase::Down,
-            (true, true) => TouchPhase::Move,
-            (true, false) => TouchPhase::Up,
-            (false, false) => return None,
-        };
-        self.touching = down;
-        Some(InputEvent::GamepadTouch {
-            seat: SEAT,
-            pointer: 0,
-            phase,
-            // The surface reports -1..1 with the origin centred; the wire is
-            // 0..1 from the top-left, and its Y grows downward.
-            x: (f32::midpoint(x, 1.0)).clamp(0.0, 1.0),
-            y: (f32::midpoint(-y, 1.0)).clamp(0.0, 1.0),
-            pressure: 1.0,
-            ts_us: now_us(),
-        })
+            let mut contact = Contact {
+                touching: self.touching[pointer],
+                at_rest: self.at_rest[pointer],
+                position: self.last_touch[pointer],
+            };
+            let phase = contact.read(x, y);
+            self.touching[pointer] = contact.touching;
+            self.at_rest[pointer] = contact.at_rest;
+            self.last_touch[pointer] = contact.position;
+            let Some(phase) = phase else { continue };
+            // A lift reports the origin, which is the middle of the surface —
+            // sending that would drag the contact to the centre on the way up.
+            let (x, y) = contact.position;
+            events.push(InputEvent::GamepadTouch {
+                seat: SEAT,
+                pointer: pointer as u8,
+                phase,
+                // The surface reports -1..1 with the origin centred; the wire is
+                // 0..1 from the top-left, and its Y grows downward.
+                x: (f32::midpoint(x, 1.0)).clamp(0.0, 1.0),
+                y: (f32::midpoint(-y, 1.0)).clamp(0.0, 1.0),
+                pressure: 1.0,
+                ts_us: now_us(),
+            });
+        }
     }
 
     /// A battery reading, but only when it has actually changed.
@@ -403,27 +417,71 @@ unsafe fn pad_kind(controller: &GCController) -> PadKind {
     }
 }
 
-/// The pad's touch surface, when it has one.
+/// One finger on the touch surface, tracked across polls.
 ///
-/// `GCDualSenseGamepad::touchpadPrimary` is a direction pad, a sibling of
-/// `GCControllerTouchpad` rather than a subclass, so it carries position but no
-/// contact state and no downcast between the two can ever succeed. The physical
-/// input profile holds the touchpad view of the same surface.
+/// The framework reports no contact state for this pad, so the reading itself
+/// has to say whether a finger is there. Measured against the hardware:
+///
+/// - An untouched surface reads exactly `(0, 0)`.
+/// - The axes do not update in the same sample. A contact begins as `(x, 0)`
+///   and ends as `(0, y)`, and those half-updated samples last exactly one
+///   sample. Requiring **both** axes rules them out, so an edge touch is never
+///   recorded at the centre; accepting *either* reports every edge lift at
+///   0.5, 0.5.
+#[derive(Debug, Default, Clone, Copy)]
+struct Contact {
+    touching: bool,
+    at_rest: u8,
+    /// The last position with a finger genuinely on it. A lift reads the
+    /// origin, which is the middle of the surface.
+    position: (f32, f32),
+}
+
+impl Contact {
+    /// Fold one reading in, returning the phase to report if it changed.
+    fn read(&mut self, x: f32, y: f32) -> Option<TouchPhase> {
+        let down = x != 0.0 && y != 0.0;
+        if down {
+            self.at_rest = 0;
+            self.position = (x, y);
+        } else if self.touching {
+            self.at_rest += 1;
+            if self.at_rest < RELEASE_SAMPLES {
+                return None;
+            }
+        }
+        let phase = match (self.touching, down) {
+            (false, true) => TouchPhase::Down,
+            (true, true) => TouchPhase::Move,
+            (true, false) => TouchPhase::Up,
+            (false, false) => return None,
+        };
+        self.touching = down;
+        Some(phase)
+    }
+}
+
+/// The pad's touch contacts, one direction pad each, empty for a pad without a
+/// touch surface.
+///
+/// The framework offers a `GCControllerTouchpad` with real contact state, but
+/// never for this pad: `touchpads` is empty on both macOS and iOS, and
+/// `GCDualSenseGamepad::touchpadPrimary` is a direction pad — a sibling of
+/// `GCControllerTouchpad` rather than a subclass, so no downcast between the
+/// two can ever succeed. Measured against the hardware, these direction pads
+/// carry absolute positions across the whole surface and rest at exactly
+/// (0, 0), which is the only contact signal available.
 ///
 /// # Safety
 /// `controller` must be live.
-unsafe fn dualsense_touchpad(controller: &GCController) -> Option<Retained<GCControllerTouchpad>> {
+unsafe fn touch_surfaces(controller: &GCController) -> Vec<Retained<GCControllerDirectionPad>> {
     // SAFETY: property reads on a live framework object.
     unsafe {
-        let profile = controller.physicalInputProfile();
-        let touchpad = profile
-            .touchpads()
-            .objectForKey(ns_string!("Touchpad 1"))
-            .or_else(|| profile.allTouchpads().anyObject())?;
-        // Without this the surface reports movement relative to wherever the
-        // finger landed, but the wire carries absolute positions.
-        touchpad.setReportsAbsoluteTouchSurfaceValues(true);
-        Some(touchpad)
+        let dpads = controller.physicalInputProfile().dpads();
+        [ns_string!("Touchpad 1"), ns_string!("Touchpad 2")]
+            .into_iter()
+            .filter_map(|key| dpads.objectForKey(key))
+            .collect()
     }
 }
 
@@ -511,7 +569,45 @@ fn now_us() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{G_TO_MS2, RAD_TO_DEG};
+    use super::{Contact, G_TO_MS2, RAD_TO_DEG, TouchPhase};
+
+    /// Both axes must be non-zero for a contact. The surface updates them a
+    /// sample apart, so accepting either one reports an edge touch at the
+    /// centre of the pad — a lift in the corner arrives as 0.5, 0.5.
+    #[test]
+    fn a_half_updated_sample_is_not_a_contact() {
+        let mut contact = Contact::default();
+        // A touch in the top-right corner: x lands first, y a sample later.
+        assert_eq!(contact.read(0.9, 0.0), None);
+        assert_eq!(contact.read(0.9, 0.8), Some(TouchPhase::Down));
+        // Release: x drops first, and that sample must not be recorded as the
+        // position or the lift is reported from the middle of the surface.
+        assert_eq!(contact.read(0.0, 0.8), None);
+        assert_eq!(contact.read(0.0, 0.0), Some(TouchPhase::Up));
+        assert_eq!(contact.position, (0.9, 0.8));
+    }
+
+    /// A finger resting still keeps reporting, and a lift needs more than the
+    /// single at-rest sample the surface produces mid-transition.
+    #[test]
+    fn a_contact_survives_one_at_rest_sample() {
+        let mut contact = Contact::default();
+        assert_eq!(contact.read(0.5, 0.5), Some(TouchPhase::Down));
+        assert_eq!(contact.read(0.0, 0.5), None);
+        assert_eq!(contact.read(0.5, 0.5), Some(TouchPhase::Move));
+        assert!(contact.touching);
+    }
+
+    /// An untouched surface must stay silent rather than emit contacts at the
+    /// origin, which is the middle of the pad.
+    #[test]
+    fn an_untouched_surface_reports_nothing() {
+        let mut contact = Contact::default();
+        for _ in 0..10 {
+            assert_eq!(contact.read(0.0, 0.0), None);
+        }
+        assert!(!contact.touching);
+    }
 
     /// The framework and the wire disagree on units, and a missing conversion
     /// is invisible in a code review: gyro still moves, it is just wrong by a
