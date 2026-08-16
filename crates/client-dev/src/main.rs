@@ -94,6 +94,15 @@ struct Cli {
     /// "the host will not send X *to this kind of pad*".
     #[arg(long, value_parser = ["auto", "xbox", "dualsense", "dualshock", "generic"])]
     moonlight_pad_kind: Option<String>,
+    /// Stream mode to ask the host for, as `WIDTHxHEIGHT@FPS`, or `auto` to
+    /// match this display. Matching is the useful default: a host that can
+    /// create a display for the session then renders at the client's real
+    /// geometry instead of scaling into it.
+    #[arg(long, default_value = "auto")]
+    moonlight_mode: String,
+    /// Let the host change its desktop resolution to match the request.
+    #[arg(long)]
+    moonlight_host_mode_change: bool,
     /// Write the first decoded frame here as a BMP. A frame count proves the
     /// decoder accepted the stream; only the pixels prove it decoded it.
     #[arg(long)]
@@ -133,6 +142,8 @@ fn main() -> Result<()> {
             cli.moonlight_pad_kind.as_deref(),
             cli.dump_frame.clone(),
             &cli.codecs,
+            &cli.moonlight_mode,
+            cli.moonlight_host_mode_change,
         );
     }
 

@@ -162,6 +162,44 @@ pub unsafe extern "C" fn gsa_spike_connect(url: *const c_char, seconds: i32) -> 
 /// Threading: `on_video` fires on the session's receive thread; `on_audio` on a
 /// separate audio thread. Both may run concurrently, so the embedder must
 /// synchronize any shared state behind `ctx`. Neither pointer's data outlives
+/// The picture to ask the host for.
+///
+/// Pass the client's own display geometry. A host that can create a display to
+/// match renders at exactly this — right aspect, right refresh, native
+/// sharpness, and a game sees the real resolution rather than a cropped or
+/// stretched one. A host that cannot scales its own desktop into these
+/// dimensions instead, which still honours the size but letterboxes a shape it
+/// does not have. Neither is detectable from the client, so the request is the
+/// same either way.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GsaStreamMode {
+    /// Zero for both dimensions falls back to 1080p: a session must start
+    /// with something, and an embedder that cannot read its own display is
+    /// better served by a common mode than by a refusal.
+    pub width: u32,
+    pub height: u32,
+    /// Zero falls back to 60.
+    pub fps: u32,
+    /// Non-zero lets the host change its *physical* desktop resolution to
+    /// match. Off by default: it rearranges the windows of whoever is using
+    /// that machine, and it is unnecessary on a host that can make a display
+    /// for the session.
+    pub allow_host_mode_change: u32,
+}
+
+impl GsaStreamMode {
+    /// Fill in what the embedder left at zero.
+    fn resolve(self) -> (u32, u32, u32) {
+        let (width, height) = if self.width == 0 || self.height == 0 {
+            (1920, 1080)
+        } else {
+            (self.width, self.height)
+        };
+        (width, height, if self.fps == 0 { 60 } else { self.fps })
+    }
+}
+
 /// the call — copy what you need to keep. Callbacks must not call back into the
 /// session (no `gsa_session_stop` from inside a callback).
 #[repr(C)]

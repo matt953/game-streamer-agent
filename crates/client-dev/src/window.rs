@@ -244,8 +244,11 @@ pub fn run_moonlight(
     pad_kind: Option<&str>,
     dump_frame: Option<std::path::PathBuf>,
     codecs: &[String],
+    mode: &str,
+    host_mode_change: bool,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
+    let mode = parse_mode(mode, host_mode_change)?;
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -262,6 +265,7 @@ pub fn run_moonlight(
                     synthetic_pad,
                     dump_frame,
                     offered,
+                    mode,
                 },
                 &proxy,
             )
@@ -289,6 +293,81 @@ fn parse_pad_kind(name: &str) -> Option<gsa_client_core::PadKind> {
 }
 
 #[allow(clippy::too_many_arguments, reason = "dev harness flags, not an API")]
+/// Read `WIDTHxHEIGHT@FPS`, or `auto` for this display's own geometry.
+fn parse_mode(text: &str, host_mode_change: bool) -> Result<gsa_backend_moonlight::StreamMode> {
+    if text.eq_ignore_ascii_case("auto") {
+        let mode = match primary_display_mode() {
+            Some(mode) => mode,
+            None => {
+                tracing::warn!("could not read this display; asking for 1080p60");
+                (1920, 1080, 60)
+            }
+        };
+        tracing::info!(
+            width = mode.0,
+            height = mode.1,
+            fps = mode.2,
+            "matching this display"
+        );
+        return Ok(gsa_backend_moonlight::StreamMode {
+            width: mode.0,
+            height: mode.1,
+            fps: mode.2,
+            allow_host_mode_change: host_mode_change,
+            ..Default::default()
+        });
+    }
+    let (size, fps) = text.split_once('@').unwrap_or((text, "60"));
+    let (width, height) = size
+        .split_once(['x', 'X'])
+        .context("mode must look like 1920x1080@60")?;
+    Ok(gsa_backend_moonlight::StreamMode {
+        width: width.parse().context("mode width")?,
+        height: height.parse().context("mode height")?,
+        fps: fps.parse().context("mode fps")?,
+        allow_host_mode_change: host_mode_change,
+        ..Default::default()
+    })
+}
+
+/// This display's size and refresh, for `--moonlight-mode auto`.
+///
+/// Read from Core Graphics rather than the window system: the mode has to be
+/// known before the session starts, and winit only exposes monitors once its
+/// event loop is running.
+fn primary_display_mode() -> Option<(u32, u32, u32)> {
+    use objc2_core_graphics::{
+        CGDisplayCopyDisplayMode, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGMainDisplayID,
+    };
+    let display = CGMainDisplayID();
+    let width = CGDisplayPixelsWide(display) as u32;
+    let height = CGDisplayPixelsHigh(display) as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // Built-in panels report 0 rather than their real rate; 60 is the safe
+    // reading, and asking for more than the panel does buys nothing.
+    let rate: f64 = CGDisplayCopyDisplayMode(display).map_or(0.0, |mode| {
+        objc2_core_graphics::CGDisplayMode::refresh_rate(Some(&mode))
+    });
+    let fps = if rate >= 1.0 { rate.round() as u32 } else { 60 };
+    Some((width, height, streamable_fps(fps)))
+}
+
+/// The rate to ask a host for, given a display that runs at `panel_hz`.
+///
+/// A panel's own rate is not a sensible request. A 240 Hz monitor asks a host
+/// to encode 240 frames a second — work no game produces and no link carries,
+/// paid for in encoder time and bitrate that would otherwise buy quality. The
+/// request is snapped down to a rate hosts actually offer.
+fn streamable_fps(panel_hz: u32) -> u32 {
+    const OFFERED: [u32; 4] = [120, 90, 60, 30];
+    OFFERED
+        .into_iter()
+        .find(|&rate| rate <= panel_hz)
+        .unwrap_or(30)
+}
+
 /// Which decoded frame `--dump-frame` writes.
 const DUMP_AT_FRAME: u64 = 120;
 
@@ -301,6 +380,7 @@ struct MoonlightRun {
     synthetic_pad: bool,
     dump_frame: Option<std::path::PathBuf>,
     offered: Vec<gsa_core::media::Codec>,
+    mode: gsa_backend_moonlight::StreamMode,
 }
 
 fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLoopProxy<AppEvent>) {
@@ -312,6 +392,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
         synthetic_pad,
         dump_frame,
         offered,
+        mode,
     } = run;
     let outcome = (|| -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -325,7 +406,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 &mut session,
                 addr.ip(),
                 app_id,
-                gsa_backend_moonlight::StreamMode::default(),
+                mode,
                 bitrate_mbps.saturating_mul(1000),
                 &offered,
             )
@@ -1355,5 +1436,23 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
         self.queue.present(output);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::streamable_fps;
+
+    /// A fast panel must not turn into a fast request: the host pays for every
+    /// frame asked of it, and 240 Hz of desktop is not 240 Hz of game.
+    #[test]
+    fn a_panels_rate_is_snapped_to_one_a_host_offers() {
+        assert_eq!(streamable_fps(240), 120);
+        assert_eq!(streamable_fps(144), 120);
+        assert_eq!(streamable_fps(120), 120);
+        assert_eq!(streamable_fps(90), 90);
+        assert_eq!(streamable_fps(60), 60);
+        // Slower than every offered rate still streams, at the lowest.
+        assert_eq!(streamable_fps(24), 30);
     }
 }

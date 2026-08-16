@@ -226,6 +226,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
     host: *const c_char,
     target_id: u32,
     bitrate_kbps: u32,
+    mode: crate::GsaStreamMode,
     callbacks: crate::GsaCallbacks,
     err: *mut c_char,
     err_cap: usize,
@@ -266,7 +267,16 @@ pub unsafe extern "C" fn gsa_host_session_start(
         } else {
             bitrate_kbps
         },
-        mode: gsa_backend_moonlight::StreamMode::default(),
+        mode: {
+            let (width, height, fps) = mode.resolve();
+            gsa_backend_moonlight::StreamMode {
+                width,
+                height,
+                fps,
+                allow_host_mode_change: mode.allow_host_mode_change != 0,
+                ..Default::default()
+            }
+        },
         // The apps decode H.264 only. Widening this without widening their
         // decoders would negotiate a stream that arrives and never shows.
         decode_codecs: vec![gsa_core::media::Codec::H264],
