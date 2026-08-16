@@ -295,36 +295,34 @@ fn parse_pad_kind(name: &str) -> Option<gsa_client_core::PadKind> {
 #[allow(clippy::too_many_arguments, reason = "dev harness flags, not an API")]
 /// Read `WIDTHxHEIGHT@FPS`, or `auto` for this display's own geometry.
 fn parse_mode(text: &str, host_mode_change: bool) -> Result<gsa_backend_moonlight::StreamMode> {
-    if text.eq_ignore_ascii_case("auto") {
-        let mode = match primary_display_mode() {
-            Some(mode) => mode,
-            None => {
-                tracing::warn!("could not read this display; asking for 1080p60");
-                (1920, 1080, 60)
-            }
-        };
-        tracing::info!(
-            width = mode.0,
-            height = mode.1,
-            fps = mode.2,
-            "matching this display"
-        );
-        return Ok(gsa_backend_moonlight::StreamMode {
-            width: mode.0,
-            height: mode.1,
-            fps: mode.2,
-            allow_host_mode_change: host_mode_change,
-            ..Default::default()
-        });
-    }
-    let (size, fps) = text.split_once('@').unwrap_or((text, "60"));
-    let (width, height) = size
-        .split_once(['x', 'X'])
-        .context("mode must look like 1920x1080@60")?;
+    let (width, height, fps) = if text.eq_ignore_ascii_case("auto") {
+        primary_display_mode().unwrap_or_else(|| {
+            tracing::warn!("could not read this display; asking for 1080p60");
+            (1920, 1080, 60)
+        })
+    } else {
+        let (size, fps) = text.split_once('@').unwrap_or((text, "60"));
+        let (width, height) = size
+            .split_once(['x', 'X'])
+            .context("mode must look like 1920x1080@60")?;
+        (
+            width.parse().context("mode width")?,
+            height.parse().context("mode height")?,
+            fps.parse().context("mode fps")?,
+        )
+    };
+
+    // Both sides even, whether they came from a display or from the command
+    // line. H.264 and HEVC carry colour at half resolution, so an odd side has
+    // no whole number of chroma samples: measured against a real host, a
+    // request for 2556x1179 negotiated, connected, played audio, and delivered
+    // no video at all.
+    let (width, height) = (width & !1, height & !1);
+    tracing::info!(width, height, fps, "asking the host for this mode");
     Ok(gsa_backend_moonlight::StreamMode {
-        width: width.parse().context("mode width")?,
-        height: height.parse().context("mode height")?,
-        fps: fps.parse().context("mode fps")?,
+        width,
+        height,
+        fps,
         allow_host_mode_change: host_mode_change,
         ..Default::default()
     })

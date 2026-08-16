@@ -345,11 +345,26 @@ async fn connect(
     bitrate_kbps: u32,
     codec: Codec,
 ) -> Result<MoonlightStream> {
+    // Both sides even, whatever the caller asked for. H.264 and HEVC carry
+    // colour at half resolution, so an odd side has no whole number of chroma
+    // samples. Measured against a real host, an odd height negotiated,
+    // connected, played audio, and delivered no video at all — a failure with
+    // no error anywhere to explain it, so the constraint is enforced here
+    // rather than trusted to every caller.
+    let (width, height) = (mode.width & !1, mode.height & !1);
+    if (width, height) != (mode.width, mode.height) {
+        tracing::warn!(
+            asked = format!("{}x{}", mode.width, mode.height),
+            using = format!("{width}x{height}"),
+            "an odd frame size cannot be encoded; rounded down"
+        );
+    }
+
     let mut rtsp = Rtsp::new(&launched.rtsp_url)?;
     let negotiated = rtsp
         .negotiate(StreamRequest {
-            width: mode.width,
-            height: mode.height,
+            width,
+            height,
             fps: mode.fps,
             bitstream_format: codec::bitstream_format(codec),
             bitrate_kbps,
