@@ -420,30 +420,37 @@ unsafe fn pad_kind(controller: &GCController) -> PadKind {
 /// One finger on the touch surface, tracked across polls.
 ///
 /// The framework reports no contact state for this pad, so the reading itself
-/// has to say whether a finger is there. Measured against the hardware:
+/// has to say whether a finger is there. Measured against the hardware, that is
+/// two separate questions, and answering them with one test gets one of them
+/// wrong:
 ///
-/// - An untouched surface reads exactly `(0, 0)`.
-/// - The axes do not update in the same sample. A contact begins as `(x, 0)`
-///   and ends as `(0, y)`, and those half-updated samples last exactly one
-///   sample. Requiring **both** axes rules them out, so an edge touch is never
-///   recorded at the centre; accepting *either* reports every edge lift at
-///   0.5, 0.5.
+/// - **Is a finger down?** Only an exact `(0, 0)` means no. A single axis
+///   reading zero is an ordinary part of a drag — it is the line through the
+///   middle of the pad — and treating that as a lift breaks a slow drag across
+///   the centre into a lift and a re-touch.
+/// - **Is this position usable?** Only when *both* axes are non-zero. The axes
+///   do not update in the same sample: a contact begins as `(x, 0)` and ends as
+///   `(0, y)`, so those half-updated samples would place a touch at the centre
+///   of the pad — an edge lift reported as 0.5, 0.5.
 #[derive(Debug, Default, Clone, Copy)]
 struct Contact {
     touching: bool,
     at_rest: u8,
-    /// The last position with a finger genuinely on it. A lift reads the
-    /// origin, which is the middle of the surface.
+    /// The last position with both axes reporting. A lift reads the origin,
+    /// which is the middle of the surface.
     position: (f32, f32),
 }
 
 impl Contact {
     /// Fold one reading in, returning the phase to report if it changed.
     fn read(&mut self, x: f32, y: f32) -> Option<TouchPhase> {
-        let down = x != 0.0 && y != 0.0;
+        let down = x != 0.0 || y != 0.0;
+        let located = x != 0.0 && y != 0.0;
+        if located {
+            self.position = (x, y);
+        }
         if down {
             self.at_rest = 0;
-            self.position = (x, y);
         } else if self.touching {
             self.at_rest += 1;
             if self.at_rest < RELEASE_SAMPLES {
@@ -451,6 +458,10 @@ impl Contact {
             }
         }
         let phase = match (self.touching, down) {
+            // Where the contact is arrives a sample after the fact that it
+            // exists. Reporting it early would put it at the last finger's
+            // position, so the contact waits for a reading that locates it.
+            (false, true) if !located => return None,
             (false, true) => TouchPhase::Down,
             (true, true) => TouchPhase::Move,
             (true, false) => TouchPhase::Up,
@@ -578,11 +589,15 @@ mod tests {
     fn a_half_updated_sample_is_not_a_contact() {
         let mut contact = Contact::default();
         // A touch in the top-right corner: x lands first, y a sample later.
+        // The contact waits for the sample that locates it, or it would be
+        // reported from the middle of the pad.
         assert_eq!(contact.read(0.9, 0.0), None);
         assert_eq!(contact.read(0.9, 0.8), Some(TouchPhase::Down));
-        // Release: x drops first, and that sample must not be recorded as the
-        // position or the lift is reported from the middle of the surface.
-        assert_eq!(contact.read(0.0, 0.8), None);
+        // Release: x drops first. That sample is still a contact — one axis at
+        // zero is a position on the pad — but it must not be recorded as the
+        // position, or the lift is reported from the middle of the surface.
+        assert_eq!(contact.read(0.0, 0.8), Some(TouchPhase::Move));
+        assert_eq!(contact.read(0.0, 0.0), None);
         assert_eq!(contact.read(0.0, 0.0), Some(TouchPhase::Up));
         assert_eq!(contact.position, (0.9, 0.8));
     }
@@ -593,9 +608,26 @@ mod tests {
     fn a_contact_survives_one_at_rest_sample() {
         let mut contact = Contact::default();
         assert_eq!(contact.read(0.5, 0.5), Some(TouchPhase::Down));
-        assert_eq!(contact.read(0.0, 0.5), None);
+        assert_eq!(contact.read(0.0, 0.5), Some(TouchPhase::Move));
         assert_eq!(contact.read(0.5, 0.5), Some(TouchPhase::Move));
         assert!(contact.touching);
+    }
+
+    /// The lines through the middle of the pad read one axis as exactly zero,
+    /// for as long as the finger stays on them. That is a position, not a
+    /// lift: treating it as one breaks a slow drag across the centre into a
+    /// lift and a re-touch, which a game sees as a tap.
+    #[test]
+    fn a_drag_along_the_centre_line_stays_down() {
+        let mut contact = Contact::default();
+        assert_eq!(contact.read(-0.4, 0.2), Some(TouchPhase::Down));
+        for _ in 0..30 {
+            assert_eq!(contact.read(-0.4, 0.0), Some(TouchPhase::Move));
+        }
+        assert!(contact.touching);
+        // Only an untouched surface reads both axes as zero.
+        assert_eq!(contact.read(0.0, 0.0), None);
+        assert_eq!(contact.read(0.0, 0.0), Some(TouchPhase::Up));
     }
 
     /// An untouched surface must stay silent rather than emit contacts at the
