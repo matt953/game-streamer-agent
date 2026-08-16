@@ -31,6 +31,91 @@ pub enum PadKind {
     SwitchPro,
 }
 
+/// USB vendor ids. A pad's family is unambiguous from these; its *name* is
+/// not, and the ambiguity is not theoretical — Android calls a DualSense
+/// "Wireless Controller" and an Xbox pad "Xbox Wireless Controller", so any
+/// substring match on the former silently claims the latter.
+mod vendor {
+    pub const SONY: u32 = 0x054C;
+    pub const MICROSOFT: u32 = 0x045E;
+    pub const NINTENDO: u32 = 0x057E;
+}
+
+/// Product ids worth distinguishing within a vendor.
+mod product {
+    /// Confirmed against hardware. Other Sony pads fall to DualShock 4, which
+    /// claims less: a DS4 has a touchpad and a lightbar but no adaptive
+    /// triggers, so a DualSense misread as a DS4 loses a feature, while the
+    /// reverse promises one that is not there.
+    pub const DUALSENSE: u32 = 0x0CE6;
+}
+
+impl PadKind {
+    /// Identify a pad from what a platform can tell us about it.
+    ///
+    /// Shared deliberately: every client learns the same pad the same way, and
+    /// the rules are testable here rather than written twice in two languages
+    /// against two sets of half-remembered ids. Pass `0` for an id the
+    /// platform does not expose — Apple, for instance, gives a name and a type
+    /// but no USB ids, and should use its own type information first where it
+    /// has it, since that is better evidence than any heuristic.
+    ///
+    /// Anything unrecognised is an **Xbox** pad, not a generic one: it is the
+    /// layout every host emulates best, and it claims no feature a stranger
+    /// pad might lack.
+    #[must_use]
+    pub fn identify(vendor_id: u32, product_id: u32, name: &str) -> Self {
+        let name = name.to_lowercase();
+        match vendor_id {
+            vendor::SONY => {
+                if product_id == product::DUALSENSE || name.contains("dualsense") {
+                    Self::DualSense
+                } else {
+                    Self::DualShock4
+                }
+            }
+            vendor::MICROSOFT => Self::Xbox,
+            vendor::NINTENDO => Self::SwitchPro,
+            // Names only where ids are absent or belong to an adapter. Most
+            // specific first, because the generic names overlap.
+            _ if name.contains("dualsense") => Self::DualSense,
+            _ if name.contains("dualshock") => Self::DualShock4,
+            _ if name.contains("xbox") => Self::Xbox,
+            _ if name.contains("pro controller") => Self::SwitchPro,
+            _ => Self::Xbox,
+        }
+    }
+
+    /// Features implied by the family alone, whatever the platform reports.
+    ///
+    /// A client ORs these with what it can actually observe (sensors, a
+    /// vibrator, a battery): the hardware in the box is a fact about the
+    /// model, while what an OS chooses to expose is a fact about the OS.
+    #[must_use]
+    pub fn implied_caps(self) -> PadCaps {
+        match self {
+            Self::DualSense => {
+                PadCaps::RUMBLE
+                    | PadCaps::TRIGGER_RUMBLE
+                    | PadCaps::MOTION
+                    | PadCaps::TOUCHPAD
+                    | PadCaps::ADAPTIVE_TRIGGERS
+                    | PadCaps::LED
+                    | PadCaps::BATTERY
+            }
+            Self::DualShock4 => {
+                PadCaps::RUMBLE
+                    | PadCaps::MOTION
+                    | PadCaps::TOUCHPAD
+                    | PadCaps::LED
+                    | PadCaps::BATTERY
+            }
+            // Rumble is the only thing every remaining pad reliably has.
+            _ => PadCaps::RUMBLE,
+        }
+    }
+}
+
 /// Features a pad has, or a wire can carry — one vocabulary for both.
 ///
 /// A client announces what its pad **has** ([`GamepadProfile::caps`]); a
@@ -216,7 +301,64 @@ impl GamepadFeedback {
 
 #[cfg(test)]
 mod tests {
-    use super::{GamepadFeedback, PadCaps, TriggerEffect};
+    use super::{GamepadFeedback, PadCaps, PadKind, TriggerEffect};
+
+    /// The trap that produced a real bug: an Xbox pad announced as a
+    /// PlayStation one because its name contains the other's alias, so the
+    /// host built a DS4 and the client claimed a lightbar that does not exist.
+    #[test]
+    fn a_pad_named_like_another_is_identified_by_its_vendor() {
+        // Real ids, from hardware.
+        assert_eq!(
+            PadKind::identify(0x045E, 0x0B13, "Xbox Wireless Controller"),
+            PadKind::Xbox
+        );
+        assert_eq!(
+            PadKind::identify(0x054C, 0x0CE6, "Wireless Controller"),
+            PadKind::DualSense
+        );
+    }
+
+    #[test]
+    fn a_sony_pad_that_is_not_a_known_dualsense_claims_less_rather_than_more() {
+        // Unknown Sony product: a DS4 has no adaptive triggers, so this loses
+        // a feature rather than promising a missing one.
+        let kind = PadKind::identify(0x054C, 0x9999, "Wireless Controller");
+        assert_eq!(kind, PadKind::DualShock4);
+        assert!(!kind.implied_caps().contains(PadCaps::ADAPTIVE_TRIGGERS));
+        assert!(kind.implied_caps().contains(PadCaps::TOUCHPAD));
+        // A named Edge is still a DualSense even with an id we do not know.
+        assert_eq!(
+            PadKind::identify(0x054C, 0x0DF2, "DualSense Edge Wireless Controller"),
+            PadKind::DualSense
+        );
+    }
+
+    #[test]
+    fn names_identify_a_pad_when_ids_are_missing() {
+        // Apple exposes a name and a type but no USB ids.
+        assert_eq!(
+            PadKind::identify(0, 0, "Xbox One Controller"),
+            PadKind::Xbox
+        );
+        assert_eq!(
+            PadKind::identify(0, 0, "DualShock 4 Wireless Controller"),
+            PadKind::DualShock4
+        );
+        assert_eq!(
+            PadKind::identify(0, 0, "Pro Controller"),
+            PadKind::SwitchPro
+        );
+    }
+
+    /// An unknown pad is announced as an Xbox one: the layout hosts emulate
+    /// best, claiming nothing a stranger pad might lack.
+    #[test]
+    fn an_unknown_pad_is_an_xbox_pad() {
+        let kind = PadKind::identify(0x1234, 0x5678, "Generic Controller");
+        assert_eq!(kind, PadKind::Xbox);
+        assert_eq!(kind.implied_caps(), PadCaps::RUMBLE);
+    }
 
     #[test]
     fn capabilities_combine_and_test_as_a_set() {

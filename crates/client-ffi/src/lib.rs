@@ -600,6 +600,65 @@ pub unsafe extern "C" fn gsa_send_gamepad(
     }
 }
 
+/// Identify a pad's family from what the platform can tell you about it.
+///
+/// **Use this rather than matching names in the app.** Names overlap in ways
+/// that bite: a DualSense is often called "Wireless Controller" and an Xbox pad
+/// "Xbox Wireless Controller", so a substring test for the former claims the
+/// latter — and the host then builds the wrong virtual device for the whole
+/// session. Sharing the rules here keeps every client identifying a pad the
+/// same way, with the awkward cases covered by tests instead of by memory.
+///
+/// Pass `0` for an id the platform does not expose. Where a platform has
+/// better evidence than a heuristic — a concrete device type rather than a
+/// name — it should use that first and call this only as a fallback.
+/// Unrecognised pads come back as [`GSA_PAD_KIND_XBOX`].
+///
+/// # Safety
+/// `name` must be a valid NUL-terminated string for the call, or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_identify_pad(
+    vendor_id: u32,
+    product_id: u32,
+    name: *const c_char,
+) -> u32 {
+    // SAFETY: caller contract; a null or non-UTF-8 name identifies by id alone.
+    let name = unsafe { host::read_str(name) }.unwrap_or_default();
+    pad_kind_to_flag(gsa_client_core::PadKind::identify(
+        vendor_id, product_id, name,
+    ))
+}
+
+/// What a pad of this family has, whatever the platform reports about it.
+///
+/// OR this with what the client can actually observe (sensors, a vibrator, a
+/// battery): the hardware in the box is a fact about the model, while what an
+/// OS exposes is a fact about the OS.
+#[unsafe(no_mangle)]
+pub extern "C" fn gsa_pad_family_caps(kind: u32) -> u32 {
+    u32::from(pad_kind_from_flag(kind).implied_caps().bits())
+}
+
+fn pad_kind_to_flag(kind: gsa_client_core::PadKind) -> u32 {
+    match kind {
+        gsa_client_core::PadKind::Xbox => GSA_PAD_KIND_XBOX,
+        gsa_client_core::PadKind::DualShock4 => GSA_PAD_KIND_DUALSHOCK4,
+        gsa_client_core::PadKind::DualSense => GSA_PAD_KIND_DUALSENSE,
+        gsa_client_core::PadKind::SwitchPro => GSA_PAD_KIND_SWITCH_PRO,
+        _ => GSA_PAD_KIND_GENERIC,
+    }
+}
+
+fn pad_kind_from_flag(kind: u32) -> gsa_client_core::PadKind {
+    match kind {
+        GSA_PAD_KIND_XBOX => gsa_client_core::PadKind::Xbox,
+        GSA_PAD_KIND_DUALSHOCK4 => gsa_client_core::PadKind::DualShock4,
+        GSA_PAD_KIND_DUALSENSE => gsa_client_core::PadKind::DualSense,
+        GSA_PAD_KIND_SWITCH_PRO => gsa_client_core::PadKind::SwitchPro,
+        _ => gsa_client_core::PadKind::Generic,
+    }
+}
+
 /// Tell the host what controller occupies `seat`, before sending any state.
 ///
 /// **Announce first, and announce again on every reconnect.** A host plugs a
@@ -629,13 +688,7 @@ pub unsafe extern "C" fn gsa_announce_gamepad(
     // SAFETY: see `gsa_send_gamepad`.
     let session = unsafe { &*session };
     if let Some(input) = &session.input {
-        let kind = match kind {
-            GSA_PAD_KIND_XBOX => gsa_client_core::PadKind::Xbox,
-            GSA_PAD_KIND_DUALSHOCK4 => gsa_client_core::PadKind::DualShock4,
-            GSA_PAD_KIND_DUALSENSE => gsa_client_core::PadKind::DualSense,
-            GSA_PAD_KIND_SWITCH_PRO => gsa_client_core::PadKind::SwitchPro,
-            _ => gsa_client_core::PadKind::Generic,
-        };
+        let kind = pad_kind_from_flag(kind);
         let caps = gsa_client_core::PadCaps::from_bits(caps as u16);
         input.announce_pad(seat, gsa_client_core::GamepadProfile::new(kind, caps));
     }
