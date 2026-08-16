@@ -83,6 +83,7 @@ objc2-core-graphics = "0.3"
 objc2-video-toolbox = "0.3"
 objc2-io-surface = "0.3"
 objc2-game-controller = "0.3"
+objc2-core-haptics = "0.3"
 dispatch2 = "0.3"
 block2 = "0.6"
 

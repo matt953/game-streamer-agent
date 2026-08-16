@@ -9,6 +9,8 @@ mod decoder_vt;
 mod gamepad_capture;
 #[cfg(target_os = "macos")]
 mod gamepad_gc;
+#[cfg(target_os = "macos")]
+mod haptics;
 mod headless;
 mod input_capture;
 mod moonlight;

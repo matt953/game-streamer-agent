@@ -43,6 +43,11 @@ enum AppEvent {
     MotionRequested {
         rate_hz: u16,
     },
+    /// The host asked the pad to rumble; a zero pair is a stop.
+    Rumble {
+        low: u16,
+        high: u16,
+    },
     StreamEnded(String),
 }
 
@@ -355,6 +360,15 @@ fn moonlight_loop(
                 // with the pad we announced.
                 while let Ok(message) = stream.events.try_recv() {
                     tracing::info!(?message, "host control message");
+                    // The pad is owned by the event-loop thread, so anything
+                    // it has to play crosses over rather than being touched
+                    // from here.
+                    if let Some(gsa_client_core::BackendEvent::Feedback(
+                        gsa_client_core::GamepadFeedback::Rumble { low, high, .. },
+                    )) = message.neutral()
+                    {
+                        let _ = proxy.send_event(AppEvent::Rumble { low, high });
+                    }
                     // Motion is opt-in: sampling starts here and not before.
                     if let Some(gsa_client_core::BackendEvent::MotionRequested {
                         rate_hz, ..
@@ -757,6 +771,14 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
+            AppEvent::Rumble { low, high } => {
+                #[cfg(target_os = "macos")]
+                if let Some(pad) = &mut self.platform_pad {
+                    pad.rumble(low, high);
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = (low, high);
+            }
             AppEvent::MotionRequested { rate_hz } => {
                 tracing::info!(rate_hz, "host asked for motion");
                 self.motion_hz = rate_hz;

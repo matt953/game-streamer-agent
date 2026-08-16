@@ -60,6 +60,8 @@ pub struct GcCapture {
     logged_motion: bool,
     /// Polls spent waiting for the sensors to produce anything.
     motion_polls: u32,
+    /// The pad's motors, for playing what the host asks for.
+    motors: Option<crate::haptics::Rumble>,
 }
 
 impl std::fmt::Debug for GcCapture {
@@ -147,6 +149,7 @@ impl GcCapture {
                 touchpad = touchpad.is_some(),
                 "controller opened through the platform framework"
             );
+            let motors = crate::haptics::Rumble::new(&controller);
             Some(Self {
                 controller,
                 pad,
@@ -157,6 +160,7 @@ impl GcCapture {
                 touching: false,
                 last_battery: None,
                 logged_motion: false,
+                motors,
                 motion_polls: 0,
             })
         }
@@ -165,6 +169,15 @@ impl GcCapture {
     /// What to announce to the host before sending anything else.
     pub fn profile(&self) -> GamepadProfile {
         self.profile
+    }
+
+    /// Play the host's rumble amplitudes on the pad. A zero pair stops, and
+    /// must be honoured: the host ends an effect explicitly rather than giving
+    /// it a duration.
+    pub fn rumble(&mut self, low: u16, high: u16) {
+        if let Some(motors) = &mut self.motors {
+            motors.set(low, high);
+        }
     }
 
     /// How many controllers the framework can see, for reporting the ones

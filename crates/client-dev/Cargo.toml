@@ -40,7 +40,15 @@ objc2-video-toolbox = { workspace = true, features = ["VTDecompressionSession", 
 block2 = { workspace = true }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true, features = ["NSArray", "NSNotification", "NSString", "NSEnumerator"] }
+objc2-core-haptics = { workspace = true, features = [
+    "CHHapticEngine",
+    "CHHapticPattern",
+    "CHHapticEvent",
+    "CHHapticParameter",
+    "CHHapticPatternPlayer",
+] }
 objc2-game-controller = { workspace = true, features = [
+    "GCDeviceHaptics",
     "GCController",
     "GCExtendedGamepad",
     "GCControllerElement",
