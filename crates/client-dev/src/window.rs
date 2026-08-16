@@ -676,6 +676,9 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     latest: Option<Box<DecodedFrame>>,
+    /// Stream size the window has already been sized to, so a resize happens
+    /// once per geometry rather than on every frame.
+    fitted: Option<(u32, u32)>,
     input: Option<std::sync::Arc<dyn gsa_client_core::InputSink>>,
     /// Live quality controls, when the backend has any.
     knobs: Option<std::sync::Arc<dyn gsa_client_core::SessionKnobs>>,
@@ -712,6 +715,43 @@ struct App {
 impl App {
     /// Refresh the window title with the live target bitrate (a lightweight HUD,
     /// since there's no on-screen text renderer) plus any active toast text.
+    /// Size the window to the stream, once, so nothing is letterboxed.
+    ///
+    /// The renderer aspect-fits, so a window whose shape differs from the
+    /// stream's shows margins — which is most of the time now that the host is
+    /// asked for a client's own geometry. Matching the shape removes them, and
+    /// at a size the display can hold it is also a pixel-for-pixel view of
+    /// what the host sent, with no resampling in the way.
+    fn fit_window_to(&mut self, width: u32, height: u32) {
+        if self.fitted == Some((width, height)) {
+            return;
+        }
+        self.fitted = Some((width, height));
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        // Leave room for the menu bar and dock rather than filling the screen:
+        // a window larger than its display cannot be sized to fit at all.
+        let (limit_w, limit_h) = window.current_monitor().map_or((1920, 1080), |m| {
+            let size = m.size();
+            (size.width * 9 / 10, size.height * 9 / 10)
+        });
+        let scale = f64::from(limit_w) / f64::from(width);
+        let scale = scale.min(f64::from(limit_h) / f64::from(height)).min(1.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let wanted = winit::dpi::PhysicalSize::new(
+            (f64::from(width) * scale) as u32,
+            (f64::from(height) * scale) as u32,
+        );
+        tracing::info!(
+            stream = format!("{width}x{height}"),
+            window = format!("{}x{}", wanted.width, wanted.height),
+            "sizing the window to the stream"
+        );
+        let _ = window.request_inner_size(wanted);
+    }
+
     fn update_title(&self) {
         let Some(w) = &self.window else { return };
         let mbps = f64::from(self.bitrate_bps) / 1_000_000.0;
@@ -902,6 +942,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.update_title();
             }
             AppEvent::Frame(frame) => {
+                self.fit_window_to(frame.width, frame.height);
                 self.latest = Some(frame);
                 if let Some(w) = &self.window {
                     w.request_redraw();
