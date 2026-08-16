@@ -6,6 +6,7 @@ mod audio_playback;
 mod decoder;
 #[cfg(target_os = "macos")]
 mod decoder_vt;
+mod frame_dump;
 mod gamepad_capture;
 #[cfg(target_os = "macos")]
 mod gamepad_gc;
@@ -92,6 +93,15 @@ struct Cli {
     /// "the host will not send X *to this kind of pad*".
     #[arg(long, value_parser = ["auto", "xbox", "dualsense", "dualshock", "generic"])]
     moonlight_pad_kind: Option<String>,
+    /// Write the first decoded frame here as a BMP. A frame count proves the
+    /// decoder accepted the stream; only the pixels prove it decoded it.
+    #[arg(long)]
+    dump_frame: Option<std::path::PathBuf>,
+    /// Codecs to offer the host, richest first, instead of everything this
+    /// machine can decode. Names the negotiation directly, so a host's
+    /// support for one codec can be exercised without changing hardware.
+    #[arg(long, value_delimiter = ',', value_parser = ["av1", "hevc", "h264"])]
+    codecs: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -120,6 +130,8 @@ fn main() -> Result<()> {
             cli.moonlight_seconds,
             cli.moonlight_synthetic_pad,
             cli.moonlight_pad_kind.as_deref(),
+            cli.dump_frame.clone(),
+            &cli.codecs,
         );
     }
 

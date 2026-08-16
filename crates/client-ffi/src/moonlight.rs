@@ -113,6 +113,10 @@ pub(crate) struct MoonlightOpts {
     pub app_id: u32,
     pub bitrate_kbps: u32,
     pub mode: gsa_backend_moonlight::StreamMode,
+    /// What the embedder can decode, richest first. The apps decode H.264
+    /// only today, so asking for more would negotiate a stream they cannot
+    /// show.
+    pub decode_codecs: Vec<gsa_core::media::Codec>,
 }
 
 impl MoonlightOpts {
@@ -137,6 +141,7 @@ impl MoonlightOpts {
             self.app_id,
             self.mode,
             self.bitrate_kbps,
+            &self.decode_codecs,
         )
         .await?;
         Ok((session, stream))
@@ -204,7 +209,7 @@ pub(crate) fn run_session(
             presented: core.presented_sink(),
             decode_error: core.decode_error_flag(),
             dejitter: core.dejitter_flag(),
-            codec: crate::GSA_CODEC_H264,
+            codec: crate::codec_to_flag(stream.codec),
             pad_caps: u32::from(stream.pad_caps().bits()),
         });
 

@@ -62,15 +62,23 @@ async fn main() {
     );
 
     let mode = StreamMode::default();
-    let mut stream =
-        match gsa_backend_moonlight::start(&mut session, addr.ip(), app_id, mode, 20_000).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("could not start: {e}");
-                let _ = session.cancel().await;
-                return;
-            }
-        };
+    let mut stream = match gsa_backend_moonlight::start(
+        &mut session,
+        addr.ip(),
+        app_id,
+        mode,
+        20_000,
+        &[gsa_core::media::Codec::H264],
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start: {e}");
+            let _ = session.cancel().await;
+            return;
+        }
+    };
 
     let input = stream.input.clone();
     let mut core = StreamSession::with_capture_clock(

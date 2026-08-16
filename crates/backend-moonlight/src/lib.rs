@@ -17,6 +17,7 @@
 
 mod audio;
 mod backend;
+mod codec;
 mod control;
 mod enet;
 mod hex;
@@ -73,6 +74,9 @@ pub struct ServerInfo {
     pub state: String,
     /// Codec capability bitfield, unreliable until paired (see above).
     pub codec_mode_support: u32,
+    /// `MaxLumaPixelsHEVC`, zero when the host offers no HEVC. Hosts that
+    /// predate the bitfield announce HEVC only here.
+    pub max_luma_pixels_hevc: u64,
     /// App id the host is currently running, 0 when idle.
     pub current_game: u32,
 }
@@ -116,6 +120,9 @@ pub(crate) fn parse_server_info(body: &[u8]) -> Result<ServerInfo> {
         state: field("state").unwrap_or_default(),
         codec_mode_support: field("ServerCodecModeSupport")
             .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        max_luma_pixels_hevc: field("MaxLumaPixelsHEVC")
+            .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0),
         current_game: field("currentgame")
             .and_then(|s| s.trim().parse().ok())

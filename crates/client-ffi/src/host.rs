@@ -267,6 +267,9 @@ pub unsafe extern "C" fn gsa_host_session_start(
             bitrate_kbps
         },
         mode: gsa_backend_moonlight::StreamMode::default(),
+        // The apps decode H.264 only. Widening this without widening their
+        // decoders would negotiate a stream that arrives and never shows.
+        decode_codecs: vec![gsa_core::media::Codec::H264],
     };
 
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());

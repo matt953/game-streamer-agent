@@ -1,6 +1,15 @@
-//! VideoToolbox hardware H.264 decoder (macOS). Parses our Annex-B access
-//! units, builds a format description from in-band SPS/PPS, repacks to
-//! AVCC, and decodes to BGRA pixel buffers.
+//! VideoToolbox hardware decoder (macOS) for H.264 and HEVC. Parses Annex-B
+//! access units, builds a format description from the in-band parameter sets,
+//! repacks to length-prefixed samples, and decodes to BGRA pixel buffers.
+//!
+//! The two codecs differ in exactly two places, and both are easy to get
+//! subtly wrong:
+//!
+//! - **NAL type.** H.264 keeps it in the low 5 bits of a 1-byte header; HEVC
+//!   uses bits 1-6 of a 2-byte header. Reading an HEVC stream with H.264's
+//!   mask finds parameter sets that are not there.
+//! - **Parameter sets.** H.264 needs SPS and PPS; HEVC needs VPS as well, and
+//!   the format description will not build without all three.
 //!
 //! One CPU copy remains (decoded CVPixelBuffer → `DecodedFrame.rgba`) —
 //! true zero-copy IOSurface→wgpu texture interop is a later optimization;
@@ -19,28 +28,63 @@ use objc2_core_foundation::{
     kCFTypeDictionaryValueCallBacks,
 };
 use objc2_core_media::{
-    CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMTime,
+    CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMTime, CMVideoCodecType,
     CMVideoFormatDescriptionCreateFromH264ParameterSets,
+    CMVideoFormatDescriptionCreateFromHEVCParameterSets, kCMVideoCodecType_AV1,
+    kCMVideoCodecType_H264, kCMVideoCodecType_HEVC,
 };
 use objc2_core_video::{
     CVImageBuffer, CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
     CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
     CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelBufferPixelFormatTypeKey,
 };
-use objc2_video_toolbox::{VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionSession};
+use objc2_video_toolbox::{
+    VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionSession, VTIsHardwareDecodeSupported,
+};
 
 use gsa_client_core::{DecodedFrame, VideoDecoder};
+use gsa_core::media::Codec;
 use gsa_core::{Error, Result};
 
 /// BGRA FourCC for the decoder output ('BGRA').
 const PIXEL_FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 const CF_NUMBER_SINT32: CFNumberType = CFNumberType(3);
 
+/// Codecs this machine decodes in hardware, richest first.
+///
+/// H.264 is always included: every Mac VideoToolbox runs on decodes it, and a
+/// list without a floor would leave a session with nothing to negotiate.
+#[must_use]
+pub fn hardware_codecs() -> Vec<Codec> {
+    let supported = |codec: Codec| {
+        // SAFETY: a pure capability query on a codec constant.
+        unsafe { VTIsHardwareDecodeSupported(codec_type(codec)) }
+    };
+    let codecs: Vec<Codec> = [Codec::Av1, Codec::Hevc]
+        .into_iter()
+        .filter(|&c| supported(c))
+        .chain(std::iter::once(Codec::H264))
+        .collect();
+    tracing::info!(?codecs, "hardware decode support");
+    codecs
+}
+
+/// The VideoToolbox four-character code for a codec.
+fn codec_type(codec: Codec) -> CMVideoCodecType {
+    match codec {
+        Codec::Hevc => kCMVideoCodecType_HEVC,
+        Codec::Av1 => kCMVideoCodecType_AV1,
+        _ => kCMVideoCodecType_H264,
+    }
+}
+
 pub struct VideoToolboxDecoder {
+    codec: Codec,
     session: Option<CFRetained<VTDecompressionSession>>,
     format: Option<CFRetained<CMFormatDescription>>,
-    /// Last seen SPS/PPS bytes; session is rebuilt when they change.
-    param_sets: (Vec<u8>, Vec<u8>),
+    /// Last seen parameter sets, in the order the format description wants
+    /// them; the session is rebuilt when they change.
+    param_sets: Vec<Vec<u8>>,
 }
 
 impl std::fmt::Debug for VideoToolboxDecoder {
@@ -52,36 +96,55 @@ impl std::fmt::Debug for VideoToolboxDecoder {
 }
 
 impl VideoToolboxDecoder {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
+    /// A decoder for one codec. Fails rather than falling back: the caller
+    /// negotiated this codec with the host, so silently decoding something
+    /// else would produce a session that streams and shows nothing.
+    pub fn new(codec: Codec) -> Result<Self> {
+        // SAFETY: a pure capability query on a codec constant.
+        if !unsafe { VTIsHardwareDecodeSupported(codec_type(codec)) } {
+            return Err(Error::Decode(format!(
+                "no hardware decode for {codec:?} on this machine"
+            )));
+        }
+        Ok(Self {
+            codec,
             session: None,
             format: None,
-            param_sets: (Vec::new(), Vec::new()),
-        }
+            param_sets: Vec::new(),
+        })
     }
 
-    fn ensure_session(&mut self, sps: &[u8], pps: &[u8]) -> Result<()> {
-        if self.session.is_some() && self.param_sets.0 == sps && self.param_sets.1 == pps {
-            return Ok(());
+    fn ensure_session(&mut self, sets: &[&[u8]]) -> Result<()> {
+        if self.session.is_some() && self.param_sets.len() == sets.len() {
+            let unchanged = self.param_sets.iter().zip(sets).all(|(a, b)| a == b);
+            if unchanged {
+                return Ok(());
+            }
         }
-        // (Re)build format description + session.
-        let sps_ptr = NonNull::new(sps.as_ptr().cast_mut()).ok_or_else(err("sps empty"))?;
-        let pps_ptr = NonNull::new(pps.as_ptr().cast_mut()).ok_or_else(err("pps empty"))?;
-        let mut ptrs = [sps_ptr, pps_ptr];
-        let mut sizes = [sps.len(), pps.len()];
+        let mut ptrs: Vec<NonNull<u8>> = Vec::with_capacity(sets.len());
+        for set in sets {
+            ptrs.push(
+                NonNull::new(set.as_ptr().cast_mut()).ok_or_else(err("empty parameter set"))?,
+            );
+        }
+        let mut sizes: Vec<usize> = sets.iter().map(|s| s.len()).collect();
         let mut fmt_raw: *const CMFormatDescription = ptr::null();
-        // SAFETY: two valid parameter-set pointers + sizes; 4-byte NAL
-        // headers (matches our AVCC repack below); valid out-pointer.
+        // SAFETY: `sets.len()` valid parameter-set pointers and matching sizes,
+        // both alive for the call; 4-byte NAL length headers, matching the
+        // repack below; valid out-pointer.
         let status = unsafe {
-            CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                None,
-                2,
-                NonNull::from(&mut ptrs).cast(),
-                NonNull::from(&mut sizes).cast(),
-                4,
-                NonNull::from(&mut fmt_raw),
-            )
+            let count = sets.len();
+            let ptrs = NonNull::from(ptrs.as_mut_slice()).cast();
+            let sizes = NonNull::from(sizes.as_mut_slice()).cast();
+            let out = NonNull::from(&mut fmt_raw);
+            match self.codec {
+                Codec::Hevc => CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    None, count, ptrs, sizes, 4, None, out,
+                ),
+                _ => CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    None, count, ptrs, sizes, 4, out,
+                ),
+            }
         };
         if status != 0 || fmt_raw.is_null() {
             return Err(Error::Decode(format!(
@@ -113,15 +176,9 @@ impl VideoToolboxDecoder {
 
         self.session = Some(session);
         self.format = Some(format);
-        self.param_sets = (sps.to_vec(), pps.to_vec());
-        tracing::info!("VideoToolbox decoder session (re)created");
+        self.param_sets = sets.iter().map(|s| s.to_vec()).collect();
+        tracing::info!(codec = ?self.codec, "VideoToolbox decoder session (re)created");
         Ok(())
-    }
-}
-
-impl Default for VideoToolboxDecoder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -133,22 +190,24 @@ unsafe impl Send for VideoToolboxDecoder {}
 impl VideoDecoder for VideoToolboxDecoder {
     fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>> {
         let nals = split_annex_b(access_unit);
-        let mut sps: Option<&[u8]> = None;
-        let mut pps: Option<&[u8]> = None;
+        // Parameter sets are held in the order the format description expects:
+        // VPS, SPS, PPS for HEVC; SPS, PPS for H.264.
+        let mut sets: [Option<&[u8]>; 3] = [None; 3];
         let mut avcc = Vec::with_capacity(access_unit.len() + 16);
         for nal in &nals {
-            match nal.first().map(|b| b & 0x1f) {
-                Some(7) => sps = Some(nal),
-                Some(8) => pps = Some(nal),
-                Some(_) => {
+            match parameter_set_slot(self.codec, nal) {
+                Some(slot) => sets[slot] = Some(nal),
+                None if nal.is_empty() => {}
+                None => {
                     avcc.extend_from_slice(&(nal.len() as u32).to_be_bytes());
                     avcc.extend_from_slice(nal);
                 }
-                None => {}
             }
         }
-        if let (Some(sps), Some(pps)) = (sps, pps) {
-            self.ensure_session(sps, pps)?;
+        let wanted = if self.codec == Codec::Hevc { 3 } else { 2 };
+        let found: Vec<&[u8]> = sets.iter().skip(3 - wanted).flatten().copied().collect();
+        if found.len() == wanted {
+            self.ensure_session(&found)?;
         }
         let Some(session) = self.session.as_ref() else {
             return Ok(None); // waiting for the first IDR's parameter sets
@@ -194,6 +253,29 @@ impl VideoDecoder for VideoToolboxDecoder {
             Ok(frame) => Ok(frame),
             Err(_) => Ok(None),
         }
+    }
+}
+
+/// Which parameter-set slot a NAL belongs in, or `None` for picture data.
+///
+/// Slots are ordered as the format description wants them — VPS, SPS, PPS —
+/// with H.264 using the last two. The NAL type lives in different bits per
+/// codec: the low 5 of a 1-byte header for H.264, bits 1-6 of a 2-byte header
+/// for HEVC.
+fn parameter_set_slot(codec: Codec, nal: &[u8]) -> Option<usize> {
+    let first = *nal.first()?;
+    match codec {
+        Codec::Hevc => match (first >> 1) & 0x3f {
+            32 => Some(0), // VPS
+            33 => Some(1), // SPS
+            34 => Some(2), // PPS
+            _ => None,
+        },
+        _ => match first & 0x1f {
+            7 => Some(1), // SPS
+            8 => Some(2), // PPS
+            _ => None,
+        },
     }
 }
 
@@ -365,6 +447,38 @@ fn err(msg: &'static str) -> impl Fn() -> Error {
 
 #[cfg(test)]
 mod tests {
+    use super::parameter_set_slot;
+    use gsa_core::media::Codec;
+
+    /// The two codecs keep the NAL type in different bits, so each one's
+    /// parameter sets are invisible to the other's reading — silently, as
+    /// picture data. A stream then decodes nothing while looking well-formed.
+    #[test]
+    fn parameter_sets_are_found_by_the_right_codecs_rules() {
+        // H.264: type in the low 5 bits. SPS = 7, PPS = 8, IDR = 5.
+        assert_eq!(parameter_set_slot(Codec::H264, &[0x67]), Some(1));
+        assert_eq!(parameter_set_slot(Codec::H264, &[0x68]), Some(2));
+        assert_eq!(parameter_set_slot(Codec::H264, &[0x65]), None);
+
+        // HEVC: type in bits 1-6. VPS = 32, SPS = 33, PPS = 34, IDR = 19.
+        assert_eq!(parameter_set_slot(Codec::Hevc, &[32 << 1, 0x01]), Some(0));
+        assert_eq!(parameter_set_slot(Codec::Hevc, &[33 << 1, 0x01]), Some(1));
+        assert_eq!(parameter_set_slot(Codec::Hevc, &[34 << 1, 0x01]), Some(2));
+        assert_eq!(parameter_set_slot(Codec::Hevc, &[19 << 1, 0x01]), None);
+
+        // Each codec's sets read as picture data under the other's rules,
+        // which is why the decoder must be built for the negotiated codec.
+        assert_eq!(parameter_set_slot(Codec::H264, &[33 << 1, 0x01]), None);
+        assert_eq!(parameter_set_slot(Codec::Hevc, &[0x67]), None);
+    }
+
+    /// An empty NAL is not a parameter set and must not index a slot.
+    #[test]
+    fn an_empty_nal_is_not_a_parameter_set() {
+        assert_eq!(parameter_set_slot(Codec::H264, &[]), None);
+        assert_eq!(parameter_set_slot(Codec::Hevc, &[]), None);
+    }
+
     use super::*;
 
     #[test]

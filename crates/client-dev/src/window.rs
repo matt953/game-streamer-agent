@@ -242,7 +242,10 @@ pub fn run_moonlight(
     seconds: u64,
     synthetic_pad: bool,
     pad_kind: Option<&str>,
+    dump_frame: Option<std::path::PathBuf>,
+    codecs: &[String],
 ) -> Result<()> {
+    let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -251,11 +254,15 @@ pub fn run_moonlight(
         .spawn(move || {
             moonlight_loop(
                 addr,
-                app_id,
-                bitrate_mbps,
-                force_sw,
-                seconds,
-                synthetic_pad,
+                MoonlightRun {
+                    app_id,
+                    bitrate_mbps,
+                    force_sw,
+                    seconds,
+                    synthetic_pad,
+                    dump_frame,
+                    offered,
+                },
                 &proxy,
             )
         })?;
@@ -282,15 +289,30 @@ fn parse_pad_kind(name: &str) -> Option<gsa_client_core::PadKind> {
 }
 
 #[allow(clippy::too_many_arguments, reason = "dev harness flags, not an API")]
-fn moonlight_loop(
-    addr: std::net::SocketAddr,
+/// Which decoded frame `--dump-frame` writes.
+const DUMP_AT_FRAME: u64 = 120;
+
+/// What a Moonlight run needs that is not the host address.
+struct MoonlightRun {
     app_id: u32,
     bitrate_mbps: u32,
     force_sw: bool,
     seconds: u64,
     synthetic_pad: bool,
-    proxy: &EventLoopProxy<AppEvent>,
-) {
+    dump_frame: Option<std::path::PathBuf>,
+    offered: Vec<gsa_core::media::Codec>,
+}
+
+fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLoopProxy<AppEvent>) {
+    let MoonlightRun {
+        app_id,
+        bitrate_mbps,
+        force_sw,
+        seconds,
+        synthetic_pad,
+        dump_frame,
+        offered,
+    } = run;
     let outcome = (|| -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -305,6 +327,7 @@ fn moonlight_loop(
                 app_id,
                 gsa_backend_moonlight::StreamMode::default(),
                 bitrate_mbps.saturating_mul(1000),
+                &offered,
             )
             .await
             .context("start moonlight session")?;
@@ -343,7 +366,7 @@ fn moonlight_loop(
             // protocol work does not wait on hardware being awake.
             let _pad = synthetic_pad.then(|| spawn_synthetic_pad(stream.input.clone()));
 
-            let mut decoder = make_decoder(force_sw)?;
+            let mut decoder = make_decoder(force_sw, stream.codec)?;
             let mut frames = 0u64;
             let deadline = (seconds > 0)
                 .then(|| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
@@ -355,6 +378,15 @@ fn moonlight_loop(
                     break Ok(());
                 };
                 frames += 1;
+                // Not the first frame: a session often opens on a black
+                // desktop, which looks exactly like a decode producing
+                // nothing. By here the host has been sending for a while.
+                if frames == DUMP_AT_FRAME
+                    && let Some(path) = dump_frame.as_deref()
+                    && let Err(e) = crate::frame_dump::write_bmp(&out.frame, path)
+                {
+                    tracing::warn!(error = %e, "could not write the decoded frame");
+                }
                 // Drain the host's own messages. The channel is unbounded, and
                 // what arrives on it is the only record of what the host did
                 // with the pad we announced.
@@ -486,7 +518,8 @@ fn network_loop(
             // control stream, interleaved with frames.
             let mut control_rx = client.take_control_events();
 
-            let mut decoder = make_decoder(force_sw)?;
+            // The agent path negotiates its own codec; it offers H.264 today.
+            let mut decoder = make_decoder(force_sw, gsa_core::media::Codec::H264)?;
             let mut frames = 0u64;
             // Latest agent-reported telemetry (target/emit Mb/s, ABR state), for the log.
             let mut target_mbps: Option<f64> = None;

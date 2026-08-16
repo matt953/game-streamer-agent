@@ -61,15 +61,23 @@ async fn main() {
     );
 
     let mode = StreamMode::default();
-    let mut stream =
-        match gsa_backend_moonlight::start(&mut session, addr.ip(), app_id, mode, 10_000).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("could not start: {e}");
-                let _ = session.cancel().await;
-                return;
-            }
-        };
+    let mut stream = match gsa_backend_moonlight::start(
+        &mut session,
+        addr.ip(),
+        app_id,
+        mode,
+        10_000,
+        &[gsa_core::media::Codec::H264],
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start: {e}");
+            let _ = session.cancel().await;
+            return;
+        }
+    };
     eprintln!("streaming; driving the shared client core for {seconds}s");
 
     // Everything past this point is backend-agnostic.

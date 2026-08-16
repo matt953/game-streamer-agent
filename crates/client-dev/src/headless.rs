@@ -145,7 +145,7 @@ pub async fn run(
             }
         }
     } else {
-        let mut decoder = make_decoder(force_sw)?;
+        let mut decoder = make_decoder(force_sw, gsa_core::media::Codec::H264)?;
         while decoded < frames {
             let Some(out) = client.recv_frame(decoder.as_mut()).await? else {
                 bail!("connection closed after {decoded} frames");

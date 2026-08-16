@@ -4,19 +4,75 @@
 
 use anyhow::Context;
 use gsa_client_core::{DecodedFrame, VideoDecoder};
-use gsa_core::media::H264Profile;
+use gsa_core::media::{Codec, H264Profile};
 use gsa_core::{Error, Result};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 
-/// Pick the platform's best decoder (`force_sw` pins openh264).
-pub fn make_decoder(force_sw: bool) -> anyhow::Result<Box<dyn VideoDecoder>> {
+/// What this build can actually decode, richest first.
+///
+/// Asked of the platform rather than assumed: hardware AV1 decode needs an M3
+/// or newer, and offering a codec this machine cannot decode yields a session
+/// that negotiates, streams, and never shows a frame.
+#[must_use]
+pub fn decode_codecs(force_sw: bool) -> Vec<Codec> {
     #[cfg(target_os = "macos")]
     if !force_sw {
-        tracing::info!("using VideoToolbox hardware decoder");
-        return Ok(Box::new(crate::decoder_vt::VideoToolboxDecoder::new()));
+        return crate::decoder_vt::hardware_codecs();
     }
     let _ = force_sw;
+    // The software path is H.264 only.
+    vec![Codec::H264]
+}
+
+/// What to offer the host: `names` when given, otherwise everything this
+/// build can decode.
+///
+/// A name this machine cannot decode is dropped rather than offered — the
+/// point of naming codecs is to exercise the negotiation, not to negotiate a
+/// stream that cannot be shown. H.264 always remains as the floor.
+#[must_use]
+pub fn offered_codecs(names: &[String], force_sw: bool) -> Vec<Codec> {
+    let available = decode_codecs(force_sw);
+    if names.is_empty() {
+        return available;
+    }
+    let mut offered: Vec<Codec> = names
+        .iter()
+        .map(|name| match name.as_str() {
+            "av1" => Codec::Av1,
+            "hevc" => Codec::Hevc,
+            _ => Codec::H264,
+        })
+        .filter(|codec| {
+            let have = available.contains(codec);
+            if !have {
+                tracing::warn!(?codec, "asked for, but this machine cannot decode it");
+            }
+            have
+        })
+        .collect();
+    if !offered.contains(&Codec::H264) {
+        offered.push(Codec::H264);
+    }
+    offered
+}
+
+/// Pick a decoder for the codec the host agreed to send (`force_sw` pins
+/// openh264, which is H.264 only).
+pub fn make_decoder(force_sw: bool, codec: Codec) -> anyhow::Result<Box<dyn VideoDecoder>> {
+    #[cfg(target_os = "macos")]
+    if !force_sw {
+        tracing::info!(?codec, "using VideoToolbox hardware decoder");
+        return Ok(Box::new(crate::decoder_vt::VideoToolboxDecoder::new(
+            codec,
+        )?));
+    }
+    let _ = force_sw;
+    anyhow::ensure!(
+        codec == Codec::H264,
+        "software decoder cannot decode {codec:?}"
+    );
     tracing::info!("using openh264 software decoder");
     Ok(Box::new(OpenH264Decoder::new()?))
 }

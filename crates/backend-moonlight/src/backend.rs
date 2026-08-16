@@ -5,9 +5,11 @@
 //! backend-neutral: complete access units stamped at arrival, plus a sink for
 //! repair requests. The shared client core takes it from there.
 
+use crate::codec;
 use crate::host::{LaunchedSession, PairedSession, StreamMode};
 use crate::{Command, Crypto, Depacketizer, MediaSocket, Received, Rtsp, StreamRequest};
 use gsa_client_backend_api::{BackendFrame, InputSink, RecoverySink, SessionOrigin};
+use gsa_core::media::Codec;
 use gsa_core::{Error, Result};
 
 /// Asks the host to repair the reference chain, via the control channel.
@@ -168,6 +170,9 @@ pub struct MoonlightStream {
     datagrams: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Whether this started the app or rejoined one already running.
     pub origin: SessionOrigin,
+    /// The codec the host agreed to encode. The decoder must be built for
+    /// this, not for what was asked for: a host may answer with less.
+    pub codec: Codec,
     /// Decoded interleaved PCM, in the same shape every backend produces.
     pub audio: std::sync::mpsc::Receiver<Vec<i16>>,
     /// Host control-channel messages: rumble, termination, and features not
@@ -255,6 +260,7 @@ pub async fn start(
     app_id: u32,
     mode: StreamMode,
     bitrate_kbps: u32,
+    decode_codecs: &[Codec],
 ) -> Result<MoonlightStream> {
     // Upper bound on how long a healthy host takes to start sending; a slow
     // app launch is normal.
@@ -262,6 +268,24 @@ pub async fn start(
     // Seconds to wait before each attempt. A host that just lost a client
     // needs a variable moment before it will serve the next one.
     const SETTLE: [u64; 3] = [0, 2, 4];
+
+    // Read over mutual TLS: the cleartext probe understates what a host can
+    // encode, so negotiating from it would settle for H.264 against a host
+    // that offers better.
+    let (host_codecs, running) = match session.server_info().await {
+        Ok(info) => (
+            codec::HostCodecs {
+                modes: info.codec_mode_support,
+                max_luma_hevc: info.max_luma_pixels_hevc,
+            },
+            info.current_game,
+        ),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read host capabilities; assuming H.264 and idle");
+            (codec::HostCodecs::default(), 0)
+        }
+    };
+    let chosen = codec::choose(host_codecs, decode_codecs);
 
     for (attempt, settle) in SETTLE.iter().enumerate() {
         if *settle > 0 {
@@ -271,12 +295,12 @@ pub async fn start(
         // running: a session that failed to deliver reproduces the failure on
         // rejoin, so later attempts start a new one.
         let (launched, origin) = if attempt == 0 {
-            begin(session, app_id, mode).await?
+            begin(session, app_id, mode, running).await?
         } else {
             let _ = session.cancel().await;
             (session.launch(app_id, mode).await?, SessionOrigin::Launched)
         };
-        let mut stream = connect(&launched, host_ip, mode, bitrate_kbps).await?;
+        let mut stream = connect(&launched, host_ip, mode, bitrate_kbps, chosen).await?;
         stream.origin = origin;
         if stream.wait_for_media(FIRST_MEDIA_TIMEOUT).await {
             if attempt > 0 {
@@ -302,14 +326,8 @@ async fn begin(
     session: &PairedSession,
     app_id: u32,
     mode: StreamMode,
+    running: u32,
 ) -> Result<(LaunchedSession, SessionOrigin)> {
-    let running = match session.server_info().await {
-        Ok(info) => info.current_game,
-        Err(e) => {
-            tracing::debug!(error = %e, "could not read host state; assuming idle");
-            0
-        }
-    };
     if running == app_id {
         return Ok((session.resume(mode).await?, SessionOrigin::Rejoined));
     }
@@ -325,6 +343,7 @@ async fn connect(
     host_ip: std::net::IpAddr,
     mode: StreamMode,
     bitrate_kbps: u32,
+    codec: Codec,
 ) -> Result<MoonlightStream> {
     let mut rtsp = Rtsp::new(&launched.rtsp_url)?;
     let negotiated = rtsp
@@ -332,8 +351,7 @@ async fn connect(
             width: mode.width,
             height: mode.height,
             fps: mode.fps,
-            // H.264 until platform decode is wired for HEVC.
-            bitstream_format: 0,
+            bitstream_format: codec::bitstream_format(codec),
             bitrate_kbps,
             packet_size: 1392,
             channels: mode.channels,
@@ -418,6 +436,7 @@ async fn connect(
 
     Ok(MoonlightStream {
         frames: Some(frames_rx),
+        codec,
         events: event_rx,
         recovery: recovery.clone(),
         repairs: recovery,
