@@ -52,7 +52,7 @@ pub const GSA_PAD_ADAPTIVE_TRIGGERS: u32 = 1 << 5;
 pub const GSA_PAD_LED: u32 = 1 << 6;
 pub const GSA_PAD_BATTERY: u32 = 1 << 7;
 
-fn codecs_from_flags(flags: u32) -> Vec<Codec> {
+pub(crate) fn codecs_from_flags(flags: u32) -> Vec<Codec> {
     let mut codecs = Vec::new();
     if flags & GSA_CODEC_HEVC != 0 {
         codecs.push(Codec::Hevc);

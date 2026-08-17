@@ -227,6 +227,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
     target_id: u32,
     bitrate_kbps: u32,
     mode: crate::GsaStreamMode,
+    decode_codecs: u32,
     callbacks: crate::GsaCallbacks,
     err: *mut c_char,
     err_cap: usize,
@@ -277,9 +278,10 @@ pub unsafe extern "C" fn gsa_host_session_start(
                 ..Default::default()
             }
         },
-        // The apps decode H.264 only. Widening this without widening their
-        // decoders would negotiate a stream that arrives and never shows.
-        decode_codecs: vec![gsa_core::media::Codec::H264],
+        // What the embedder says it can decode, richest first. H.264 is added
+        // whatever is passed: a session with nothing to negotiate is worse
+        // than one that falls back.
+        decode_codecs: crate::codecs_from_flags(decode_codecs),
     };
 
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
