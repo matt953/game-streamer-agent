@@ -218,7 +218,8 @@ pub unsafe extern "C" fn gsa_catalog(
 /// session is streaming or has failed. Release with [`crate::gsa_session_stop`].
 ///
 /// # Safety
-/// `host` must be a valid NUL-terminated string for the call. The function
+/// `host` must be a valid NUL-terminated string for the call. `decode_codecs`
+/// must point to `decode_codecs_len` `GSA_CODEC_*` values, or be null. The function
 /// pointers and `ctx` in `callbacks` must stay valid until
 /// [`crate::gsa_session_stop`] returns.
 #[unsafe(no_mangle)]
@@ -227,7 +228,8 @@ pub unsafe extern "C" fn gsa_host_session_start(
     target_id: u32,
     bitrate_kbps: u32,
     mode: crate::GsaStreamMode,
-    decode_codecs: u32,
+    decode_codecs: *const u32,
+    decode_codecs_len: usize,
     callbacks: crate::GsaCallbacks,
     err: *mut c_char,
     err_cap: usize,
@@ -281,7 +283,8 @@ pub unsafe extern "C" fn gsa_host_session_start(
         // What the embedder says it can decode, richest first. H.264 is added
         // whatever is passed: a session with nothing to negotiate is worse
         // than one that falls back.
-        decode_codecs: crate::codecs_from_flags(decode_codecs),
+        // SAFETY: caller contract — `decode_codecs_len` values, or null.
+        decode_codecs: unsafe { crate::codecs_from_list(decode_codecs, decode_codecs_len) },
     };
 
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());

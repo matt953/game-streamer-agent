@@ -52,6 +52,36 @@ pub const GSA_PAD_ADAPTIVE_TRIGGERS: u32 = 1 << 5;
 pub const GSA_PAD_LED: u32 = 1 << 6;
 pub const GSA_PAD_BATTERY: u32 = 1 << 7;
 
+/// Read an embedder's ordered preference list.
+///
+/// Order is the preference — the backend takes the first entry its host also
+/// has — so a list, not a mask: a mask says only *which* are allowed, and the
+/// user's ordering would be lost. H.264 is appended whatever is passed, since
+/// a session with nothing to negotiate is worse than one that falls back.
+///
+/// # Safety
+/// `codecs` must point to `len` `GSA_CODEC_*` values, or be null with `len` 0.
+pub(crate) unsafe fn codecs_from_list(codecs: *const u32, len: usize) -> Vec<Codec> {
+    let mut out = Vec::with_capacity(len + 1);
+    if !codecs.is_null() {
+        // SAFETY: caller contract.
+        for flag in unsafe { std::slice::from_raw_parts(codecs, len) } {
+            let codec = match *flag {
+                GSA_CODEC_HEVC => Codec::Hevc,
+                GSA_CODEC_AV1 => Codec::Av1,
+                _ => Codec::H264,
+            };
+            if !out.contains(&codec) {
+                out.push(codec);
+            }
+        }
+    }
+    if !out.contains(&Codec::H264) {
+        out.push(Codec::H264);
+    }
+    out
+}
+
 pub(crate) fn codecs_from_flags(flags: u32) -> Vec<Codec> {
     let mut codecs = Vec::new();
     if flags & GSA_CODEC_HEVC != 0 {
