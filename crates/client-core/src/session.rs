@@ -14,6 +14,18 @@ use crate::decode::VideoDecoder;
 use crate::stats::{ClockSync, LatencyStats, StatsSummary};
 use crate::{EncodedFrame, FrameOutput, PresentedSink, stats};
 
+/// How far a frame's arrival sits from its capture stamp.
+///
+/// Not a latency: the two clocks differ by an unknown constant, so the value
+/// on its own means nothing. That constant is the same for every frame, so it
+/// cancels from any difference — which makes the *spread* of this quantity the
+/// jitter, and a target on it a capture-anchored release. Both are real under
+/// a stream clock, where latency is not.
+fn transit_drift_us(client_us: u64, capture_ts_us: u32) -> u32 {
+    #[allow(clippy::cast_possible_truncation)]
+    gsa_core::time::wire_ts_delta_us(client_us as u32, capture_ts_us)
+}
+
 /// Drives one running stream: gate, de-jitter, and health accounting.
 pub struct StreamSession {
     clock: MediaClock,
@@ -375,7 +387,7 @@ impl StreamSession {
     }
 
     /// Absorb delay variance by holding early frames to a capture-anchored
-    /// latency target (the window's p90), so the spread is spent waiting
+    /// target (the window's p90 transit), so the spread is spent waiting
     /// rather than stuttering.
     ///
     /// The target must be anchored to capture time and never to the previous
@@ -383,6 +395,17 @@ impl StreamSession {
     /// drifts, while a capture anchor forces the release rate to equal the
     /// capture rate. Late frames never wait, a backlog drains unpaced, and a
     /// clean link waits not at all.
+    ///
+    /// **The signal is transit drift, not latency.** `arrival - capture` is
+    /// offset by however far the two clocks differ, and under a stream clock
+    /// that offset is unknowable — but it is *constant*, so it cancels out of
+    /// every difference. The spread of the drift is therefore exactly the
+    /// jitter, and holding a frame to a drift target spaces releases by the
+    /// capture interval, which is what smooth motion is.
+    ///
+    /// Keying this to absolute latency instead is what made it dead code on
+    /// every stream-clock backend: the latency was always `None`, the window
+    /// never filled, and it returned before measuring anything.
     async fn dejitter_release(&mut self, capture_ts_us: u32, arrival_us: u64, backlog: bool) {
         const WIN: usize = 32;
         const JITTER_ON_US: u32 = 12_000;
@@ -395,12 +418,11 @@ impl StreamSession {
         const WARMUP_US: u64 = 2_000_000;
         let now = self.clock.now_us();
         self.first_gate_us.get_or_insert(now);
-        if let Some(lat) = self.clock_sync.frame_latency_us(arrival_us, capture_ts_us) {
-            if self.jitter_win.len() == WIN {
-                self.jitter_win.pop_front();
-            }
-            self.jitter_win.push_back(lat);
+        let drift = transit_drift_us(arrival_us, capture_ts_us);
+        if self.jitter_win.len() == WIN {
+            self.jitter_win.pop_front();
         }
+        self.jitter_win.push_back(drift);
         if self.jitter_win.len() < WIN / 2 {
             return;
         }
@@ -430,13 +452,57 @@ impl StreamSession {
         if !high {
             return;
         }
-        let Some(lat_now) = self.clock_sync.frame_latency_us(now, capture_ts_us) else {
-            return;
-        };
+        // How far through its transit budget this frame already is. Measured
+        // against `now` rather than `arrival_us` so time spent queued behind
+        // the gate counts against the wait rather than being added to it.
+        let drift_now = transit_drift_us(now, capture_ts_us);
         let target = p90.min(p10.saturating_add(DEJITTER_MAX_US));
-        if lat_now < target {
-            let wait = u64::from((target - lat_now).min(DEJITTER_MAX_US));
+        if drift_now < target {
+            let wait = u64::from((target - drift_now).min(DEJITTER_MAX_US));
             tokio::time::sleep(std::time::Duration::from_micros(wait)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod dejitter_signal_tests {
+    use super::transit_drift_us;
+
+    /// The whole reason this signal works under a stream clock: the offset
+    /// between the two clocks is unknown, but it is the *same* for every
+    /// frame, so it vanishes from any difference. If it did not, the jitter
+    /// figure would be an arbitrary constant and the de-jitter would hold
+    /// frames for a made-up length of time.
+    #[test]
+    fn an_unknown_clock_offset_cancels_out_of_the_spread() {
+        let captures: Vec<u32> = (0..8).map(|i| 1_000_000 + i * 33_333).collect();
+        let jitter = [0i64, 5_000, -3_000, 1_000, 4_000, -2_000, 0, 3_000];
+
+        let spread_for = |offset: i64| {
+            let drifts: Vec<u32> = captures
+                .iter()
+                .zip(jitter)
+                .map(|(&capture, wobble)| {
+                    let arrival = i64::from(capture) + offset + 20_000 + wobble;
+                    #[allow(clippy::cast_sign_loss)]
+                    transit_drift_us(arrival as u64, capture)
+                })
+                .collect();
+            drifts.iter().max().unwrap() - drifts.iter().min().unwrap()
+        };
+
+        let baseline = spread_for(0);
+        assert_eq!(baseline, 8_000, "5 ms early to 3 ms late");
+        assert_eq!(spread_for(500_000), baseline);
+        assert_eq!(spread_for(-250_000), baseline);
+    }
+
+    /// Stream timestamps wrap; a frame either side of the wrap must not read
+    /// as a four-thousand-second transit and freeze the pacing.
+    #[test]
+    fn the_drift_survives_a_timestamp_wrap() {
+        let capture = u32::MAX - 1_000;
+        let arrival = u64::from(u32::MAX) + 4_000;
+        assert_eq!(transit_drift_us(arrival, capture), 5_000);
     }
 }

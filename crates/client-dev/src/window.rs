@@ -534,7 +534,14 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         low1_fps = f64::from(present.low1_fps_x100) / 100.0,
                         freezes = present.freezes,
                         stutters = present.stutters,
+                        // Cadence breaks already present in the host's own
+                        // capture stamps: the source hitched, we only carried
+                        // it. Separates "fix the client" from "cannot".
+                        src_stutters = present.src_stutters,
                         latency_absolute = core.latency_is_absolute(),
+                        // The de-jitter's own signal. A flat zero means it has
+                        // never measured anything, not that the link is clean.
+                        dejitter_signal_us = core.jitter_us(),
                         dropped = stats.frames_dropped_incomplete,
                         recovered = stats.frames_recovered,
                         "moonlight stream stats"
