@@ -252,6 +252,7 @@ pub fn run_moonlight(
     mapping: DisplayMapping,
     present_mode: &str,
     jitter: Option<crate::netsim::Jitter>,
+    pacing: gsa_client_core::PacingMode,
     dejitter: bool,
     float_window: bool,
     chase_refresh: bool,
@@ -264,6 +265,21 @@ pub fn run_moonlight(
     tracing::info!(hdr, "HDR requested");
     let vsync = present_mode != "nosync";
     tracing::info!(vsync, "presentation mode");
+    // One mode asks the host for less than the display can show, so the two
+    // cadences cannot beat against each other. Applied before the launch, as
+    // the rate is fixed at negotiation.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let display_hz = display_refresh_hz().map(|hz| hz.round() as u32);
+    let limited = pacing.requested_fps(mode.fps, display_hz);
+    if limited != mode.fps {
+        tracing::info!(
+            asked = mode.fps,
+            using = limited,
+            display_hz,
+            "staying below the display's rate for this pacing mode"
+        );
+        mode.fps = limited;
+    }
     report_rate_match(mode.fps);
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -284,6 +300,7 @@ pub fn run_moonlight(
                     mode,
                     mapping,
                     jitter,
+                    pacing,
                     dejitter,
                 },
                 &proxy,
@@ -293,6 +310,7 @@ pub fn run_moonlight(
     let mut app = App {
         pad_kind_override: pad_kind.and_then(parse_pad_kind),
         vsync,
+        pacing,
         chase_refresh,
         window_level: if float_window {
             winit::window::WindowLevel::AlwaysOnTop
@@ -449,6 +467,8 @@ struct MoonlightRun {
     mapping: DisplayMapping,
     /// An imposed bad link, for exercising pacing on a LAN that has none.
     jitter: Option<crate::netsim::Jitter>,
+    /// The latency-for-smoothness trade this run makes.
+    pacing: gsa_client_core::PacingMode,
     /// Whether to smooth the imposed jitter — the control half of the A/B.
     dejitter: bool,
 }
@@ -465,6 +485,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
         mode,
         mapping,
         jitter,
+        pacing,
         dejitter,
     } = run;
     let outcome = (|| -> Result<()> {
@@ -507,6 +528,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 gsa_client_core::CaptureClock::StreamPts,
             );
 
+            core.set_pacing(pacing);
             core.dejitter_flag()
                 .store(dejitter, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(dejitter, "de-jitter");
@@ -618,6 +640,9 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         // whether the smoothing did anything.
                         jitter_in_us = core.jitter_us(),
                         jitter_out_us = core.released_jitter_us(),
+                        // The price of that smoothing, invisible downstream.
+                        mean_hold_us = core.mean_hold_us(),
+                        frame_interval_us = core.frame_interval_us(),
                         dejitter_duty = {
                             let (ran, skipped) = core.dejitter_duty();
                             format!("{ran} paced / {skipped} skipped")
@@ -805,6 +830,12 @@ struct App {
     presentation: crate::present::PresentLedger,
     /// Redraws that reached no display, because the window is hidden.
     occluded: u64,
+    /// The trade in force, which decides whether an unshown frame may be
+    /// discarded when a newer one arrives.
+    pacing: gsa_client_core::PacingMode,
+    /// Frames waiting to be shown, when the mode refuses to drop any. Stays
+    /// empty in every other mode, where only the newest is kept.
+    pending: std::collections::VecDeque<Box<DecodedFrame>>,
     /// Redraw on every refresh rather than only when a frame arrives. Shows
     /// repeats honestly, at the cost of looking like a max-rate client to a
     /// variable-refresh display.
@@ -1135,8 +1166,22 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Frame(frame) => {
                 self.fit_window_to(frame.width, frame.height);
-                // A frame replacing one that was never shown is decode work
-                // the user paid for and did not receive.
+                // The smoothest mode is the one that refuses to drop: a frame
+                // arriving while another is still unshown queues behind it
+                // rather than replacing it, and latency grows by exactly the
+                // depth of that queue. Every other mode discards, which is
+                // what keeps latency from creeping.
+                if !self.pacing.drops_unshown() && self.latest.is_some() && !self.latest_shown {
+                    // Bounded: an unbounded queue on a stalled display is a
+                    // memory leak, and beyond a second of frames the picture
+                    // is so far behind that dropping is the kinder failure.
+                    const MAX_PENDING: usize = 60;
+                    if self.pending.len() < MAX_PENDING
+                        && let Some(waiting) = self.latest.take()
+                    {
+                        self.pending.push_back(waiting);
+                    }
+                }
                 let displaced_unshown = self.latest.is_some() && !self.latest_shown;
                 self.presentation
                     .on_ready(displaced_unshown, std::time::Instant::now());
@@ -1215,6 +1260,16 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // A queued frame is older than `latest` and must be shown
+                // first, or "never drop a frame" would still show them out of
+                // order — which is worse than dropping.
+                if self.latest_shown
+                    && let Some(next) = self.pending.pop_front()
+                {
+                    self.latest = Some(next);
+                    self.latest_ready_at = Some(std::time::Instant::now());
+                    self.latest_shown = false;
+                }
                 if let (Some(gpu), Some(frame)) = (&mut self.gpu, &self.latest) {
                     self.content_rect = Some(gpu.content_rect(frame));
                     let toast = self.toast.as_ref().map(|t| (t.color(), t.slide()));
@@ -1267,7 +1322,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // then has no reason to slow down to match the content.
                     // Presenting only when a frame arrives is what lets it.
                     if self.vsync
-                        && self.chase_refresh
+                        && (self.chase_refresh || !self.pending.is_empty())
                         && let Some(w) = &self.window
                     {
                         w.request_redraw();

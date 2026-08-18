@@ -6,6 +6,7 @@
 
 mod audio;
 mod decode;
+pub mod pacing;
 mod reassembly;
 mod session;
 pub mod stats;
@@ -18,6 +19,7 @@ pub use gsa_client_backend_api::{
 };
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
 pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
+pub use pacing::PacingMode;
 pub use reassembly::Reassembler;
 pub use session::StreamSession;
 pub use stats::{ClockSync, LatencyStats, StatsSummary};

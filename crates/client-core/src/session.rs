@@ -71,6 +71,20 @@ pub struct StreamSession {
     /// taken after the hold, and it is the one that should shrink.
     released_jitter_us: u32,
     released_win: std::collections::VecDeque<u32>,
+    /// The latency-for-smoothness trade this session is making.
+    pacing: crate::PacingMode,
+    /// One frame at the stream's rate, in microseconds — the unit the hold cap
+    /// is expressed in. Learned from the capture stamps rather than assumed,
+    /// since the negotiated rate and the rate a host actually produces differ.
+    frame_interval_us: u32,
+    /// Previous capture stamp, for measuring the stream's frame interval.
+    last_capture_for_interval: Option<u32>,
+    /// Total time frames have been held back to smooth delivery, and how many
+    /// were held. The latency side of the trade: smoothness gained is
+    /// meaningless without the delay paid for it, and the hold happens before
+    /// decode so nothing downstream can see it.
+    hold_total_us: u64,
+    held_frames: u64,
     /// Frames the de-jitter declined to pace because something was queued.
     dejitter_skipped_backlog: u64,
     /// Frames it did pace.
@@ -147,6 +161,13 @@ impl StreamSession {
             last_jitter_us: 0,
             released_jitter_us: 0,
             released_win: std::collections::VecDeque::new(),
+            pacing: crate::PacingMode::default(),
+            // Until measured, assume 60 fps: it is the commonest rate and the
+            // figure is replaced within a second of frames arriving.
+            frame_interval_us: 16_667,
+            last_capture_for_interval: None,
+            hold_total_us: 0,
+            held_frames: 0,
             dejitter_skipped_backlog: 0,
             dejitter_ran: 0,
             dejitter_active: false,
@@ -190,6 +211,29 @@ impl StreamSession {
         self.released_jitter_us
     }
 
+    /// Learn the stream's own frame interval from consecutive capture stamps.
+    ///
+    /// The negotiated rate is what was asked for, not what arrives: a host
+    /// encodes on change, so a 60 fps request over 30 fps content delivers
+    /// every 33 ms. The hold cap is a number of frames, so it has to be the
+    /// real interval or the policy is not the one the mode names.
+    fn learn_frame_interval(&mut self, capture_ts_us: u32) {
+        let Some(previous) = self.last_capture_for_interval else {
+            self.last_capture_for_interval = Some(capture_ts_us);
+            return;
+        };
+        self.last_capture_for_interval = Some(capture_ts_us);
+        let gap = gsa_core::time::wire_ts_delta_us(capture_ts_us, previous);
+        // A gap outside this range is a stall or a stamp that wrapped oddly,
+        // not a cadence: 8 ms is 120 fps and 200 ms is 5 fps.
+        if !(8_000..=200_000).contains(&gap) {
+            return;
+        }
+        // Slow exponential average: the interval is a property of the stream,
+        // and a single late frame must not move the policy.
+        self.frame_interval_us = (self.frame_interval_us * 7 + gap) / 8;
+    }
+
     /// Fold a released frame into the output measure.
     fn note_release(&mut self, capture_ts_us: u32) {
         const WIN: usize = 64;
@@ -218,6 +262,42 @@ impl StreamSession {
         self.latency_is_absolute()
             .then(|| self.clock_sync.frame_latency_us(now_us, capture_ts_us))
             .flatten()
+    }
+
+    /// Choose the latency-for-smoothness trade. Takes effect on the next
+    /// frame; nothing is retained from the previous mode.
+    pub fn set_pacing(&mut self, mode: crate::PacingMode) {
+        self.pacing = mode;
+        tracing::info!(mode = mode.label(), "pacing mode");
+    }
+
+    /// The trade currently in force.
+    #[must_use]
+    pub fn pacing(&self) -> crate::PacingMode {
+        self.pacing
+    }
+
+    /// The stream's measured frame interval (µs), which the hold cap is a
+    /// multiple of.
+    #[must_use]
+    pub fn frame_interval_us(&self) -> u32 {
+        self.frame_interval_us
+    }
+
+    /// Mean microseconds a frame is held back, over the session.
+    ///
+    /// The price of smoothing, and the half of the trade that no downstream
+    /// measurement can see: the hold happens before decode, so a display-side
+    /// figure reports it as zero however long it was.
+    #[must_use]
+    pub fn mean_hold_us(&self) -> u32 {
+        if self.held_frames == 0 {
+            return 0;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (self.hold_total_us / self.held_frames) as u32
+        }
     }
 
     /// Shared de-jitter switch for the embedder (default enabled).
@@ -460,12 +540,19 @@ impl StreamSession {
         /// Disengage threshold, deliberately below `JITTER_ON_US`: the
         /// hysteresis stops a link hovering at the engage point from flapping.
         const JITTER_OFF_US: u32 = 8_000;
-        const DEJITTER_MAX_US: u32 = 33_000;
+        // The mode's own ceiling, in frame intervals. Was a flat 33 ms, which
+        // is two frames at 60 fps and eight at 240 — the same number meaning a
+        // different policy on every display.
+        let dejitter_max_us = self.pacing.hold_cap_us(self.frame_interval_us);
+        if !self.pacing.paces() {
+            return;
+        }
         /// Startup transients (clock sync settling, burst catch-up) must not
         /// be read as jitter.
         const WARMUP_US: u64 = 2_000_000;
         let now = self.clock.now_us();
         self.first_gate_us.get_or_insert(now);
+        self.learn_frame_interval(capture_ts_us);
         // Measured on this clock, not from `arrival_us`. Every stage stamps
         // with a `MediaClock` of its own, and each one starts its epoch when
         // it is built — so a drift window filled from the backend's stamps and
@@ -519,9 +606,11 @@ impl StreamSession {
         // against `now` rather than `arrival_us` so time spent queued behind
         // the gate counts against the wait rather than being added to it.
         let drift_now = transit_drift_us(now, capture_ts_us);
-        let target = p90.min(p10.saturating_add(DEJITTER_MAX_US));
+        let target = p90.min(p10.saturating_add(dejitter_max_us));
         if drift_now < target {
-            let wait = u64::from((target - drift_now).min(DEJITTER_MAX_US));
+            let wait = u64::from((target - drift_now).min(dejitter_max_us));
+            self.hold_total_us += wait;
+            self.held_frames += 1;
             tokio::time::sleep(std::time::Duration::from_micros(wait)).await;
         }
     }

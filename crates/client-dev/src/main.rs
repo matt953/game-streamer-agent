@@ -138,6 +138,14 @@ struct Cli {
     /// covered one silently measures nothing at all.
     #[arg(long)]
     no_float: bool,
+    /// The latency-for-smoothness trade, named as other clients name it:
+    /// `lowest-latency` shows each frame the moment it decodes; `balanced`
+    /// holds up to one frame to absorb jitter; `balanced-fps-limit` also stays
+    /// a frame below the display's rate; `smoothest` never drops a frame and
+    /// lets latency grow.
+    #[arg(long, default_value = "balanced",
+          value_parser = ["lowest-latency", "balanced", "balanced-fps-limit", "smoothest"])]
+    pacing: String,
     /// Turn the de-jitter off. Only useful next to `--jitter-ms`: it is the
     /// control half of the experiment, since a smoothing that cannot be
     /// switched off cannot be shown to have done anything.
@@ -190,6 +198,7 @@ fn main() -> Result<()> {
             decoder::DisplayMapping::new(cli.hdr_sdr_white_nits)?,
             &cli.present_mode,
             netsim::Jitter::new(cli.jitter_ms, cli.jitter_seed),
+            gsa_client_core::PacingMode::from_name(&cli.pacing).unwrap_or_default(),
             !cli.no_dejitter,
             !cli.no_float,
             cli.chase_refresh,
