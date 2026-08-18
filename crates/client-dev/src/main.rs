@@ -17,6 +17,7 @@ mod hdr_probe;
 mod headless;
 mod input_capture;
 mod moonlight;
+mod netsim;
 mod pairing;
 mod present;
 mod window;
@@ -118,6 +119,20 @@ struct Cli {
     /// decoder accepted the stream; only the pixels prove it decoded it.
     #[arg(long)]
     dump_frame: Option<std::path::PathBuf>,
+    /// Add up to this many milliseconds of delay to each frame, varying per
+    /// frame, before the pacing code sees it. A LAN is too clean to exercise
+    /// de-jitter at all, so this is how a Wi-Fi hop is reproduced on a desk.
+    #[arg(long, default_value_t = 0)]
+    jitter_ms: u32,
+    /// Seed for the jitter, so two runs impose the same link and an A/B
+    /// compares one change rather than two different experiments.
+    #[arg(long, default_value_t = 1)]
+    jitter_seed: u64,
+    /// Turn the de-jitter off. Only useful next to `--jitter-ms`: it is the
+    /// control half of the experiment, since a smoothing that cannot be
+    /// switched off cannot be shown to have done anything.
+    #[arg(long)]
+    no_dejitter: bool,
     /// How the window presents: `vsync` waits for the display's refresh, the
     /// way a phone or a TV does; `nosync` shows each frame the moment it is
     /// ready. Only `vsync` reproduces what a user's display actually does, so
@@ -164,6 +179,8 @@ fn main() -> Result<()> {
             cli.moonlight_hdr,
             decoder::DisplayMapping::new(cli.hdr_sdr_white_nits)?,
             &cli.present_mode,
+            netsim::Jitter::new(cli.jitter_ms, cli.jitter_seed),
+            !cli.no_dejitter,
         );
     }
 

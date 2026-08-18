@@ -251,6 +251,8 @@ pub fn run_moonlight(
     hdr: bool,
     mapping: DisplayMapping,
     present_mode: &str,
+    jitter: Option<crate::netsim::Jitter>,
+    dejitter: bool,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let mut mode = parse_mode(mode, host_mode_change)?;
@@ -278,6 +280,8 @@ pub fn run_moonlight(
                     offered,
                     mode,
                     mapping,
+                    jitter,
+                    dejitter,
                 },
                 &proxy,
             )
@@ -393,6 +397,10 @@ struct MoonlightRun {
     offered: Vec<gsa_core::media::Codec>,
     mode: gsa_backend_moonlight::StreamMode,
     mapping: DisplayMapping,
+    /// An imposed bad link, for exercising pacing on a LAN that has none.
+    jitter: Option<crate::netsim::Jitter>,
+    /// Whether to smooth the imposed jitter — the control half of the A/B.
+    dejitter: bool,
 }
 
 fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLoopProxy<AppEvent>) {
@@ -406,6 +414,8 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
         offered,
         mode,
         mapping,
+        jitter,
+        dejitter,
     } = run;
     let outcome = (|| -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -427,8 +437,16 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
             .context("start moonlight session")?;
 
             // Everything from here is the shared core.
+            let frames = stream.take_frames().context("frames already taken")?;
+            let frames = match jitter {
+                Some(jitter) => {
+                    tracing::info!("imposing extra delay on every frame (netsim)");
+                    crate::netsim::delayed(frames, jitter, gsa_core::time::MediaClock::new())
+                }
+                None => frames,
+            };
             let mut core = gsa_client_core::StreamSession::with_capture_clock(
-                stream.take_frames().context("frames already taken")?,
+                frames,
                 stream.recovery.clone(),
                 gsa_core::time::MediaClock::new(),
                 gsa_client_core::ClockSync::default(),
@@ -438,6 +456,10 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 // from them would be fiction; cadence and jitter are real.
                 gsa_client_core::CaptureClock::StreamPts,
             );
+
+            core.dejitter_flag()
+                .store(dejitter, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(dejitter, "de-jitter");
 
             // Play whatever audio arrives. The host may send none — that is a
             // host-side condition, not a client failure — so video continues
@@ -541,7 +563,11 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         latency_absolute = core.latency_is_absolute(),
                         // The de-jitter's own signal. A flat zero means it has
                         // never measured anything, not that the link is clean.
-                        dejitter_signal_us = core.jitter_us(),
+                        // In: the spread the link delivered. Out: the spread
+                        // after pacing. The pair is the only honest way to say
+                        // whether the smoothing did anything.
+                        jitter_in_us = core.jitter_us(),
+                        jitter_out_us = core.released_jitter_us(),
                         dropped = stats.frames_dropped_incomplete,
                         recovered = stats.frames_recovered,
                         "moonlight stream stats"
@@ -723,6 +749,8 @@ struct App {
     latest_ready_at: Option<std::time::Instant>,
     latest_shown: bool,
     presentation: crate::present::PresentLedger,
+    /// Redraws that reached no display, because the window is hidden.
+    occluded: u64,
     /// Stream size the window has already been sized to, so a resize happens
     /// once per geometry rather than on every frame.
     fitted: Option<(u32, u32)>,
@@ -808,8 +836,10 @@ impl App {
     /// whole point of the measurement.
     fn report_presentation(&mut self) {
         const EVERY: u64 = 120;
-        let shown = self.presentation.presented + self.presentation.repeats;
-        if shown == 0 || !shown.is_multiple_of(EVERY) {
+        // Counted on frames arriving rather than frames shown, so a covered
+        // window still reports the delivery cadence it can measure.
+        let seen = self.presentation.ready;
+        if seen == 0 || !seen.is_multiple_of(EVERY) {
             return;
         }
         let Some(s) = self.presentation.summary() else {
@@ -872,11 +902,17 @@ impl ApplicationHandler<AppEvent> for App {
                 .create_window(
                     Window::default_attributes()
                         .with_title("gsa client-dev")
+                        // Presentation can only be measured on a window that
+                        // is actually on a display: macOS stops compositing a
+                        // fully covered one, and the run then silently yields
+                        // no timing data at all.
+                        .with_active(true)
                         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0)),
                 )
                 .expect("create window"),
         );
         window.set_cursor_visible(false);
+        window.focus_window();
         let gpu = Gpu::new(window.clone(), self.vsync).expect("init wgpu");
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -1037,6 +1073,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.latest = Some(frame);
                 self.latest_ready_at = Some(std::time::Instant::now());
                 self.latest_shown = false;
+                self.report_presentation();
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -1102,9 +1139,27 @@ impl ApplicationHandler<AppEvent> for App {
                     // display's refresh is spent, so the clock is read after.
                     match gpu.render(frame, toast) {
                         // Nothing was shown — an occluded or timed-out
-                        // surface. Not a present, not a repeat.
-                        Ok(false) => {}
+                        // surface. Not a present, not a repeat, and worth
+                        // saying: a hidden window produces no presentation
+                        // data at all, and silence reads as "no problem".
+                        Ok(false) => {
+                            self.occluded = self.occluded.saturating_add(1);
+                            if self.occluded.is_multiple_of(600) {
+                                tracing::warn!(
+                                    skipped = self.occluded,
+                                    "the window is not visible, so nothing is reaching a display; \
+                                     presentation figures cannot be measured until it is raised"
+                                );
+                            }
+                        }
                         Ok(true) => {
+                            if self.occluded > 0 {
+                                tracing::info!(
+                                    skipped = self.occluded,
+                                    "the window is visible again; measuring from here"
+                                );
+                                self.occluded = 0;
+                            }
                             let now = std::time::Instant::now();
                             if self.latest_shown {
                                 // Redrawn with nothing new: the display asked

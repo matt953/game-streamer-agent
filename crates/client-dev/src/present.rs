@@ -99,11 +99,17 @@ impl PresentLedger {
         self.last_present = Some(at);
     }
 
-    /// A snapshot for reporting; `None` until enough presents to be worth
-    /// reading, since a percentile over three samples is noise.
+    /// A snapshot for reporting; `None` until enough samples to be worth
+    /// reading, since a percentile over three of them is noise.
+    ///
+    /// Gated on *arrival* samples, not presents: a window the compositor has
+    /// covered shows nothing and therefore presents nothing, but the frames
+    /// still arrive and their cadence is still the question pacing is about.
+    /// Requiring presents here made the harness useless whenever its window
+    /// was behind another.
     #[must_use]
     pub fn summary(&self) -> Option<PresentSummary> {
-        if self.intervals.len() < 30 {
+        if self.ready_intervals.len() < 30 {
             return None;
         }
         Some(PresentSummary {

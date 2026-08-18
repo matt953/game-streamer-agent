@@ -63,6 +63,14 @@ pub struct StreamSession {
     dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
     jitter_win: std::collections::VecDeque<u32>,
     last_jitter_us: u32,
+    /// Spread of transit drift as frames were *released* (µs), and its window.
+    ///
+    /// The output measure. `last_jitter_us` is the spread on arrival — the
+    /// smoother's input, which it cannot change — so judging the de-jitter by
+    /// that shows nothing however well it works. This is the same quantity
+    /// taken after the hold, and it is the one that should shrink.
+    released_jitter_us: u32,
+    released_win: std::collections::VecDeque<u32>,
     dejitter_active: bool,
     first_gate_us: Option<u64>,
 }
@@ -133,6 +141,8 @@ impl StreamSession {
             dejitter: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             jitter_win: std::collections::VecDeque::new(),
             last_jitter_us: 0,
+            released_jitter_us: 0,
+            released_win: std::collections::VecDeque::new(),
             dejitter_active: false,
             first_gate_us: None,
         }
@@ -158,6 +168,28 @@ impl StreamSession {
     #[must_use]
     pub fn jitter_us(&self) -> u32 {
         self.last_jitter_us
+    }
+
+    /// Spread of transit drift at release — what the de-jitter achieved, as
+    /// opposed to [`Self::jitter_us`], which is what it was given.
+    #[must_use]
+    pub fn released_jitter_us(&self) -> u32 {
+        self.released_jitter_us
+    }
+
+    /// Fold a released frame into the output measure.
+    fn note_release(&mut self, capture_ts_us: u32) {
+        const WIN: usize = 64;
+        let drift = transit_drift_us(self.clock.now_us(), capture_ts_us);
+        if self.released_win.len() == WIN {
+            self.released_win.pop_front();
+        }
+        self.released_win.push_back(drift);
+        if self.released_win.len() >= WIN / 2 {
+            let mut sorted: Vec<u32> = self.released_win.iter().copied().collect();
+            sorted.sort_unstable();
+            self.released_jitter_us = sorted[sorted.len() * 9 / 10] - sorted[sorted.len() / 10];
+        }
     }
 
     /// Whether glass-to-glass latency exists for this backend. False under
@@ -365,6 +397,9 @@ impl StreamSession {
         self.last_delivered_id = Some(f.frame_id);
         self.dejitter_release(f.capture_ts_us, arrival_us, backlog)
             .await;
+        // After the hold, not before: this is the measure of what the pacing
+        // achieved rather than what it was handed.
+        self.measure_release(f.capture_ts_us);
         Ok(Some(f))
     }
 
@@ -461,6 +496,11 @@ impl StreamSession {
             let wait = u64::from((target - drift_now).min(DEJITTER_MAX_US));
             tokio::time::sleep(std::time::Duration::from_micros(wait)).await;
         }
+    }
+
+    /// Record what the release actually achieved, held or not.
+    fn measure_release(&mut self, capture_ts_us: u32) {
+        self.note_release(capture_ts_us);
     }
 }
 
