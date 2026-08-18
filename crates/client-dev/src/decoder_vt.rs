@@ -336,6 +336,11 @@ impl VideoToolboxDecoder {
             full_range = ?colour.full_range,
             stream_bit_depth = ?colour.stream_bit_depth,
             signals_hdr = colour.signals_hdr(),
+            // Present only when the host is really driving an HDR display, so
+            // this says what brightness statistics cannot: whether the source
+            // has HDR at all, independently of what is on screen.
+            mastering_display = colour.mastering_display,
+            content_light_level = colour.content_light_level,
             "stream colour description"
         );
         self.output_format =
@@ -460,7 +465,7 @@ impl VideoToolboxDecoder {
     /// frame at all: a session opens on a black frame often enough that
     /// reporting from it would say "no precision" about a picture that has
     /// not arrived yet.
-    fn report_luma(&mut self, luma: crate::hdr_probe::LumaStats, clipped: u64) {
+    fn report_luma(&mut self, luma: &crate::hdr_probe::LumaStats, clipped: u64) {
         tracing::info!(
             min = luma.min,
             max = luma.max,
@@ -470,6 +475,43 @@ impl VideoToolboxDecoder {
             clipped_to_white = clipped,
             sdr_white_nits = self.mapping.sdr_white_nits,
             "decoded luma range"
+        );
+        self.report_brightness(luma);
+    }
+
+    /// Say how bright the picture actually is, in absolute nits.
+    ///
+    /// This is the last layer, and the only one that separates real HDR from
+    /// an SDR desktop wrapped in an HDR signal: PQ codes are absolute, so a
+    /// picture that never exceeds diffuse white has no HDR range in it no
+    /// matter how correctly it is tagged.
+    fn report_brightness(&self, luma: &crate::hdr_probe::LumaStats) {
+        let Some(transfer) = self.colour.transfer.as_deref() else {
+            return;
+        };
+        if !transfer.contains("2084") || luma.samples == 0 {
+            // Only PQ carries absolute levels. A relative curve has no nits to
+            // report, and inventing some would be the guess this exists to
+            // avoid.
+            return;
+        }
+        let full_range = self.output_format == crate::hdr_probe::PIXEL_FORMAT_420_10_FULL;
+        let (offset, span, _) = range_constants(full_range);
+        let nits = |code: u16| pq_eotf_nits(((f32::from(code) - offset) / span).clamp(0.0, 1.0));
+
+        // The code at which diffuse white sits, so "above it" means a
+        // highlight rather than ordinary picture content.
+        let reference_code = reference_white_code(self.mapping.sdr_white_nits, offset, span);
+        #[allow(clippy::cast_precision_loss)]
+        let above_reference = luma.count_above(reference_code) as f64 * 100.0 / luma.samples as f64;
+
+        tracing::info!(
+            peak_nits = format!("{:.0}", nits(luma.max)),
+            p99_nits = format!("{:.0}", nits(luma.percentile(0.99))),
+            median_nits = format!("{:.1}", nits(luma.percentile(0.50))),
+            above_reference_white_pct = format!("{above_reference:.2}"),
+            reference_white_nits = self.mapping.sdr_white_nits,
+            "decoded brightness"
         );
     }
 
@@ -526,7 +568,7 @@ impl VideoToolboxDecoder {
             }
             if !self.reported_luma && decoded.luma.max > decoded.luma.min {
                 self.reported_luma = true;
-                self.report_luma(decoded.luma, decoded.clipped);
+                self.report_luma(&decoded.luma, decoded.clipped);
             }
             return Ok(Some(decoded.frame));
         }
@@ -861,6 +903,22 @@ impl PqTables {
             self.encode[index]
         })
     }
+}
+
+/// The luma code that `nits` of diffuse white sits at, for this range.
+fn reference_white_code(nits: f32, offset: f32, span: f32) -> u16 {
+    // Invert the EOTF by search rather than by a second formula: one curve in
+    // the file means the two cannot drift apart.
+    let target = (0..=TEN_BIT_MAX)
+        .find(|code| {
+            #[allow(clippy::cast_precision_loss)]
+            let normalised = ((*code as f32) - offset) / span;
+            pq_eotf_nits(normalised.clamp(0.0, 1.0)) >= nits
+        })
+        .unwrap_or(TEN_BIT_MAX);
+    #[allow(clippy::cast_possible_truncation)]
+    let code = target as u16;
+    code
 }
 
 /// The PQ EOTF (SMPTE ST 2084), code value in [0,1] to absolute nits.
@@ -1417,6 +1475,45 @@ mod tests {
             ),
             Conversion::Sdr(_)
         ));
+    }
+
+    /// PQ codes are absolute, which is the whole reason brightness can be
+    /// reported at all — so the code diffuse white sits at must land where the
+    /// curve says, or every "above reference white" figure is meaningless.
+    #[test]
+    fn reference_white_lands_where_the_curve_puts_it() {
+        let (offset, span, _) = range_constants(false);
+        let code = reference_white_code(203.0, offset, span);
+        let nits = pq_eotf_nits(((f32::from(code) - offset) / span).clamp(0.0, 1.0));
+        assert!(
+            (nits - 203.0).abs() < 5.0,
+            "203 nits resolved to code {code}, which is {nits} nits"
+        );
+        // Brighter white must sit higher up the curve, never lower.
+        assert!(reference_white_code(400.0, offset, span) > code);
+        assert!(reference_white_code(100.0, offset, span) < code);
+    }
+
+    /// An SDR desktop wrapped in a PQ signal and a real HDR picture are told
+    /// apart by the distribution, not the tag — so the percentile has to be
+    /// read from the whole histogram rather than from the peak.
+    #[test]
+    fn percentiles_come_from_the_distribution_not_the_peak() {
+        let mut stats = crate::hdr_probe::LumaStats::default();
+        for _ in 0..990 {
+            stats.observe(500);
+        }
+        // A handful of specular highlights, and one stuck pixel at the top.
+        for _ in 0..9 {
+            stats.observe(800);
+        }
+        stats.observe(1023);
+
+        assert_eq!(stats.max, 1023, "the peak sees the outlier");
+        assert_eq!(stats.percentile(0.50), 500, "the bulk does not");
+        assert!(stats.percentile(0.99) <= 800, "nor does the 99th");
+        assert_eq!(stats.count_above(500), 10);
+        assert_eq!(stats.count_above(1023), 0);
     }
 
     #[test]

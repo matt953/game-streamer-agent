@@ -21,7 +21,9 @@
 use objc2_core_foundation::{CFData, CFDictionary, CFRetained, CFString, CFType};
 use objc2_core_media::{
     CMFormatDescription, kCMFormatDescriptionExtension_ColorPrimaries,
+    kCMFormatDescriptionExtension_ContentLightLevelInfo,
     kCMFormatDescriptionExtension_FullRangeVideo,
+    kCMFormatDescriptionExtension_MasteringDisplayColorVolume,
     kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
     kCMFormatDescriptionExtension_TransferFunction, kCMFormatDescriptionExtension_YCbCrMatrix,
 };
@@ -36,6 +38,16 @@ pub struct ColourReport {
     /// Bits per component the *bitstream* carries, from its configuration
     /// record. What arrived, before we choose what to ask the decoder for.
     pub stream_bit_depth: Option<u8>,
+    /// Whether the stream carries HDR static metadata: the mastering display's
+    /// colour volume, and the content light levels (MaxCLL/MaxFALL).
+    ///
+    /// The one reading here that does not depend on what is on screen. A host
+    /// emits these because it is genuinely driving an HDR display, so their
+    /// presence separates real HDR from a correctly-tagged SDR desktop in a
+    /// way that measuring brightness cannot — a dark HDR picture and a dark
+    /// SDR one look the same on every other measure.
+    pub mastering_display: bool,
+    pub content_light_level: bool,
     /// FourCC of the decoder's output format, e.g. `BGRA` or `x420`.
     pub pixel_format: Option<String>,
     /// Bits per component the output format carries.
@@ -83,7 +95,7 @@ impl ColourReport {
 ///
 /// A decoder can hand back a 10-bit buffer whose samples all came from 8 bits,
 /// and it looks identical to a real one until the values are counted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LumaStats {
     pub min: u16,
     pub max: u16,
@@ -91,6 +103,24 @@ pub struct LumaStats {
     /// shifted into 10 bits could not produce.
     pub off_grid: u64,
     pub samples: u64,
+    /// How many samples landed on each of the 1024 codes.
+    ///
+    /// Kept because the peak alone cannot tell a picture with real highlights
+    /// from one with a single stuck pixel, and because brightness only means
+    /// something as a distribution.
+    histogram: Box<[u32; 1024]>,
+}
+
+impl Default for LumaStats {
+    fn default() -> Self {
+        Self {
+            min: 0,
+            max: 0,
+            off_grid: 0,
+            samples: 0,
+            histogram: Box::new([0; 1024]),
+        }
+    }
 }
 
 impl LumaStats {
@@ -106,7 +136,37 @@ impl LumaStats {
         if !luma.is_multiple_of(4) {
             self.off_grid += 1;
         }
+        self.histogram[usize::from(luma).min(1023)] += 1;
         self.samples += 1;
+    }
+
+    /// The code at or below which `fraction` of samples fall.
+    #[must_use]
+    pub fn percentile(&self, fraction: f64) -> u16 {
+        if self.samples == 0 {
+            return 0;
+        }
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let target = (self.samples as f64 * fraction) as u64;
+        let mut seen = 0u64;
+        for (code, count) in self.histogram.iter().enumerate() {
+            seen += u64::from(*count);
+            if seen >= target {
+                #[allow(clippy::cast_possible_truncation)]
+                return code as u16;
+            }
+        }
+        self.max
+    }
+
+    /// How many samples sit above `code`.
+    #[must_use]
+    pub fn count_above(&self, code: u16) -> u64 {
+        self.histogram
+            .iter()
+            .skip(usize::from(code) + 1)
+            .map(|c| u64::from(*c))
+            .sum()
     }
 
     /// Whether the plane carries precision finer than 8 bits.
@@ -193,6 +253,14 @@ pub unsafe fn read_format(format: &CMFormatDescription) -> ColourReport {
             matrix: extension_string(format, kCMFormatDescriptionExtension_YCbCrMatrix),
             full_range: extension_bool(format, kCMFormatDescriptionExtension_FullRangeVideo),
             stream_bit_depth: stream_bit_depth(format),
+            mastering_display: has_extension(
+                format,
+                kCMFormatDescriptionExtension_MasteringDisplayColorVolume,
+            ),
+            content_light_level: has_extension(
+                format,
+                kCMFormatDescriptionExtension_ContentLightLevelInfo,
+            ),
             ..Default::default()
         }
     }
@@ -236,6 +304,15 @@ pub fn describe_pixel_format(fourcc: u32) -> (String, Option<u8>) {
         _ => None,
     };
     (name, bits)
+}
+
+/// Whether the format description carries `key` at all.
+///
+/// # Safety
+/// Live format description; `key` a static framework string.
+unsafe fn has_extension(format: &CMFormatDescription, key: &CFString) -> bool {
+    // SAFETY: caller contract.
+    unsafe { format.extension(key) }.is_some()
 }
 
 /// # Safety
