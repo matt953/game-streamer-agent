@@ -216,6 +216,10 @@ pub struct GsaStreamMode {
     /// that machine, and it is unnecessary on a host that can make a display
     /// for the session.
     pub allow_host_mode_change: u32,
+    /// Non-zero asks the host for HDR. A request, not a guarantee: a host
+    /// whose display cannot do HDR answers in SDR without saying so, so what
+    /// arrived is reported per session rather than assumed from this.
+    pub hdr: u32,
 }
 
 impl GsaStreamMode {

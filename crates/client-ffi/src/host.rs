@@ -277,6 +277,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
                 height,
                 fps,
                 allow_host_mode_change: mode.allow_host_mode_change != 0,
+                hdr: mode.hdr != 0,
                 ..Default::default()
             }
         },
