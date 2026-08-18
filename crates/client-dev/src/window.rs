@@ -616,6 +616,10 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         // whether the smoothing did anything.
                         jitter_in_us = core.jitter_us(),
                         jitter_out_us = core.released_jitter_us(),
+                        dejitter_duty = {
+                            let (ran, skipped) = core.dejitter_duty();
+                            format!("{ran} paced / {skipped} skipped")
+                        },
                         dropped = stats.frames_dropped_incomplete,
                         recovered = stats.frames_recovered,
                         "moonlight stream stats"

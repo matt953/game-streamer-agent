@@ -71,6 +71,10 @@ pub struct StreamSession {
     /// taken after the hold, and it is the one that should shrink.
     released_jitter_us: u32,
     released_win: std::collections::VecDeque<u32>,
+    /// Frames the de-jitter declined to pace because something was queued.
+    dejitter_skipped_backlog: u64,
+    /// Frames it did pace.
+    dejitter_ran: u64,
     dejitter_active: bool,
     first_gate_us: Option<u64>,
 }
@@ -143,6 +147,8 @@ impl StreamSession {
             last_jitter_us: 0,
             released_jitter_us: 0,
             released_win: std::collections::VecDeque::new(),
+            dejitter_skipped_backlog: 0,
+            dejitter_ran: 0,
             dejitter_active: false,
             first_gate_us: None,
         }
@@ -168,6 +174,13 @@ impl StreamSession {
     #[must_use]
     pub fn jitter_us(&self) -> u32 {
         self.last_jitter_us
+    }
+
+    /// How often the de-jitter paced a frame, against how often it stood down
+    /// because frames were already queued.
+    #[must_use]
+    pub fn dejitter_duty(&self) -> (u64, u64) {
+        (self.dejitter_ran, self.dejitter_skipped_backlog)
     }
 
     /// Spread of transit drift at release — what the de-jitter achieved, as
@@ -475,9 +488,17 @@ impl StreamSession {
         self.last_jitter_us = jitter;
         // Pacing is only sound with nothing else queued: holding a frame while
         // others wait builds a standing backlog that never drains.
+        //
+        // Counted because it decides whether the smoothing runs at all: a
+        // bursty source keeps something queued most of the time, and the
+        // de-jitter then stands down exactly when the link needs it.
+        if backlog {
+            self.dejitter_skipped_backlog = self.dejitter_skipped_backlog.saturating_add(1);
+        }
         if backlog || !self.dejitter.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        self.dejitter_ran = self.dejitter_ran.saturating_add(1);
         let age = now.saturating_sub(self.first_gate_us.unwrap_or(now));
         if age < WARMUP_US {
             return;
