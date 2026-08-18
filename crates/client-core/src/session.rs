@@ -453,7 +453,14 @@ impl StreamSession {
         const WARMUP_US: u64 = 2_000_000;
         let now = self.clock.now_us();
         self.first_gate_us.get_or_insert(now);
-        let drift = transit_drift_us(arrival_us, capture_ts_us);
+        // Measured on this clock, not from `arrival_us`. Every stage stamps
+        // with a `MediaClock` of its own, and each one starts its epoch when
+        // it is built — so a drift window filled from the backend's stamps and
+        // compared against a target on this clock is two different time bases
+        // subtracted from each other. The spread then reads as whatever the
+        // gap between the epochs happens to be.
+        let drift = transit_drift_us(now, capture_ts_us);
+        let _ = arrival_us;
         if self.jitter_win.len() == WIN {
             self.jitter_win.pop_front();
         }
