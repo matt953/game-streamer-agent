@@ -57,6 +57,7 @@ async fn main() {
     let mut rtsp = gsa_backend_moonlight::Rtsp::new(&launched.rtsp_url).expect("rtsp");
     let negotiated = rtsp
         .negotiate(gsa_backend_moonlight::StreamRequest {
+            hdr: false,
             width: mode.width,
             height: mode.height,
             fps: mode.fps,

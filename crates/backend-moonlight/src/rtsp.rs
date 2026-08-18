@@ -78,6 +78,13 @@ pub struct StreamRequest {
     pub fps: u32,
     /// 0 = H.264, 1 = HEVC, 2 = AV1.
     pub bitstream_format: u32,
+    /// Ask for high dynamic range.
+    ///
+    /// Separate from the `hdrMode` in the launch request, and both are
+    /// required: launching in HDR and then negotiating a standard-range
+    /// stream gets a standard-range stream, with nothing reporting a
+    /// contradiction.
+    pub hdr: bool,
     pub bitrate_kbps: u32,
     /// Video shard size; hosts use 1024 or 1392.
     pub packet_size: u32,
@@ -291,7 +298,7 @@ fn announce_sdp(host: &str, want: StreamRequest, host_sdp: &str) -> String {
          a=x-nv-video[0].maxNumReferenceFrames:1\r\n\
          a=x-nv-video[0].videoEncoderSlicesPerFrame:1\r\n\
          a=x-nv-video[0].encoderCscMode:0\r\n\
-         a=x-nv-video[0].dynamicRangeMode:0\r\n\
+         a=x-nv-video[0].dynamicRangeMode:{}\r\n\
          a=x-nv-vqos[0].bitStreamFormat:{}\r\n\
          a=x-nv-vqos[0].fec.enable:1\r\n\
          a=x-nv-vqos[0].fec.minRequiredFecPackets:2\r\n\
@@ -312,6 +319,7 @@ fn announce_sdp(host: &str, want: StreamRequest, host_sdp: &str) -> String {
         want.height,
         want.fps,
         want.packet_size,
+        u8::from(want.hdr),
         want.bitstream_format,
         want.bitrate_kbps,
         want.bitrate_kbps,
@@ -398,6 +406,7 @@ mod tests {
             height: 1080,
             fps: 60,
             bitstream_format: 1,
+            hdr: false,
             bitrate_kbps: 20_000,
             packet_size: 1392,
             channels: 2,

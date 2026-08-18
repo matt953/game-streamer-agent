@@ -367,6 +367,7 @@ async fn connect(
             height,
             fps: mode.fps,
             bitstream_format: codec::bitstream_format(codec),
+            hdr: mode.hdr,
             bitrate_kbps,
             packet_size: 1392,
             channels: mode.channels,

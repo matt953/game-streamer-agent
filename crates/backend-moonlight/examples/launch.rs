@@ -65,6 +65,7 @@ async fn main() {
             // which encryption it wants, so nothing here is assumed.
             let mut rtsp = gsa_backend_moonlight::Rtsp::new(&launched.rtsp_url).expect("rtsp url");
             let want = gsa_backend_moonlight::StreamRequest {
+                hdr: false,
                 width: mode.width,
                 height: mode.height,
                 fps: mode.fps,

@@ -92,6 +92,7 @@ async fn report(
     };
     let negotiated = match rtsp
         .negotiate(gsa_backend_moonlight::StreamRequest {
+            hdr: false,
             width: mode.width,
             height: mode.height,
             fps: mode.fps,
