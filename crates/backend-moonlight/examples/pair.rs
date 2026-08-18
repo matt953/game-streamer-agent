@@ -10,14 +10,21 @@
 
 use gsa_backend_moonlight::ClientIdentity;
 
-/// Where the dev identity lives. Real embedders keep this in the keychain.
+/// Where the dev credentials live. Real embedders keep these in the keychain.
+///
+/// Deliberately not the OS temp directory: macOS purges it, and a pairing that
+/// evaporates costs a PIN round-trip with the person who owns the host.
+fn credential_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("GSA_MOONLIGHT_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    let base = std::env::var_os("HOME").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    base.join(".local/share/gsa")
+}
+
 fn identity_path() -> std::path::PathBuf {
     std::env::var_os("GSA_MOONLIGHT_KEY").map_or_else(
-        || {
-            let mut p = std::env::temp_dir();
-            p.push("gsa-moonlight-dev-key.pem");
-            p
-        },
+        || credential_dir().join("moonlight-dev-key.pem"),
         std::path::PathBuf::from,
     )
 }
@@ -70,7 +77,10 @@ async fn main() {
                 .expect("probe");
             // Persist the host certificate: it is what pins every future
             // TLS connection to this exact machine.
-            let cert_path = std::env::temp_dir().join("gsa-moonlight-host-cert.pem");
+            let cert_path = credential_dir().join("moonlight-host-cert.pem");
+            if let Some(parent) = cert_path.parent() {
+                std::fs::create_dir_all(parent).expect("create credential dir");
+            }
             std::fs::write(&cert_path, &paired.host_cert_pem).expect("save host cert");
             println!("host certificate saved to {}", cert_path.display());
             let tls_addr = std::net::SocketAddr::new(addr.ip(), info.https_port);

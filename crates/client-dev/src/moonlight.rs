@@ -7,15 +7,23 @@
 use anyhow::{Context, Result};
 use gsa_backend_moonlight::{ClientIdentity, PairedSession};
 
+/// Where the dev credentials live, matching the backend's `pair` example.
+///
+/// Deliberately not the OS temp directory: macOS purges it, and losing the
+/// pairing costs a PIN round-trip with whoever owns the host.
 fn store(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(name)
+    if let Some(dir) = std::env::var_os("GSA_MOONLIGHT_DIR") {
+        return std::path::PathBuf::from(dir).join(name);
+    }
+    let base = std::env::var_os("HOME").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    base.join(".local/share/gsa").join(name)
 }
 
 /// Rebuild a paired session for `addr` from the stored dev credentials.
 pub(crate) async fn paired_session(addr: std::net::SocketAddr) -> Result<PairedSession> {
-    let key = std::fs::read_to_string(store("gsa-moonlight-dev-key.pem"))
+    let key = std::fs::read_to_string(store("moonlight-dev-key.pem"))
         .context("no stored Moonlight identity — pair first with the backend's `pair` example")?;
-    let host_cert = std::fs::read_to_string(store("gsa-moonlight-host-cert.pem"))
+    let host_cert = std::fs::read_to_string(store("moonlight-host-cert.pem"))
         .context("no stored host certificate — pair first")?;
     let identity = ClientIdentity::from_key_pem(&key).context("load Moonlight identity")?;
 

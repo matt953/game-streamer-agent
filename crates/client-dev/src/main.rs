@@ -18,6 +18,7 @@ mod headless;
 mod input_capture;
 mod moonlight;
 mod pairing;
+mod present;
 mod window;
 
 use anyhow::{Context, Result};
@@ -117,6 +118,12 @@ struct Cli {
     /// decoder accepted the stream; only the pixels prove it decoded it.
     #[arg(long)]
     dump_frame: Option<std::path::PathBuf>,
+    /// How the window presents: `vsync` waits for the display's refresh, the
+    /// way a phone or a TV does; `nosync` shows each frame the moment it is
+    /// ready. Only `vsync` reproduces what a user's display actually does, so
+    /// it is the one to judge pacing under.
+    #[arg(long, default_value = "vsync", value_parser = ["vsync", "nosync"])]
+    present_mode: String,
     /// Codecs to offer the host, richest first, instead of everything this
     /// machine can decode. Names the negotiation directly, so a host's
     /// support for one codec can be exercised without changing hardware.
@@ -156,6 +163,7 @@ fn main() -> Result<()> {
             cli.moonlight_host_mode_change,
             cli.moonlight_hdr,
             decoder::DisplayMapping::new(cli.hdr_sdr_white_nits)?,
+            &cli.present_mode,
         );
     }
 

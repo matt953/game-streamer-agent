@@ -250,6 +250,7 @@ pub fn run_moonlight(
     host_mode_change: bool,
     hdr: bool,
     mapping: DisplayMapping,
+    present_mode: &str,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let mut mode = parse_mode(mode, host_mode_change)?;
@@ -257,6 +258,8 @@ pub fn run_moonlight(
     // session, since a host may answer in SDR without saying so.
     mode.hdr = hdr;
     tracing::info!(hdr, "HDR requested");
+    let vsync = present_mode != "nosync";
+    tracing::info!(vsync, "presentation mode");
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -282,6 +285,7 @@ pub fn run_moonlight(
 
     let mut app = App {
         pad_kind_override: pad_kind.and_then(parse_pad_kind),
+        vsync,
         ..App::default()
     };
     event_loop.run_app(&mut app)?;
@@ -704,6 +708,14 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     latest: Option<Box<DecodedFrame>>,
+    /// Wait for the display's refresh, as a real device does. Off presents
+    /// immediately, which measures delivery but not what anyone would see.
+    vsync: bool,
+    /// When the frame in `latest` became ready, and whether it has reached the
+    /// screen — the two facts the display tax is computed from.
+    latest_ready_at: Option<std::time::Instant>,
+    latest_shown: bool,
+    presentation: crate::present::PresentLedger,
     /// Stream size the window has already been sized to, so a resize happens
     /// once per geometry rather than on every frame.
     fitted: Option<(u32, u32)>,
@@ -782,6 +794,38 @@ impl App {
         let _ = window.request_inner_size(wanted);
     }
 
+    /// Say what the display did, every couple of seconds.
+    ///
+    /// Reported from the event loop rather than the network thread, because
+    /// only this side knows when a frame reached the screen — which is the
+    /// whole point of the measurement.
+    fn report_presentation(&mut self) {
+        const EVERY: u64 = 120;
+        let shown = self.presentation.presented + self.presentation.repeats;
+        if shown == 0 || !shown.is_multiple_of(EVERY) {
+            return;
+        }
+        let Some(s) = self.presentation.summary() else {
+            return;
+        };
+        tracing::info!(
+            vsync = self.vsync,
+            display_p50_ms = format!("{:.2}", f64::from(s.interval_p50_us) / 1000.0),
+            frame_p50_ms = format!("{:.2}", f64::from(s.frame_p50_us) / 1000.0),
+            frame_p99_ms = format!("{:.2}", f64::from(s.frame_p99_us) / 1000.0),
+            frame_spread_ms = format!("{:.2}", f64::from(s.frame_spread_us) / 1000.0),
+            ready_p50_ms = format!("{:.2}", f64::from(s.ready_p50_us) / 1000.0),
+            ready_spread_ms = format!("{:.2}", f64::from(s.ready_spread_us) / 1000.0),
+            wait_p50_ms = format!("{:.2}", f64::from(s.wait_p50_us) / 1000.0),
+            wait_p99_ms = format!("{:.2}", f64::from(s.wait_p99_us) / 1000.0),
+            repeats_pct = format!("{:.1}", s.repeat_pct()),
+            unshown_pct = format!("{:.1}", s.superseded_pct()),
+            ready = s.ready,
+            presented = s.presented,
+            "presentation"
+        );
+    }
+
     fn update_title(&self) {
         let Some(w) = &self.window else { return };
         let mbps = f64::from(self.bitrate_bps) / 1_000_000.0;
@@ -826,7 +870,7 @@ impl ApplicationHandler<AppEvent> for App {
                 .expect("create window"),
         );
         window.set_cursor_visible(false);
-        let gpu = Gpu::new(window.clone()).expect("init wgpu");
+        let gpu = Gpu::new(window.clone(), self.vsync).expect("init wgpu");
         self.window = Some(window);
         self.gpu = Some(gpu);
         // Both are opened: the platform framework is the only source of
@@ -978,7 +1022,14 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Frame(frame) => {
                 self.fit_window_to(frame.width, frame.height);
+                // A frame replacing one that was never shown is decode work
+                // the user paid for and did not receive.
+                let displaced_unshown = self.latest.is_some() && !self.latest_shown;
+                self.presentation
+                    .on_ready(displaced_unshown, std::time::Instant::now());
                 self.latest = Some(frame);
+                self.latest_ready_at = Some(std::time::Instant::now());
+                self.latest_shown = false;
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -1039,8 +1090,37 @@ impl ApplicationHandler<AppEvent> for App {
                 if let (Some(gpu), Some(frame)) = (&mut self.gpu, &self.latest) {
                     self.content_rect = Some(gpu.content_rect(frame));
                     let toast = self.toast.as_ref().map(|t| (t.color(), t.slide()));
-                    if let Err(e) = gpu.render(frame, toast) {
-                        tracing::warn!(error = %e, "render failed");
+                    // `render` returns once the frame is handed to the
+                    // surface; under vsync that call is where the wait for the
+                    // display's refresh is spent, so the clock is read after.
+                    match gpu.render(frame, toast) {
+                        // Nothing was shown — an occluded or timed-out
+                        // surface. Not a present, not a repeat.
+                        Ok(false) => {}
+                        Ok(true) => {
+                            let now = std::time::Instant::now();
+                            if self.latest_shown {
+                                // Redrawn with nothing new: the display asked
+                                // for a frame and the stream had none.
+                                self.presentation.on_repeat(now);
+                            } else {
+                                let waited = self
+                                    .latest_ready_at
+                                    .map_or_else(Default::default, |ready| now - ready);
+                                self.presentation.on_present(waited, now);
+                                self.latest_shown = true;
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "render failed"),
+                    }
+                    self.report_presentation();
+                    // Under vsync the next refresh is the next chance to show
+                    // anything, so keep asking: a stream that stops arriving
+                    // must still be measured as repeats rather than silence.
+                    if self.vsync
+                        && let Some(w) = &self.window
+                    {
+                        w.request_redraw();
                     }
                 }
             }
@@ -1198,7 +1278,7 @@ struct FrameTexture {
 }
 
 impl Gpu {
-    fn new(window: Arc<Window>) -> Result<Self> {
+    fn new(window: Arc<Window>, vsync: bool) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window).context("create surface")?;
@@ -1214,7 +1294,14 @@ impl Gpu {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .context("surface unsupported")?;
-        config.present_mode = wgpu::PresentMode::AutoNoVsync; // newest-wins, no vsync queueing
+        // Vsync is what a phone, a TV and a monitor all do, so it is the only
+        // mode under which presentation timing means anything. The immediate
+        // mode is kept for measuring delivery in isolation.
+        config.present_mode = if vsync {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
         surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1420,7 +1507,10 @@ impl Gpu {
         ((sw - vw) / 2.0, (sh - vh) / 2.0, vw, vh)
     }
 
-    fn render(&mut self, frame: &DecodedFrame, toast: Option<([f32; 4], f32)>) -> Result<()> {
+    /// Draw `frame`, returning whether it actually reached the surface. An
+    /// occluded or timed-out surface presents nothing, and reporting that as a
+    /// present is how a hidden window comes to look like a 600 Hz display.
+    fn render(&mut self, frame: &DecodedFrame, toast: Option<([f32; 4], f32)>) -> Result<bool> {
         self.ensure_texture(frame.width, frame.height, frame.order);
 
         // A toast is showing: write its quad (full width, bottom, slid by `s`).
@@ -1463,6 +1553,7 @@ impl Gpu {
         );
 
         use wgpu::CurrentSurfaceTexture as Cst;
+        #[allow(clippy::items_after_statements)]
         let output = match self.surface.get_current_texture() {
             Cst::Success(o) | Cst::Suboptimal(o) => o,
             Cst::Outdated | Cst::Lost => {
@@ -1472,7 +1563,9 @@ impl Gpu {
                     other => return Err(anyhow::anyhow!("surface after reconfigure: {other:?}")),
                 }
             }
-            Cst::Timeout | Cst::Occluded => return Ok(()), // skip this frame
+            // Nothing reached the screen. Saying so matters: counting these
+            // as presents makes an occluded window look like a 600 Hz display.
+            Cst::Timeout | Cst::Occluded => return Ok(false),
             Cst::Validation => return Err(anyhow::anyhow!("surface validation error")),
         };
         let view = output.texture.create_view(&Default::default());
@@ -1513,7 +1606,7 @@ impl Gpu {
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(output);
-        Ok(())
+        Ok(true)
     }
 }
 
