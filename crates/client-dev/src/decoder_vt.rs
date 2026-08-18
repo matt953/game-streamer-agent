@@ -56,7 +56,7 @@ use objc2_video_toolbox::{
 };
 
 use crate::decoder::DisplayMapping;
-use gsa_client_core::{DecodedFrame, VideoDecoder};
+use gsa_client_core::{DecodedFrame, VideoDecoder, VideoFormat};
 use gsa_core::media::Codec;
 use gsa_core::{Error, Result};
 
@@ -378,6 +378,18 @@ impl VideoToolboxDecoder {
 unsafe impl Send for VideoToolboxDecoder {}
 
 impl VideoDecoder for VideoToolboxDecoder {
+    /// What came out, not what was asked for: the output format is the one
+    /// this decoder actually opened its session with, and the transfer is the
+    /// one read from the stream's own description.
+    fn video_format(&self) -> Option<VideoFormat> {
+        self.session.as_ref()?;
+        Some(VideoFormat {
+            bit_depth: crate::hdr_probe::describe_pixel_format(self.output_format).1,
+            transfer: self.colour.transfer.as_deref().map(short_transfer_name),
+            hdr: self.colour.signals_hdr(),
+        })
+    }
+
     fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>> {
         // AV1 is not Annex-B: no start codes, no parameter-set NALs, and the
         // sample is the temporal unit exactly as it arrived.
@@ -620,6 +632,22 @@ unsafe fn copy_bgra(pb: &CVPixelBuffer) -> Option<DecodedFrame> {
     // SAFETY: paired with the lock above.
     unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
     frame
+}
+
+/// A transfer function's short name, for somewhere with no room for
+/// `SMPTE_ST_2084_PQ`.
+fn short_transfer_name(name: &str) -> String {
+    if name.contains("2084") {
+        "PQ".to_string()
+    } else if name.contains("HLG") || name.contains("2100") {
+        "HLG".to_string()
+    } else if name.contains("709") {
+        "BT.709".to_string()
+    } else if name.contains("2020") {
+        "BT.2020".to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 /// AV1's colour codes are the ones ISO/IEC 23091-2 assigns, shared with HEVC

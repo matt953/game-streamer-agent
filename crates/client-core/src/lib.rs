@@ -10,7 +10,7 @@ mod reassembly;
 mod session;
 pub mod stats;
 
-pub use decode::{DecodedFrame, PixelOrder, VideoDecoder};
+pub use decode::{DecodedFrame, PixelOrder, VideoDecoder, VideoFormat};
 pub use gsa_client_backend_api::{
     ActiveSession, BackendEvent, BackendFrame, CaptureClock, CatalogEntry, CatalogKind,
     GamepadFeedback, GamepadProfile, InputSink, MotionSensor, PadCaps, PadKind, RecoverySink,

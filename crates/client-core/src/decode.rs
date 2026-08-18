@@ -30,9 +30,86 @@ pub struct DecodedFrame {
     pub order: PixelOrder,
 }
 
+/// What a decoder is really producing, for display alongside a stream.
+///
+/// Read from the decoder rather than from the request, because those are the
+/// two things that can disagree: a session can ask for HDR, be answered in
+/// HDR, and still be decoded into 8 bits with nothing reporting it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VideoFormat {
+    /// Bits per component the decoder handed back.
+    pub bit_depth: Option<u8>,
+    /// The transfer function the stream is carried with, named — `PQ` and
+    /// `HLG` are the HDR ones. A name rather than a verdict: what makes a
+    /// picture HDR is the curve, and saying which one is checkable.
+    pub transfer: Option<String>,
+    /// Whether the stream's own signalling describes HDR: a wide gamut *and*
+    /// an HDR curve. Says nothing about whether the content uses the range.
+    pub hdr: bool,
+}
+
+impl VideoFormat {
+    /// A short label for a stats overlay, e.g. `10-bit · HDR (PQ)`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let depth = self
+            .bit_depth
+            .map_or_else(|| "—".to_string(), |bits| format!("{bits}-bit"));
+        let range = match (self.hdr, self.transfer.as_deref()) {
+            (true, Some(curve)) => format!("HDR ({curve})"),
+            (true, None) => "HDR".to_string(),
+            (false, _) => "SDR".to_string(),
+        };
+        format!("{depth} · {range}")
+    }
+}
+
 /// An H.264 (M0) access-unit decoder.
 pub trait VideoDecoder: Send {
     /// Feed one complete access unit. `Ok(None)` = decoder buffering
     /// (parameter sets, reordering) — not an error.
     fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>>;
+
+    /// What this decoder is producing, once it has configured itself from a
+    /// keyframe. `None` before then, and for decoders that cannot say.
+    fn video_format(&self) -> Option<VideoFormat> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::VideoFormat;
+
+    /// The label names the curve rather than passing a verdict: a host can
+    /// send a real PQ signal over content with no HDR range in it, and
+    /// "HDR (PQ)" stays true where a bare "HDR" would read as a promise.
+    #[test]
+    fn the_label_names_the_curve_it_found() {
+        assert_eq!(
+            VideoFormat {
+                bit_depth: Some(10),
+                transfer: Some("PQ".into()),
+                hdr: true,
+            }
+            .label(),
+            "10-bit · HDR (PQ)"
+        );
+        assert_eq!(
+            VideoFormat {
+                bit_depth: Some(8),
+                transfer: Some("BT.709".into()),
+                hdr: false,
+            }
+            .label(),
+            "8-bit · SDR"
+        );
+    }
+
+    /// A decoder that cannot say must not be reported as 8-bit SDR: not
+    /// knowing and knowing it is narrow are different answers.
+    #[test]
+    fn an_unknown_depth_is_shown_as_unknown() {
+        assert_eq!(VideoFormat::default().label(), "— · SDR");
+    }
 }

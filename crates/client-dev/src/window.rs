@@ -36,6 +36,8 @@ enum AppEvent {
     Frame(Box<DecodedFrame>),
     /// Rolling received video goodput (Mb/s), for the title HUD.
     RecvMbps(Option<f64>),
+    /// What the decoder is actually producing, once it has configured itself.
+    VideoFormat(gsa_client_core::VideoFormat),
     /// Agent-pushed notification (e.g. host confirmed the virtual pad plugged).
     Notification(ControlEvent),
     /// The host asked for motion samples at this rate. Sampling starts here
@@ -456,6 +458,9 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
 
             let mut decoder = make_decoder(force_sw, stream.codec, mapping)?;
             let mut frames = 0u64;
+            // The decoder cannot answer until a keyframe has configured it,
+            // and can change answer if the stream reconfigures mid-session.
+            let mut reported_format: Option<gsa_client_core::VideoFormat> = None;
             let deadline = (seconds > 0)
                 .then(|| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
             let result = loop {
@@ -506,11 +511,21 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 // The display path is the source of presentation truth; without
                 // this the health stats would report every frame as unshown.
                 core.frame_presented(out.capture_ts_us);
+                if frames.is_multiple_of(30)
+                    && let Some(format) = decoder.video_format()
+                    && reported_format.as_ref() != Some(&format)
+                {
+                    reported_format = Some(format.clone());
+                    let _ = proxy.send_event(AppEvent::VideoFormat(format));
+                }
                 if frames.is_multiple_of(120) {
                     let present = core.present_stats();
                     let stats = core.stats();
                     tracing::info!(
                         frames,
+                        video = decoder
+                            .video_format()
+                            .map_or_else(|| "—".to_string(), |f| f.label()),
                         present_fps = f64::from(present.fps_x100) / 100.0,
                         low1_fps = f64::from(present.low1_fps_x100) / 100.0,
                         freezes = present.freezes,
@@ -723,6 +738,8 @@ struct App {
     emitted_mbps: Option<f64>,
     /// Whether server-side ABR is on (toggled with `\`).
     abr_on: bool,
+    /// Depth and range as the decoder reports them, for the title HUD.
+    video_format: Option<gsa_client_core::VideoFormat>,
 }
 
 impl App {
@@ -774,6 +791,11 @@ impl App {
         }
         if let Some(rx) = self.recv_mbps {
             title.push_str(&format!(" · rx {rx:.1} Mbps"));
+        }
+        // What arrived, not what was asked for: the two can differ, and this
+        // is the only place a session says which.
+        if let Some(format) = &self.video_format {
+            title.push_str(&format!(" · {}", format.label()));
         }
         title.push_str(if self.abr_on {
             " · ABR on"
@@ -963,6 +985,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::RecvMbps(mbps) => {
                 self.recv_mbps = mbps;
+                self.update_title();
+            }
+            AppEvent::VideoFormat(format) => {
+                self.video_format = Some(format);
                 self.update_title();
             }
             AppEvent::Notification(event) => {
