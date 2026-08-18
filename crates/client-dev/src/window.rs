@@ -253,6 +253,7 @@ pub fn run_moonlight(
     present_mode: &str,
     jitter: Option<crate::netsim::Jitter>,
     dejitter: bool,
+    float_window: bool,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let mut mode = parse_mode(mode, host_mode_change)?;
@@ -262,6 +263,7 @@ pub fn run_moonlight(
     tracing::info!(hdr, "HDR requested");
     let vsync = present_mode != "nosync";
     tracing::info!(vsync, "presentation mode");
+    report_rate_match(mode.fps);
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -290,10 +292,56 @@ pub fn run_moonlight(
     let mut app = App {
         pad_kind_override: pad_kind.and_then(parse_pad_kind),
         vsync,
+        window_level: if float_window {
+            winit::window::WindowLevel::AlwaysOnTop
+        } else {
+            winit::window::WindowLevel::Normal
+        },
         ..App::default()
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// The panel's own refresh rate, unrounded — what a rate match is judged
+/// against. `None` when the system will not say.
+fn display_refresh_hz() -> Option<f64> {
+    use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGMainDisplayID};
+    let rate = CGDisplayCopyDisplayMode(CGMainDisplayID()).map_or(0.0, |mode| {
+        objc2_core_graphics::CGDisplayMode::refresh_rate(Some(&mode))
+    });
+    // Built-in panels report zero rather than their real rate.
+    (rate >= 1.0).then_some(rate)
+}
+
+/// Say whether the stream's rate and the panel's can agree, and what a
+/// variable-rate display would be asked for if not.
+///
+/// Reported per session because it is a property of the pairing, not of the
+/// link: it holds on a perfect network and no amount of pacing removes it.
+fn report_rate_match(content_fps: u32) {
+    let Some(display_hz) = display_refresh_hz() else {
+        tracing::info!("the display will not report its refresh rate; rate match unknown");
+        return;
+    };
+    let m = crate::present::RateMatch::new(display_hz, f64::from(content_fps));
+    if m.fits() {
+        tracing::info!(
+            display_hz = format!("{display_hz:.2}"),
+            content_fps,
+            refreshes_per_frame = m.refreshes_per_frame,
+            "stream and display rates fit; no frame is ever held over"
+        );
+    } else {
+        tracing::warn!(
+            display_hz = format!("{display_hz:.2}"),
+            content_fps,
+            beat_period_s = m.beat_period_s.map(|s| format!("{s:.1}")),
+            would_fit_at_hz = format!("{:.2}", m.suggested_display_hz()),
+            "stream and display rates do not divide; a frame is held over on \
+             that period, which is judder no pacing can remove"
+        );
+    }
 }
 
 /// A pad family named on the command line, for announcing something other than
@@ -751,6 +799,9 @@ struct App {
     presentation: crate::present::PresentLedger,
     /// Redraws that reached no display, because the window is hidden.
     occluded: u64,
+    /// Where the window sits in the stack. On top by default: this is a
+    /// measuring instrument, and one that can be covered measures nothing.
+    window_level: winit::window::WindowLevel,
     /// Stream size the window has already been sized to, so a resize happens
     /// once per geometry rather than on every frame.
     fitted: Option<(u32, u32)>,
@@ -905,14 +956,23 @@ impl ApplicationHandler<AppEvent> for App {
                         // Presentation can only be measured on a window that
                         // is actually on a display: macOS stops compositing a
                         // fully covered one, and the run then silently yields
-                        // no timing data at all.
+                        // no timing data at all. Asking for focus is not
+                        // enough — a background process does not get to take
+                        // it — so the window sits above the others instead.
                         .with_active(true)
+                        .with_window_level(self.window_level)
                         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0)),
                 )
                 .expect("create window"),
         );
         window.set_cursor_visible(false);
+        window.set_window_level(self.window_level);
         window.focus_window();
+        tracing::info!(
+            level = ?self.window_level,
+            visible = ?window.is_visible(),
+            "window created"
+        );
         let gpu = Gpu::new(window.clone(), self.vsync).expect("init wgpu");
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -1073,6 +1133,20 @@ impl ApplicationHandler<AppEvent> for App {
                 self.latest = Some(frame);
                 self.latest_ready_at = Some(std::time::Instant::now());
                 self.latest_shown = false;
+                // Frames arriving but nothing ever drawn is a different fault
+                // from a covered window, and it is silent unless named: the
+                // compositor stops asking a window on a sleeping display to
+                // redraw at all, so neither branch of `render` is reached.
+                if self.presentation.ready.is_multiple_of(240)
+                    && self.presentation.presented == 0
+                    && self.occluded == 0
+                {
+                    tracing::warn!(
+                        frames = self.presentation.ready,
+                        "frames are decoding but the window has never been asked to redraw; \
+                         the display may be asleep or the window never opened"
+                    );
+                }
                 self.report_presentation();
                 if let Some(w) = &self.window {
                     w.request_redraw();

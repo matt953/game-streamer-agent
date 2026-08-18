@@ -128,6 +128,11 @@ struct Cli {
     /// compares one change rather than two different experiments.
     #[arg(long, default_value_t = 1)]
     jitter_seed: u64,
+    /// Let the window be covered by others. Off by default: presentation can
+    /// only be measured while the window is actually on a display, and a
+    /// covered one silently measures nothing at all.
+    #[arg(long)]
+    no_float: bool,
     /// Turn the de-jitter off. Only useful next to `--jitter-ms`: it is the
     /// control half of the experiment, since a smoothing that cannot be
     /// switched off cannot be shown to have done anything.
@@ -181,6 +186,7 @@ fn main() -> Result<()> {
             &cli.present_mode,
             netsim::Jitter::new(cli.jitter_ms, cli.jitter_seed),
             !cli.no_dejitter,
+            !cli.no_float,
         );
     }
 

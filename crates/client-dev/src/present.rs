@@ -299,3 +299,148 @@ mod tests {
         assert!(ledger.summary().is_none());
     }
 }
+
+/// Whether a content rate and a display rate can live together.
+///
+/// A display can only change image on its own refresh boundaries, so a frame
+/// occupies a whole number of them. When the rates divide evenly that number
+/// is constant and motion is smooth. When they do not, the phase drifts until
+/// a frame has to be held one refresh longer than its neighbours — and that
+/// hitch repeats forever, on a period set by how badly they disagree.
+///
+/// This is the decision VRR exists to remove: a display that can change its
+/// own rate to match the content never has to hold a frame over. The same
+/// arithmetic tells an app whether asking for a rate change is worth it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateMatch {
+    pub display_hz: f64,
+    pub content_fps: f64,
+    /// Refreshes each frame occupies, when the rates divide evenly.
+    pub refreshes_per_frame: Option<u32>,
+    /// Seconds between forced hitches when they do not. `None` when they fit.
+    pub beat_period_s: Option<f64>,
+}
+
+impl RateMatch {
+    /// Rates agree when a frame always occupies the same number of refreshes.
+    ///
+    /// The tolerance is not slack for its own sake: 59.94 against 60 is a real
+    /// pairing that beats once every ~17 seconds, and calling that "matched"
+    /// would hide the most common judder there is.
+    const TOLERANCE: f64 = 0.001;
+
+    #[must_use]
+    pub fn new(display_hz: f64, content_fps: f64) -> Self {
+        if display_hz <= 0.0 || content_fps <= 0.0 {
+            return Self {
+                display_hz,
+                content_fps,
+                refreshes_per_frame: None,
+                beat_period_s: None,
+            };
+        }
+        let ratio = display_hz / content_fps;
+        let nearest = ratio.round();
+        let drift = (ratio - nearest).abs();
+        // Fewer than one refresh per frame means the display cannot keep up at
+        // all; there is no whole number of refreshes to hold a frame for.
+        let fits = drift < Self::TOLERANCE && nearest >= 1.0;
+        Self {
+            display_hz,
+            content_fps,
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            refreshes_per_frame: fits.then_some(nearest as u32),
+            // Each frame slips `drift` of a refresh, so `1/drift` frames pass
+            // before a whole one has accumulated and must be held over.
+            beat_period_s: (!fits && drift > 0.0).then(|| 1.0 / drift / content_fps),
+        }
+    }
+
+    /// Whether the pairing needs no frame ever held over.
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        self.refreshes_per_frame.is_some()
+    }
+
+    /// A display rate that would fit, for a panel that can be asked.
+    ///
+    /// The content rate itself always fits, and a whole multiple of it fits
+    /// while giving the panel more chances to show a frame on time.
+    #[must_use]
+    pub fn suggested_display_hz(&self) -> f64 {
+        if self.fits() {
+            return self.display_hz;
+        }
+        let multiple = (self.display_hz / self.content_fps).round().max(1.0);
+        self.content_fps * multiple
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::RateMatch;
+
+    /// The everyday good case: 30 fps content on a 60 Hz panel holds every
+    /// frame for exactly two refreshes, forever.
+    #[test]
+    fn rates_that_divide_evenly_never_hold_a_frame_over() {
+        let m = RateMatch::new(60.0, 30.0);
+        assert!(m.fits());
+        assert_eq!(m.refreshes_per_frame, Some(2));
+        assert_eq!(m.beat_period_s, None);
+        assert!((m.suggested_display_hz() - 60.0).abs() < 0.001);
+
+        assert!(RateMatch::new(120.0, 60.0).fits());
+        assert!(RateMatch::new(60.0, 60.0).fits());
+        assert!(RateMatch::new(120.0, 30.0).fits());
+    }
+
+    /// The most common judder in the world, and the reason the tolerance is
+    /// tight: 59.94 fps on a 60 Hz panel looks matched to a rounder check and
+    /// hitches about every 17 seconds.
+    #[test]
+    fn the_ntsc_pairing_is_caught_rather_than_rounded_away() {
+        let m = RateMatch::new(60.0, 59.94);
+        assert!(!m.fits(), "59.94 does not divide 60");
+        let beat = m.beat_period_s.expect("a beat period");
+        assert!(
+            (16.0..18.0).contains(&beat),
+            "expected a hitch roughly every 17 s, got {beat:.1}"
+        );
+    }
+
+    /// A worse mismatch must beat more often, not less — otherwise the number
+    /// cannot be used to decide whether a rate change is worth asking for.
+    #[test]
+    fn a_worse_mismatch_hitches_more_often() {
+        let mild = RateMatch::new(60.0, 59.94).beat_period_s.expect("beat");
+        let bad = RateMatch::new(60.0, 50.0).beat_period_s.expect("beat");
+        assert!(
+            bad < mild,
+            "50 on 60 should hitch far more often than 59.94"
+        );
+    }
+
+    /// What to ask a panel for, when it can be asked.
+    #[test]
+    fn the_suggestion_is_a_rate_the_content_fits() {
+        // 50 fps on a 60 Hz panel: ask for 100, which fits at 2 refreshes.
+        let m = RateMatch::new(60.0, 50.0);
+        assert!(!m.fits());
+        let suggested = m.suggested_display_hz();
+        assert!(RateMatch::new(suggested, 50.0).fits());
+
+        // And 24 fps film, the other classic, on the same panel.
+        let film = RateMatch::new(60.0, 24.0);
+        assert!(!film.fits());
+        assert!(RateMatch::new(film.suggested_display_hz(), 24.0).fits());
+    }
+
+    /// Nonsense in must not produce confident nonsense out.
+    #[test]
+    fn a_rate_of_zero_claims_nothing() {
+        assert!(!RateMatch::new(0.0, 60.0).fits());
+        assert!(RateMatch::new(0.0, 60.0).beat_period_s.is_none());
+        assert!(!RateMatch::new(60.0, 0.0).fits());
+    }
+}
