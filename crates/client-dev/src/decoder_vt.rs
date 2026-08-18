@@ -24,15 +24,25 @@ use std::sync::{Arc, mpsc};
 
 use block2::RcBlock;
 use objc2_core_foundation::{
-    CFData, CFDictionary, CFNumber, CFNumberType, CFRetained, CFString,
-    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+    CFData, CFDictionary, CFNumber, CFNumberType, CFRetained, CFString, kCFBooleanFalse,
+    kCFBooleanTrue, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
 };
 use objc2_core_media::{
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMTime, CMVideoCodecType,
     CMVideoFormatDescriptionCreate, CMVideoFormatDescriptionCreateFromH264ParameterSets,
     CMVideoFormatDescriptionCreateFromHEVCParameterSets,
-    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, kCMVideoCodecType_AV1,
-    kCMVideoCodecType_H264, kCMVideoCodecType_HEVC,
+    kCMFormatDescriptionColorPrimaries_ITU_R_709_2, kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+    kCMFormatDescriptionColorPrimaries_SMPTE_C, kCMFormatDescriptionExtension_ColorPrimaries,
+    kCMFormatDescriptionExtension_FullRangeVideo,
+    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
+    kCMFormatDescriptionExtension_TransferFunction, kCMFormatDescriptionExtension_YCbCrMatrix,
+    kCMFormatDescriptionTransferFunction_ITU_R_709_2,
+    kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG,
+    kCMFormatDescriptionTransferFunction_SMPTE_240M_1995,
+    kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ,
+    kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4, kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2,
+    kCMFormatDescriptionYCbCrMatrix_ITU_R_2020, kCMFormatDescriptionYCbCrMatrix_SMPTE_240M_1995,
+    kCMVideoCodecType_AV1, kCMVideoCodecType_H264, kCMVideoCodecType_HEVC,
 };
 use objc2_core_video::{
     CVImageBuffer, CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
@@ -182,17 +192,57 @@ impl VideoToolboxDecoder {
             )
         }
         .ok_or_else(err("CFDictionaryCreate failed"))?;
-        // SAFETY: as above — a static framework key and a live dictionary.
+        // The colour description has to be attached by hand. `av1C` does not
+        // restate it and VideoToolbox does not read the sequence header, so a
+        // description built from the atom alone reports no colour at all — and
+        // a PQ stream then decodes as BT.709 with lifted blacks, silently.
+        // SAFETY: static framework keys, and values that outlive the call.
         let extensions = unsafe {
-            let key: *const CFString =
-                kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms;
-            let mut keys: [*const c_void; 1] = [key.cast()];
-            let mut values: [*const c_void; 1] = [CFRetained::as_ptr(&atoms).as_ptr().cast()];
+            let mut keys: Vec<*const c_void> = vec![
+                (kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as *const CFString)
+                    .cast::<c_void>(),
+            ];
+            let mut values: Vec<*const c_void> = vec![CFRetained::as_ptr(&atoms).as_ptr().cast()];
+
+            let colour: [(*const CFString, Option<&'static CFString>); 3] = [
+                (
+                    kCMFormatDescriptionExtension_ColorPrimaries,
+                    colour_primaries(header.color_primaries),
+                ),
+                (
+                    kCMFormatDescriptionExtension_TransferFunction,
+                    transfer_function(header.transfer_characteristics),
+                ),
+                (
+                    kCMFormatDescriptionExtension_YCbCrMatrix,
+                    ycbcr_matrix(header.matrix_coefficients),
+                ),
+            ];
+            for (key, value) in colour {
+                // An unspecified or unrecognised code is left off entirely:
+                // saying nothing is honest, saying BT.709 would be a guess
+                // that later code could not tell from a real reading.
+                if let Some(value) = value {
+                    keys.push(key.cast());
+                    values.push((value as *const CFString).cast());
+                }
+            }
+            let range = if header.full_range {
+                kCFBooleanTrue
+            } else {
+                kCFBooleanFalse
+            };
+            if let Some(range) = range {
+                keys.push((kCMFormatDescriptionExtension_FullRangeVideo as *const CFString).cast());
+                values.push((range as *const objc2_core_foundation::CFBoolean).cast());
+            }
+
+            let count = keys.len() as isize;
             CFDictionary::new(
                 None,
                 keys.as_mut_ptr(),
                 values.as_mut_ptr(),
-                1,
+                count,
                 &kCFTypeDictionaryKeyCallBacks,
                 &kCFTypeDictionaryValueCallBacks,
             )
@@ -572,6 +622,51 @@ unsafe fn copy_bgra(pb: &CVPixelBuffer) -> Option<DecodedFrame> {
     frame
 }
 
+/// AV1's colour codes are the ones ISO/IEC 23091-2 assigns, shared with HEVC
+/// and H.264 — so these mappings are the same ones VideoToolbox applies when
+/// it reads an HEVC bitstream itself. `None` means unspecified or unhandled,
+/// which is reported as unknown rather than guessed at.
+fn colour_primaries(code: u8) -> Option<&'static CFString> {
+    // SAFETY: statics from the framework, valid for the process.
+    unsafe {
+        match code {
+            1 => Some(kCMFormatDescriptionColorPrimaries_ITU_R_709_2),
+            // 170M and 240M share BT.601's primaries, which CoreMedia names
+            // after SMPTE C.
+            6 | 7 => Some(kCMFormatDescriptionColorPrimaries_SMPTE_C),
+            9 => Some(kCMFormatDescriptionColorPrimaries_ITU_R_2020),
+            _ => None,
+        }
+    }
+}
+
+fn transfer_function(code: u8) -> Option<&'static CFString> {
+    // SAFETY: as above.
+    unsafe {
+        match code {
+            // 170M carries the same curve as BT.709.
+            1 | 6 => Some(kCMFormatDescriptionTransferFunction_ITU_R_709_2),
+            7 => Some(kCMFormatDescriptionTransferFunction_SMPTE_240M_1995),
+            16 => Some(kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ),
+            18 => Some(kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG),
+            _ => None,
+        }
+    }
+}
+
+fn ycbcr_matrix(code: u8) -> Option<&'static CFString> {
+    // SAFETY: as above.
+    unsafe {
+        match code {
+            1 => Some(kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2),
+            6 => Some(kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4),
+            7 => Some(kCMFormatDescriptionYCbCrMatrix_SMPTE_240M_1995),
+            9 => Some(kCMFormatDescriptionYCbCrMatrix_ITU_R_2020),
+            _ => None,
+        }
+    }
+}
+
 /// Ten-bit samples sit in the top of each 16-bit word, six zero bits below.
 ///
 /// Measured, not assumed: reading them as if they were in the low bits gives
@@ -717,9 +812,13 @@ impl PqTables {
             luma + self.g_from_cb[cb] + self.g_from_cr[cr],
             luma + self.b_from_cb[cb],
         ];
+        // Bounded before the matrix, not after. Above display white there is
+        // nothing left to show, and carrying a value of 40 into a conversion
+        // whose green row subtracts a fraction of red drags green far negative
+        // — highlights come out magenta rather than merely clipped.
         let linear = coded.map(|v| {
             let index = (v * TEN_BIT_MAX as f32).clamp(0.0, TEN_BIT_MAX as f32) as usize;
-            self.eotf[index]
+            self.eotf[index].min(1.0)
         });
         // BT.2020 to BT.709 primaries, in linear light. Out-of-gamut results
         // are normal for saturated colour and clip on the way out.
@@ -1234,6 +1333,62 @@ mod tests {
                 [r, g, b]
             );
         }
+    }
+
+    /// The mapping is checked against what VideoToolbox itself reported for
+    /// the *same host's HEVC stream of the same desktop*, where the platform
+    /// read the bitstream rather than us: SDR came back SMPTE_C / 709 / 601_4
+    /// and HDR came back 2020 / PQ / 2020. AV1 carries the same ISO colour
+    /// codes, so the two codecs must describe that picture identically — if
+    /// they disagree, one of them is being decoded wrongly.
+    #[test]
+    fn av1_colour_codes_map_to_what_the_platform_reads_from_hevc() {
+        let name = |s: Option<&'static CFString>| s.map(std::string::ToString::to_string);
+
+        // Apollo's SDR AV1 header: 6 / 6 / 6.
+        assert_eq!(name(colour_primaries(6)).as_deref(), Some("SMPTE_C"));
+        assert_eq!(name(transfer_function(6)).as_deref(), Some("ITU_R_709_2"));
+        assert_eq!(name(ycbcr_matrix(6)).as_deref(), Some("ITU_R_601_4"));
+
+        // Apollo's HDR AV1 header: 9 / 16 / 9.
+        assert_eq!(name(colour_primaries(9)).as_deref(), Some("ITU_R_2020"));
+        assert_eq!(
+            name(transfer_function(16)).as_deref(),
+            Some("SMPTE_ST_2084_PQ")
+        );
+        assert_eq!(name(ycbcr_matrix(9)).as_deref(), Some("ITU_R_2020"));
+
+        // Unspecified (2) must stay unknown. Filling in BT.709 here would be a
+        // guess that nothing downstream could tell from a real reading.
+        assert_eq!(colour_primaries(2), None);
+        assert_eq!(transfer_function(2), None);
+        assert_eq!(ycbcr_matrix(2), None);
+    }
+
+    /// The whole point of carrying the codes: a PQ stream must reach the PQ
+    /// conversion. Reaching the SDR one is the silent failure.
+    #[test]
+    fn a_pq_description_selects_the_pq_conversion() {
+        let pq = crate::hdr_probe::ColourReport {
+            primaries: Some("ITU_R_2020".into()),
+            transfer: Some("SMPTE_ST_2084_PQ".into()),
+            matrix: Some("ITU_R_2020".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Conversion::build(&pq, false, DisplayMapping::default()),
+            Conversion::Pq(_)
+        ));
+
+        // And a stream that says nothing must not be treated as PQ.
+        assert!(matches!(
+            Conversion::build(
+                &crate::hdr_probe::ColourReport::default(),
+                false,
+                DisplayMapping::default()
+            ),
+            Conversion::Sdr(_)
+        ));
     }
 
     #[test]

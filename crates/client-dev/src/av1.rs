@@ -73,6 +73,16 @@ pub struct SequenceHeader {
     pub chroma_sample_position: u8,
     pub width: u32,
     pub height: u32,
+    /// The colour description, as the AV1 spec's numeric codes.
+    ///
+    /// Carried because nothing else will: `av1C` does not restate it, and
+    /// VideoToolbox does not read the sequence header, so a format description
+    /// built from `av1C` alone reports no colour at all. A PQ stream then
+    /// decodes as if it were BT.709 — no error, just lifted blacks.
+    pub color_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    pub full_range: bool,
 }
 
 /// Split a temporal unit into its OBUs, returning `(type, payload_with_header)`.
@@ -251,14 +261,16 @@ fn parse_sequence_header(payload: &[u8]) -> Option<SequenceHeader> {
     };
 
     let (subsampling_x, subsampling_y, chroma_sample_position);
+    let full_range;
     if monochrome {
-        let _color_range = r.flag()?;
+        full_range = r.flag()?;
         (subsampling_x, subsampling_y, chroma_sample_position) = (true, true, 0);
     } else if primaries == 1 && transfer == 13 && matrix == 0 {
-        // sRGB, which is 4:4:4 by definition.
+        // sRGB, which is 4:4:4 and full range by definition.
+        full_range = true;
         (subsampling_x, subsampling_y, chroma_sample_position) = (false, false, 0);
     } else {
-        let _color_range = r.flag()?;
+        full_range = r.flag()?;
         let (sx, sy) = match profile {
             0 => (true, true),
             1 => (false, false),
@@ -285,6 +297,10 @@ fn parse_sequence_header(payload: &[u8]) -> Option<SequenceHeader> {
         chroma_sample_position,
         width,
         height,
+        color_primaries: primaries as u8,
+        transfer_characteristics: transfer as u8,
+        matrix_coefficients: matrix as u8,
+        full_range,
     })
 }
 
@@ -417,6 +433,10 @@ mod tests {
             chroma_sample_position: 0,
             width: 1920,
             height: 1080,
+            color_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 1,
+            full_range: false,
         };
         let record = av1c(&header, &[0xAA, 0xBB]);
         assert_eq!(record[0], 0x81, "marker and version");
@@ -424,6 +444,46 @@ mod tests {
         assert_eq!(record[2], 0b0000_1100, "4:2:0, 8-bit, colour");
         assert_eq!(record[3], 0);
         assert_eq!(&record[4..], &[0xAA, 0xBB], "sequence header follows");
+    }
+
+    /// The colour description lives only in the sequence header: `av1C` does
+    /// not restate it and VideoToolbox does not read it, so if this parse is
+    /// wrong nothing else will contradict it — a PQ stream simply decodes as
+    /// BT.709 with lifted blacks.
+    ///
+    /// Both vectors captured from Apollo on 2026-08-18: the same host, the
+    /// same picture, asked for SDR and then for HDR.
+    #[test]
+    fn a_real_hosts_colour_description_is_read_from_the_header() {
+        let sdr = hex("0a0e0000004eabbfc370086641818189");
+        let parsed = sequence_header(&sdr).unwrap();
+        assert!(!parsed.high_bitdepth);
+        assert_eq!(parsed.color_primaries, 6, "SMPTE 170M");
+        assert_eq!(parsed.transfer_characteristics, 6, "SMPTE 170M");
+        assert_eq!(parsed.matrix_coefficients, 6, "BT.601");
+        assert!(!parsed.full_range);
+
+        let hdr = hex("0a0e0000004eabbfc370086742440249");
+        let parsed = sequence_header(&hdr).unwrap();
+        assert!(parsed.high_bitdepth, "10-bit");
+        assert!(!parsed.twelve_bit);
+        assert_eq!(parsed.color_primaries, 9, "BT.2020");
+        assert_eq!(parsed.transfer_characteristics, 16, "PQ (SMPTE ST 2084)");
+        assert_eq!(
+            parsed.matrix_coefficients, 9,
+            "BT.2020 non-constant luminance"
+        );
+        assert!(!parsed.full_range);
+        // Same picture either way; only the range changed.
+        assert_eq!((parsed.width, parsed.height), (1920, 1080));
+        assert_eq!(parsed.profile, 0);
+        assert!(parsed.subsampling_x && parsed.subsampling_y);
+    }
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len() / 2)
+            .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
