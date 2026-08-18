@@ -327,6 +327,28 @@ pub fn av1c(header: &SequenceHeader, sequence_header_obu: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The `metadata_type` of every OBU_METADATA in a temporal unit.
+///
+/// AV1 carries HDR static metadata in its own OBU rather than in an SEI, so
+/// this is the AV1 half of the same question.
+#[must_use]
+pub fn metadata_types(access_unit: &[u8]) -> Vec<u64> {
+    const OBU_METADATA: u8 = 5;
+    obus(access_unit)
+        .into_iter()
+        .filter(|(kind, _)| *kind == OBU_METADATA)
+        .filter_map(|(_, payload)| {
+            // Skip the OBU header and size field to reach metadata_type.
+            let first = *payload.first()?;
+            let mut at = 1 + usize::from(first & 0x04 != 0);
+            if first & 0x02 != 0 {
+                at += leb128(payload.get(at..)?)?.1;
+            }
+            Some(leb128(payload.get(at..)?)?.0)
+        })
+        .collect()
+}
+
 /// The sequence header OBU exactly as it appeared, for `av1C`.
 #[must_use]
 pub fn sequence_header_obu(access_unit: &[u8]) -> Option<Vec<u8>> {

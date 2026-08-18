@@ -108,6 +108,8 @@ pub struct VideoToolboxDecoder {
     reported_output: bool,
     /// Whether a frame carrying actual variation has been measured.
     reported_luma: bool,
+    /// Whether the wire has been checked for HDR static metadata.
+    reported_metadata: bool,
     session: Option<CFRetained<VTDecompressionSession>>,
     format: Option<CFRetained<CMFormatDescription>>,
     /// Last seen parameter sets, in the order the format description wants
@@ -142,6 +144,7 @@ impl VideoToolboxDecoder {
             conversion: None,
             reported_output: false,
             reported_luma: false,
+            reported_metadata: false,
             session: None,
             format: None,
             param_sets: Vec::new(),
@@ -400,6 +403,11 @@ impl VideoDecoder for VideoToolboxDecoder {
         // sample is the temporal unit exactly as it arrived.
         if self.codec == Codec::Av1 {
             self.ensure_av1_session(access_unit)?;
+            if !self.reported_metadata {
+                let found =
+                    crate::hdr_probe::av1_static_metadata(&crate::av1::metadata_types(access_unit));
+                self.report_static_metadata(found);
+            }
             return self.decode_sample(access_unit);
         }
 
@@ -418,6 +426,10 @@ impl VideoDecoder for VideoToolboxDecoder {
                 }
             }
         }
+        if !self.reported_metadata {
+            let found = crate::hdr_probe::hevc_static_metadata(&nals);
+            self.report_static_metadata(found);
+        }
         let wanted = if self.codec == Codec::Hevc { 3 } else { 2 };
         let found: Vec<&[u8]> = sets.iter().skip(3 - wanted).flatten().copied().collect();
         if found.len() == wanted {
@@ -434,6 +446,27 @@ impl VideoDecoder for VideoToolboxDecoder {
 }
 
 impl VideoToolboxDecoder {
+    /// Say whether the wire carries HDR static metadata.
+    ///
+    /// Read from the access units, not from the format description: these are
+    /// SEI messages (or, for AV1, metadata OBUs), and a description built from
+    /// parameter sets alone cannot see them. Reported once a keyframe has been
+    /// seen, since that is where a host puts them.
+    fn report_static_metadata(&mut self, found: crate::hdr_probe::StaticMetadata) {
+        // Keep looking until a keyframe actually carries some, or until the
+        // session ends having carried none — a P-frame saying nothing is not
+        // an answer.
+        if !found.any() && self.session.is_none() {
+            return;
+        }
+        self.reported_metadata = true;
+        tracing::info!(
+            mastering_display = found.mastering_display,
+            content_light_level = found.content_light_level,
+            "HDR static metadata on the wire"
+        );
+    }
+
     /// Say what the decoder is actually producing.
     ///
     /// The last place HDR can be lost, and the quietest: a stream tagged

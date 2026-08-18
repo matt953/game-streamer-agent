@@ -181,6 +181,134 @@ impl LumaStats {
     }
 }
 
+/// The HDR static metadata a stream can carry, as distinct from its colour
+/// tags.
+///
+/// Separate from [`ColourReport`] on purpose: the colour description says how
+/// to *interpret* the samples and lives in the parameter sets, while these say
+/// how bright the mastering display was and how bright the content gets. They
+/// travel as SEI messages inside the access units, so a format description
+/// built from parameter sets alone cannot see them — reading their absence
+/// there and calling it "the host sent none" is the mistake this exists to
+/// stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StaticMetadata {
+    /// SMPTE ST 2086 mastering display colour volume.
+    pub mastering_display: bool,
+    /// MaxCLL / MaxFALL content light level.
+    pub content_light_level: bool,
+}
+
+impl StaticMetadata {
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.mastering_display || self.content_light_level
+    }
+
+    fn note_payload_type(&mut self, payload_type: u32) {
+        match payload_type {
+            MASTERING_DISPLAY_COLOUR_VOLUME => self.mastering_display = true,
+            CONTENT_LIGHT_LEVEL_INFO => self.content_light_level = true,
+            _ => {}
+        }
+    }
+}
+
+/// SEI payload types (H.265 Table D.1), shared with H.264.
+const MASTERING_DISPLAY_COLOUR_VOLUME: u32 = 137;
+const CONTENT_LIGHT_LEVEL_INFO: u32 = 144;
+
+/// AV1 metadata OBU types (spec 6.7.1).
+const AV1_METADATA_HDR_CLL: u64 = 1;
+const AV1_METADATA_HDR_MDCV: u64 = 2;
+
+/// Which HDR static-metadata messages an HEVC access unit carries.
+///
+/// `nals` are payloads with start codes already stripped. Prefix SEI is NAL
+/// type 39 and suffix SEI is 40; both can carry these.
+#[must_use]
+pub fn hevc_static_metadata(nals: &[&[u8]]) -> StaticMetadata {
+    let mut found = StaticMetadata::default();
+    for nal in nals {
+        let Some(first) = nal.first() else { continue };
+        if !matches!((first >> 1) & 0x3f, 39 | 40) {
+            continue;
+        }
+        // Two-byte NAL header, then the SEI message list.
+        if nal.len() > 2 {
+            scan_sei_payloads(&strip_emulation_prevention(&nal[2..]), &mut found);
+        }
+    }
+    found
+}
+
+/// Which HDR static-metadata messages an AV1 temporal unit carries.
+#[must_use]
+pub fn av1_static_metadata(metadata_types: &[u64]) -> StaticMetadata {
+    let mut found = StaticMetadata::default();
+    for kind in metadata_types {
+        match *kind {
+            AV1_METADATA_HDR_MDCV => found.mastering_display = true,
+            AV1_METADATA_HDR_CLL => found.content_light_level = true,
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Walk an SEI message list, noting the payload types present.
+///
+/// Both the type and the size are coded as a run of 0xFF bytes plus a final
+/// byte, so a message can be skipped without understanding it.
+fn scan_sei_payloads(data: &[u8], found: &mut StaticMetadata) {
+    let mut at = 0;
+    let read_extended = |at: &mut usize| -> Option<u32> {
+        let mut value: u32 = 0;
+        loop {
+            let byte = *data.get(*at)?;
+            *at += 1;
+            value = value.checked_add(u32::from(byte))?;
+            if byte != 0xFF {
+                return Some(value);
+            }
+        }
+    };
+    loop {
+        let Some(payload_type) = read_extended(&mut at) else {
+            return;
+        };
+        let Some(payload_size) = read_extended(&mut at) else {
+            return;
+        };
+        found.note_payload_type(payload_type);
+        at += payload_size as usize;
+        // A trailing 0x80 marks the end of the list, and anything past the
+        // buffer means the unit was cut short.
+        if at >= data.len() {
+            return;
+        }
+    }
+}
+
+/// Undo emulation prevention (`00 00 03` → `00 00`) before reading a payload.
+fn strip_emulation_prevention(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut zeros = 0;
+    for &byte in data {
+        if zeros >= 2 && byte == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        if byte == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+        out.push(byte);
+    }
+    out
+}
+
 /// Bits per component a codec configuration record describes.
 ///
 /// The record is what the decoder itself was configured from, so it cannot
@@ -473,6 +601,83 @@ mod tests {
         assert_eq!(
             wanted_output_format(None, None),
             u32::from_be_bytes(*b"BGRA")
+        );
+    }
+
+    /// A "no metadata found" reading is only worth what the walk is worth:
+    /// if the payload list were mis-stepped, every stream would look bare.
+    #[test]
+    fn the_sei_walk_finds_the_hdr_messages_among_others() {
+        // Prefix SEI (NAL type 39), two-byte header, then three messages:
+        // a 4-byte type 1 (pic timing), mastering display (137), and
+        // content light level (144).
+        let nal = [
+            39 << 1,
+            0x01,
+            1,
+            4,
+            0xAA,
+            0xBB,
+            0xCC,
+            0xDD, // an unrelated message
+            137,
+            2,
+            0x11,
+            0x22, // mastering display
+            144,
+            4,
+            0x00,
+            0x10,
+            0x00,
+            0x20, // content light level
+            0x80, // trailing marker
+        ];
+        let found = hevc_static_metadata(&[&nal[..]]);
+        assert!(found.mastering_display);
+        assert!(found.content_light_level);
+        assert!(found.any());
+    }
+
+    /// The types are extended by runs of 0xFF, so a large type must not be
+    /// read as a small one — which would silently match the wrong message.
+    #[test]
+    fn extended_payload_types_are_accumulated() {
+        // Type 255 + 144 = 399, size 1. Not one of ours, and must not be
+        // mistaken for 144.
+        let nal = [39 << 1, 0x01, 0xFF, 144, 1, 0x00, 0x80];
+        assert!(!hevc_static_metadata(&[&nal[..]]).any());
+    }
+
+    /// Only SEI NALs carry these; a slice that happens to contain the same
+    /// bytes must not be read as metadata.
+    #[test]
+    fn a_picture_nal_is_not_scanned_for_sei() {
+        // NAL type 19 (IDR) whose payload bytes look like a 137 message.
+        let nal = [19 << 1, 0x01, 137, 2, 0x11, 0x22, 0x80];
+        assert!(!hevc_static_metadata(&[&nal[..]]).any());
+    }
+
+    /// AV1 puts the same two facts in metadata OBUs rather than SEI.
+    #[test]
+    fn av1_metadata_types_map_to_the_same_two_facts() {
+        assert!(av1_static_metadata(&[2]).mastering_display);
+        assert!(av1_static_metadata(&[1]).content_light_level);
+        assert!(!av1_static_metadata(&[3, 4]).any());
+        assert!(!av1_static_metadata(&[]).any());
+    }
+
+    /// Emulation prevention must be undone first, or a payload containing
+    /// `00 00 03` shifts every subsequent message.
+    #[test]
+    fn emulation_prevention_bytes_are_removed() {
+        assert_eq!(
+            strip_emulation_prevention(&[0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x03, 0x02]),
+            vec![0x00, 0x00, 0x01, 0x00, 0x00, 0x02]
+        );
+        // A 0x03 that is not preceded by two zeros is real data.
+        assert_eq!(
+            strip_emulation_prevention(&[0x01, 0x03, 0x00, 0x03]),
+            vec![0x01, 0x03, 0x00, 0x03]
         );
     }
 
