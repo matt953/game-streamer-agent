@@ -9,8 +9,16 @@
 
 use gsa_backend_moonlight::{ClientIdentity, PairedSession, StreamMode};
 
+/// Where the paired dev credentials live, shared with `pair` and the harness.
+///
+/// Deliberately not the OS temp directory: macOS purges it, and losing the
+/// pairing costs a PIN round-trip with whoever owns the host.
 fn store(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(name)
+    if let Some(dir) = std::env::var_os("GSA_MOONLIGHT_DIR") {
+        return std::path::PathBuf::from(dir).join(name);
+    }
+    let base = std::env::var_os("HOME").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    base.join(".local/share/gsa").join(name)
 }
 
 #[tokio::main]
@@ -25,11 +33,11 @@ async fn main() {
     let client_id = "0123456789ABCDEF";
 
     let identity = ClientIdentity::from_key_pem(
-        &std::fs::read_to_string(store("gsa-moonlight-dev-key.pem")).expect("paired identity"),
+        &std::fs::read_to_string(store("moonlight-dev-key.pem")).expect("paired identity"),
     )
     .expect("load identity");
     let host_cert =
-        std::fs::read_to_string(store("gsa-moonlight-host-cert.pem")).expect("host certificate");
+        std::fs::read_to_string(store("moonlight-host-cert.pem")).expect("host certificate");
 
     let info = gsa_backend_moonlight::probe(addr, client_id)
         .await

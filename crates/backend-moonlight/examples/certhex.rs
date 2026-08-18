@@ -4,7 +4,7 @@
 fn main() {
     let path = std::env::var("GSA_MOONLIGHT_KEY").unwrap_or_else(|_| {
         std::env::temp_dir()
-            .join("gsa-moonlight-dev-key.pem")
+            .join("moonlight-dev-key.pem")
             .display()
             .to_string()
     });
