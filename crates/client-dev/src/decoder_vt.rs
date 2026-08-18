@@ -131,7 +131,14 @@ impl VideoToolboxDecoder {
         if self.session.is_some() && self.param_sets.first().is_some_and(|s| *s == record) {
             return Ok(());
         }
-        tracing::info!(?header, "AV1 sequence header");
+        // The bytes as well as the reading: ports of this parser on other
+        // platforms are checked against a real host's header, not a synthetic
+        // one, and this is where a real one can be captured.
+        tracing::info!(
+            ?header,
+            obu = obu.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "AV1 sequence header"
+        );
 
         // `av1C` is passed the way the container formats carry it: a
         // sample-description atom keyed by its four-character name.
