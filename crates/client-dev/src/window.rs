@@ -246,9 +246,14 @@ pub fn run_moonlight(
     codecs: &[String],
     mode: &str,
     host_mode_change: bool,
+    hdr: bool,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
-    let mode = parse_mode(mode, host_mode_change)?;
+    let mut mode = parse_mode(mode, host_mode_change)?;
+    // A request, not a guarantee: what actually arrives is reported per
+    // session, since a host may answer in SDR without saying so.
+    mode.hdr = hdr;
+    tracing::info!(hdr, "HDR requested");
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 

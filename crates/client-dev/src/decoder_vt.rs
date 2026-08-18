@@ -81,6 +81,10 @@ fn codec_type(codec: Codec) -> CMVideoCodecType {
 
 pub struct VideoToolboxDecoder {
     codec: Codec,
+    /// What the stream said about colour, and what we ended up decoding to.
+    colour: crate::hdr_probe::ColourReport,
+    /// Whether the output format has been reported once.
+    reported_output: bool,
     session: Option<CFRetained<VTDecompressionSession>>,
     format: Option<CFRetained<CMFormatDescription>>,
     /// Last seen parameter sets, in the order the format description wants
@@ -109,6 +113,8 @@ impl VideoToolboxDecoder {
         }
         Ok(Self {
             codec,
+            colour: crate::hdr_probe::ColourReport::default(),
+            reported_output: false,
             session: None,
             format: None,
             param_sets: Vec::new(),
@@ -266,6 +272,21 @@ impl VideoToolboxDecoder {
             .map(|p| unsafe { CFRetained::from_raw(p) })
             .ok_or_else(|| Error::Decode(format!("VTDecompressionSessionCreate: {status}")))?;
 
+        // What the platform read out of the bitstream, before anything of
+        // ours has had a chance to throw it away.
+        // SAFETY: the format description was just built and is live.
+        let colour = unsafe { crate::hdr_probe::read_format(&format) };
+        tracing::info!(
+            codec = ?self.codec,
+            primaries = ?colour.primaries,
+            transfer = ?colour.transfer,
+            matrix = ?colour.matrix,
+            full_range = ?colour.full_range,
+            signals_hdr = colour.signals_hdr(),
+            "stream colour description"
+        );
+        self.colour = colour;
+
         self.session = Some(session);
         self.format = Some(format);
         tracing::info!(codec = ?self.codec, "VideoToolbox decoder session (re)created");
@@ -318,6 +339,30 @@ impl VideoDecoder for VideoToolboxDecoder {
 }
 
 impl VideoToolboxDecoder {
+    /// Say what the decoder is actually producing.
+    ///
+    /// The last place HDR can be lost, and the quietest: a stream tagged
+    /// BT.2020 PQ decoded into an 8-bit buffer has already thrown its range
+    /// away, and nothing upstream reports an error.
+    fn report_output(&mut self) {
+        let (name, bits) = crate::hdr_probe::describe_pixel_format(PIXEL_FORMAT_BGRA);
+        self.colour.pixel_format = Some(name.clone());
+        self.colour.output_bit_depth = bits;
+        tracing::info!(
+            pixel_format = name,
+            output_bit_depth = ?bits,
+            signals_hdr = self.colour.signals_hdr(),
+            output_is_wide = self.colour.output_is_wide(),
+            "decoder output format"
+        );
+        if self.colour.signals_hdr() && !self.colour.output_is_wide() {
+            tracing::warn!(
+                "the stream is HDR but this decoder was asked for 8-bit output, \
+                 so its range is being discarded before anything can show it"
+            );
+        }
+    }
+
     /// Hand one prepared sample to the session and wait for its frame.
     fn decode_sample(&mut self, sample_data: &[u8]) -> Result<Option<DecodedFrame>> {
         let Some(session) = self.session.as_ref() else {
@@ -362,10 +407,12 @@ impl VideoToolboxDecoder {
             return Err(Error::Decode(format!("decode_frame: {status}")));
         }
         // Synchronous decode (no async flag requested): handler already ran.
-        match rx.try_recv() {
-            Ok(frame) => Ok(frame),
-            Err(_) => Ok(None),
+        let decoded = rx.try_recv().unwrap_or(None);
+        if !self.reported_output && decoded.is_some() {
+            self.reported_output = true;
+            self.report_output();
         }
+        Ok(decoded)
     }
 }
 

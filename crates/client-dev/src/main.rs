@@ -13,6 +13,7 @@ mod gamepad_capture;
 mod gamepad_gc;
 #[cfg(target_os = "macos")]
 mod haptics;
+mod hdr_probe;
 mod headless;
 mod input_capture;
 mod moonlight;
@@ -94,6 +95,10 @@ struct Cli {
     /// "the host will not send X *to this kind of pad*".
     #[arg(long, value_parser = ["auto", "xbox", "dualsense", "dualshock", "generic"])]
     moonlight_pad_kind: Option<String>,
+    /// Ask the host for HDR. A request, not a guarantee: what actually
+    /// arrives is reported per session, since a host may answer in SDR.
+    #[arg(long)]
+    moonlight_hdr: bool,
     /// Stream mode to ask the host for, as `WIDTHxHEIGHT@FPS`, or `auto` to
     /// match this display. Matching is the useful default: a host that can
     /// create a display for the session then renders at the client's real
@@ -144,6 +149,7 @@ fn main() -> Result<()> {
             &cli.codecs,
             &cli.moonlight_mode,
             cli.moonlight_host_mode_change,
+            cli.moonlight_hdr,
         );
     }
 
