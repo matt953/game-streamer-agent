@@ -254,6 +254,7 @@ pub fn run_moonlight(
     jitter: Option<crate::netsim::Jitter>,
     dejitter: bool,
     float_window: bool,
+    chase_refresh: bool,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let mut mode = parse_mode(mode, host_mode_change)?;
@@ -292,6 +293,7 @@ pub fn run_moonlight(
     let mut app = App {
         pad_kind_override: pad_kind.and_then(parse_pad_kind),
         vsync,
+        chase_refresh,
         window_level: if float_window {
             winit::window::WindowLevel::AlwaysOnTop
         } else {
@@ -803,6 +805,10 @@ struct App {
     presentation: crate::present::PresentLedger,
     /// Redraws that reached no display, because the window is hidden.
     occluded: u64,
+    /// Redraw on every refresh rather than only when a frame arrives. Shows
+    /// repeats honestly, at the cost of looking like a max-rate client to a
+    /// variable-refresh display.
+    chase_refresh: bool,
     /// Where the window sits in the stack. On top by default: this is a
     /// measuring instrument, and one that can be covered measures nothing.
     window_level: winit::window::WindowLevel,
@@ -1254,10 +1260,14 @@ impl ApplicationHandler<AppEvent> for App {
                         Err(e) => tracing::warn!(error = %e, "render failed"),
                     }
                     self.report_presentation();
-                    // Under vsync the next refresh is the next chance to show
-                    // anything, so keep asking: a stream that stops arriving
-                    // must still be measured as repeats rather than silence.
+                    // Only chase the next refresh when asked to. Redrawing
+                    // after every present makes this a max-rate client from
+                    // the compositor's point of view — repeating the same
+                    // frame most refreshes — and a variable-refresh display
+                    // then has no reason to slow down to match the content.
+                    // Presenting only when a frame arrives is what lets it.
                     if self.vsync
+                        && self.chase_refresh
                         && let Some(w) = &self.window
                     {
                         w.request_redraw();

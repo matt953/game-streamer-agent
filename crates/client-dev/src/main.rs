@@ -128,6 +128,11 @@ struct Cli {
     /// compares one change rather than two different experiments.
     #[arg(long, default_value_t = 1)]
     jitter_seed: u64,
+    /// Redraw on every display refresh rather than only when a frame arrives.
+    /// Measures repeats honestly, but makes this look like a max-rate client
+    /// to a variable-refresh display, which then never slows to the content.
+    #[arg(long)]
+    chase_refresh: bool,
     /// Let the window be covered by others. Off by default: presentation can
     /// only be measured while the window is actually on a display, and a
     /// covered one silently measures nothing at all.
@@ -187,6 +192,7 @@ fn main() -> Result<()> {
             netsim::Jitter::new(cli.jitter_ms, cli.jitter_seed),
             !cli.no_dejitter,
             !cli.no_float,
+            cli.chase_refresh,
         );
     }
 
