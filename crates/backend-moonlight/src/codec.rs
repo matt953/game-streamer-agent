@@ -22,18 +22,25 @@ use gsa_core::media::Codec;
 
 /// Bits of `ServerCodecModeSupport` this client relies on.
 ///
-/// The field carries more than these — profile variants for 4:4:4 and higher
-/// bit depths — but a bit we do not request is a bit we cannot get wrong, so
-/// only the three base profiles are read. A host that sets a profile bit
-/// without its base bit would be misread, which no observed host does.
+/// The field carries more than these — 4:4:4 and other profile variants — and
+/// those stay unread because a bit we do not request is a bit we cannot get
+/// wrong. The 10-bit bits are the exception: an HDR session *is* a request for
+/// a 10-bit profile, so they have to be read or we ask for something the host
+/// never said it could do.
 mod bits {
     /// Hosts set this, but its absence proves nothing: an unpaired read
     /// reports an empty field for a host that plainly encodes H.264. Kept
-    /// because it documents the layout the other two bits sit in.
+    /// because it documents the layout the other bits sit in.
     #[allow(dead_code)]
     pub const H264: u32 = 1 << 0;
     pub const HEVC: u32 = 1 << 8;
+    pub const HEVC_MAIN10: u32 = 1 << 9;
     pub const AV1: u32 = 1 << 16;
+    /// Inferred from the layout — the 10-bit bit sits directly above its base
+    /// in the HEVC family, and the observed hosts set 16..=20 together. Only
+    /// used to warn, never to withhold a request, so a wrong reading costs a
+    /// misleading log line rather than a session.
+    pub const AV1_MAIN10: u32 = 1 << 17;
 }
 
 /// What a host can encode, as read from its `/serverinfo`.
@@ -62,6 +69,23 @@ impl HostCodecs {
             // modern one, the luma limit is what older hosts set.
             Codec::Hevc => self.modes & bits::HEVC != 0 || self.max_luma_hevc > 0,
             Codec::Av1 => self.modes & bits::AV1 != 0,
+            _ => false,
+        }
+    }
+
+    /// Whether the host advertises a 10-bit profile of `codec`.
+    ///
+    /// What an HDR session actually needs: the colour signalling is carried in
+    /// a 10-bit bitstream, so a host with only the 8-bit profile cannot answer
+    /// an HDR request however willing it is. Read separately from
+    /// [`Self::supports`] because the base bit says nothing about depth.
+    #[must_use]
+    pub fn supports_ten_bit(self, codec: Codec) -> bool {
+        match codec {
+            Codec::Hevc => self.modes & bits::HEVC_MAIN10 != 0,
+            Codec::Av1 => self.modes & bits::AV1_MAIN10 != 0,
+            // 10-bit H.264 exists in the standard; no host of this protocol
+            // offers it, and none of these clients would decode it.
             _ => false,
         }
     }
@@ -172,6 +196,31 @@ mod tests {
         assert_eq!(choose(APOLLO, &[Codec::Hevc, Codec::Av1]), Codec::Hevc);
         // An embedder that declares nothing still gets a picture.
         assert_eq!(choose(APOLLO, &[]), Codec::H264);
+    }
+
+    /// The bit that makes an HDR session possible is not the one that makes
+    /// the codec possible, and reading only the latter is how a client ends up
+    /// asking a host for a depth it never advertised.
+    #[test]
+    fn ten_bit_is_advertised_separately_from_the_codec() {
+        // The real host offers both 10-bit profiles.
+        assert!(APOLLO.supports_ten_bit(Codec::Hevc));
+        assert!(APOLLO.supports_ten_bit(Codec::Av1));
+
+        // A host with HEVC but only its 8-bit profile: the codec negotiates,
+        // the HDR request cannot be honoured.
+        let eight_bit_only = HostCodecs {
+            modes: bits::H264 | bits::HEVC | bits::AV1,
+            max_luma_hevc: 1,
+        };
+        assert!(eight_bit_only.supports(Codec::Hevc));
+        assert!(!eight_bit_only.supports_ten_bit(Codec::Hevc));
+        assert!(eight_bit_only.supports(Codec::Av1));
+        assert!(!eight_bit_only.supports_ten_bit(Codec::Av1));
+
+        // H.264 has a 10-bit profile in the standard and none of these hosts
+        // offer it, so it is never claimed.
+        assert!(!APOLLO.supports_ten_bit(Codec::H264));
     }
 
     #[test]

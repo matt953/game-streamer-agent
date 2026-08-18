@@ -300,7 +300,8 @@ pub async fn start(
             let _ = session.cancel().await;
             (session.launch(app_id, mode).await?, SessionOrigin::Launched)
         };
-        let mut stream = connect(&launched, host_ip, mode, bitrate_kbps, chosen).await?;
+        let mut stream =
+            connect(&launched, host_ip, mode, bitrate_kbps, chosen, host_codecs).await?;
         stream.origin = origin;
         if stream.wait_for_media(FIRST_MEDIA_TIMEOUT).await {
             if attempt > 0 {
@@ -344,7 +345,21 @@ async fn connect(
     mode: StreamMode,
     bitrate_kbps: u32,
     codec: Codec,
+    host_codecs: codec::HostCodecs,
 ) -> Result<MoonlightStream> {
+    // An HDR session is a request for a 10-bit profile, which is advertised
+    // separately from the codec itself. The request still goes out — hosts
+    // answer in SDR rather than refusing, and withholding it on a bit we may
+    // have misread would be worse — but a session that comes back SDR should
+    // say why here rather than look like a client fault.
+    if mode.hdr && !host_codecs.supports_ten_bit(codec) {
+        tracing::warn!(
+            ?codec,
+            host_modes = format!("{:#x}", host_codecs.modes),
+            "HDR asked for, but this host advertises no 10-bit profile for the \
+             negotiated codec; expect it to answer in SDR"
+        );
+    }
     // Both sides even, whatever the caller asked for. H.264 and HEVC carry
     // colour at half resolution, so an odd side has no whole number of chroma
     // samples. Measured against a real host, an odd height negotiated,
