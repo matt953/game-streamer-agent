@@ -79,6 +79,15 @@ impl PairedSession {
                 u8::from(mode.hdr),
             ))
             .await?;
+        // What was asked of the host, so a session that arrives in SDR can be
+        // told apart from one that was never asked for anything else.
+        tracing::info!(
+            mode = format!("{}x{}x{}", mode.width, mode.height, mode.fps),
+            hdr = mode.hdr,
+            host_mode_change = mode.allow_host_mode_change,
+            channels = mode.channels,
+            "launched"
+        );
         let rtsp_url = xml_field(&body, "sessionUrl0")?;
         Ok(LaunchedSession {
             rtsp_url,
@@ -107,6 +116,15 @@ impl PairedSession {
                 u8::from(mode.hdr),
             ))
             .await?;
+        // What was asked of the host, so a session that arrives in SDR can be
+        // told apart from one that was never asked for anything else.
+        tracing::info!(
+            mode = format!("{}x{}x{}", mode.width, mode.height, mode.fps),
+            hdr = mode.hdr,
+            host_mode_change = mode.allow_host_mode_change,
+            channels = mode.channels,
+            "launched"
+        );
         let rtsp_url = xml_field(&body, "sessionUrl0")?;
         Ok(LaunchedSession {
             rtsp_url,
