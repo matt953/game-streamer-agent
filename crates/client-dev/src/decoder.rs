@@ -58,14 +58,53 @@ pub fn offered_codecs(names: &[String], force_sw: bool) -> Vec<Codec> {
     offered
 }
 
+/// How HDR content is mapped onto an SDR display.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayMapping {
+    /// The absolute level, in nits, shown as full white.
+    ///
+    /// BT.2408's diffuse white is 203 nits — the level graphics and desktop
+    /// content are authored against, so mapping it to full white is what makes
+    /// an HDR-tagged desktop look like the desktop rather than a grey wash.
+    /// Hosts differ in what they encode SDR white as, and the difference shows
+    /// up as clipped highlights or a dim picture, so it is a knob.
+    pub sdr_white_nits: f32,
+}
+
+impl Default for DisplayMapping {
+    fn default() -> Self {
+        Self {
+            sdr_white_nits: 203.0,
+        }
+    }
+}
+
+impl DisplayMapping {
+    /// Reject a level that would divide the whole picture into black or blow
+    /// it out, rather than letting it produce a mystifying image.
+    pub fn new(sdr_white_nits: f32) -> std::result::Result<Self, Error> {
+        if !(1.0..=10_000.0).contains(&sdr_white_nits) {
+            return Err(Error::Decode(format!(
+                "SDR white must be between 1 and 10000 nits, not {sdr_white_nits}"
+            )));
+        }
+        Ok(Self { sdr_white_nits })
+    }
+}
+
 /// Pick a decoder for the codec the host agreed to send (`force_sw` pins
-/// openh264, which is H.264 only).
-pub fn make_decoder(force_sw: bool, codec: Codec) -> anyhow::Result<Box<dyn VideoDecoder>> {
+/// openh264, which is H.264 only). `mapping` only bears on HDR streams, which
+/// only the hardware decoder can produce.
+pub fn make_decoder(
+    force_sw: bool,
+    codec: Codec,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] mapping: DisplayMapping,
+) -> anyhow::Result<Box<dyn VideoDecoder>> {
     #[cfg(target_os = "macos")]
     if !force_sw {
         tracing::info!(?codec, "using VideoToolbox hardware decoder");
         return Ok(Box::new(crate::decoder_vt::VideoToolboxDecoder::new(
-            codec,
+            codec, mapping,
         )?));
     }
     let _ = force_sw;

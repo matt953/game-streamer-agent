@@ -14,7 +14,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
-use crate::decoder::make_decoder;
+use crate::decoder::{DisplayMapping, make_decoder};
 use crate::gamepad_capture::GamepadCapture;
 
 /// Gamepad poll period. Controllers are read on the event-loop thread — gilrs
@@ -247,6 +247,7 @@ pub fn run_moonlight(
     mode: &str,
     host_mode_change: bool,
     hdr: bool,
+    mapping: DisplayMapping,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let mut mode = parse_mode(mode, host_mode_change)?;
@@ -271,6 +272,7 @@ pub fn run_moonlight(
                     dump_frame,
                     offered,
                     mode,
+                    mapping,
                 },
                 &proxy,
             )
@@ -384,6 +386,7 @@ struct MoonlightRun {
     dump_frame: Option<std::path::PathBuf>,
     offered: Vec<gsa_core::media::Codec>,
     mode: gsa_backend_moonlight::StreamMode,
+    mapping: DisplayMapping,
 }
 
 fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLoopProxy<AppEvent>) {
@@ -396,6 +399,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
         dump_frame,
         offered,
         mode,
+        mapping,
     } = run;
     let outcome = (|| -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -450,7 +454,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
             // protocol work does not wait on hardware being awake.
             let _pad = synthetic_pad.then(|| spawn_synthetic_pad(stream.input.clone()));
 
-            let mut decoder = make_decoder(force_sw, stream.codec)?;
+            let mut decoder = make_decoder(force_sw, stream.codec, mapping)?;
             let mut frames = 0u64;
             let deadline = (seconds > 0)
                 .then(|| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
@@ -603,7 +607,11 @@ fn network_loop(
             let mut control_rx = client.take_control_events();
 
             // The agent path negotiates its own codec; it offers H.264 today.
-            let mut decoder = make_decoder(force_sw, gsa_core::media::Codec::H264)?;
+            let mut decoder = make_decoder(
+                force_sw,
+                gsa_core::media::Codec::H264,
+                DisplayMapping::default(),
+            )?;
             let mut frames = 0u64;
             // Latest agent-reported telemetry (target/emit Mb/s, ABR state), for the log.
             let mut target_mbps: Option<f64> = None;

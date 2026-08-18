@@ -99,6 +99,11 @@ struct Cli {
     /// arrives is reported per session, since a host may answer in SDR.
     #[arg(long)]
     moonlight_hdr: bool,
+    /// The level, in nits, that an HDR stream's full white is shown at on this
+    /// SDR window. Hosts differ in what they encode SDR white as, so a picture
+    /// that comes out dim or with blown highlights is tuned here.
+    #[arg(long, default_value_t = 203.0)]
+    hdr_sdr_white_nits: f32,
     /// Stream mode to ask the host for, as `WIDTHxHEIGHT@FPS`, or `auto` to
     /// match this display. Matching is the useful default: a host that can
     /// create a display for the session then renders at the client's real
@@ -150,6 +155,7 @@ fn main() -> Result<()> {
             &cli.moonlight_mode,
             cli.moonlight_host_mode_change,
             cli.moonlight_hdr,
+            decoder::DisplayMapping::new(cli.hdr_sdr_white_nits)?,
         );
     }
 

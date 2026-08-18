@@ -7,7 +7,7 @@ use gsa_client_core::Client;
 use gsa_core::id::SourceId;
 use serde::Serialize;
 
-use crate::decoder::{decoder_max_profile, make_decoder};
+use crate::decoder::{DisplayMapping, decoder_max_profile, make_decoder};
 
 #[derive(Debug, Serialize)]
 struct Report {
@@ -145,7 +145,11 @@ pub async fn run(
             }
         }
     } else {
-        let mut decoder = make_decoder(force_sw, gsa_core::media::Codec::H264)?;
+        let mut decoder = make_decoder(
+            force_sw,
+            gsa_core::media::Codec::H264,
+            DisplayMapping::default(),
+        )?;
         while decoded < frames {
             let Some(out) = client.recv_frame(decoder.as_mut()).await? else {
                 bail!("connection closed after {decoded} frames");

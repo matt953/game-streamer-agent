@@ -18,11 +18,12 @@
 //! platform already extracted this from the bitstream, and it answers the same
 //! way for H.264, HEVC and AV1.
 
-use objc2_core_foundation::{CFRetained, CFString, CFType};
+use objc2_core_foundation::{CFData, CFDictionary, CFRetained, CFString, CFType};
 use objc2_core_media::{
     CMFormatDescription, kCMFormatDescriptionExtension_ColorPrimaries,
-    kCMFormatDescriptionExtension_FullRangeVideo, kCMFormatDescriptionExtension_TransferFunction,
-    kCMFormatDescriptionExtension_YCbCrMatrix,
+    kCMFormatDescriptionExtension_FullRangeVideo,
+    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
+    kCMFormatDescriptionExtension_TransferFunction, kCMFormatDescriptionExtension_YCbCrMatrix,
 };
 
 /// What the stream and the decoder say about colour.
@@ -32,6 +33,9 @@ pub struct ColourReport {
     pub transfer: Option<String>,
     pub matrix: Option<String>,
     pub full_range: Option<bool>,
+    /// Bits per component the *bitstream* carries, from its configuration
+    /// record. What arrived, before we choose what to ask the decoder for.
+    pub stream_bit_depth: Option<u8>,
     /// FourCC of the decoder's output format, e.g. `BGRA` or `x420`.
     pub pixel_format: Option<String>,
     /// Bits per component the output format carries.
@@ -61,6 +65,119 @@ impl ColourReport {
     pub fn output_is_wide(&self) -> bool {
         self.output_bit_depth.is_some_and(|bits| bits > 8)
     }
+
+    /// Whether the decoder is being asked for fewer bits than arrived.
+    ///
+    /// Independent of HDR: a 10-bit SDR stream decoded into an 8-bit buffer
+    /// has still lost precision, and this is the only place it is visible.
+    #[must_use]
+    pub fn truncates_the_stream(&self) -> bool {
+        match (self.stream_bit_depth, self.output_bit_depth) {
+            (Some(stream), Some(output)) => output < stream,
+            _ => false,
+        }
+    }
+}
+
+/// What the luma plane actually contained, measured rather than assumed.
+///
+/// A decoder can hand back a 10-bit buffer whose samples all came from 8 bits,
+/// and it looks identical to a real one until the values are counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LumaStats {
+    pub min: u16,
+    pub max: u16,
+    /// Samples that are not multiples of four — values an 8-bit pipeline
+    /// shifted into 10 bits could not produce.
+    pub off_grid: u64,
+    pub samples: u64,
+}
+
+impl LumaStats {
+    /// Fold one sample in.
+    pub fn observe(&mut self, luma: u16) {
+        if self.samples == 0 {
+            self.min = luma;
+            self.max = luma;
+        } else {
+            self.min = self.min.min(luma);
+            self.max = self.max.max(luma);
+        }
+        if !luma.is_multiple_of(4) {
+            self.off_grid += 1;
+        }
+        self.samples += 1;
+    }
+
+    /// Whether the plane carries precision finer than 8 bits.
+    ///
+    /// Proves the *path* preserves ten bits — not that the source had ten bits
+    /// of real detail. A host encoding an 8-bit desktop into a 10-bit stream
+    /// still lands off the grid, because its colour conversion is done in the
+    /// wider space. What this rules out is our own truncation.
+    #[must_use]
+    pub fn finer_than_eight_bit(&self) -> bool {
+        self.off_grid > 0
+    }
+}
+
+/// Bits per component a codec configuration record describes.
+///
+/// The record is what the decoder itself was configured from, so it cannot
+/// disagree with the stream the way a separate parser can drift.
+#[must_use]
+pub fn record_bit_depth(kind: &str, record: &[u8]) -> Option<u8> {
+    match kind {
+        // `hvcC`: bit_depth_luma_minus8 in the low 3 bits of byte 17.
+        "hvcC" => record.get(17).map(|b| 8 + (b & 0x07)),
+        // `av1C`: high_bitdepth and twelve_bit in byte 2. Twelve is only
+        // meaningful in profile 2, and profile 2 is not in play here.
+        "av1C" => record.get(2).map(|b| match (b & 0x40 != 0, b & 0x20 != 0) {
+            (false, _) => 8,
+            (true, false) => 10,
+            (true, true) => 12,
+        }),
+        // `avcC` carries bit depth only in an optional trailing section, and
+        // 10-bit H.264 is not a mode any of these hosts offer.
+        _ => None,
+    }
+}
+
+/// Read the bit depth out of the configuration record the format description
+/// was built with.
+///
+/// # Safety
+/// `format` must be a live format description.
+pub unsafe fn stream_bit_depth(format: &CMFormatDescription) -> Option<u8> {
+    // SAFETY: static framework key, live format description.
+    let atoms =
+        unsafe { format.extension(kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) }?;
+    let atoms = atoms.downcast_ref::<CFDictionary>()?;
+    for kind in ["hvcC", "av1C", "avcC"] {
+        let key = CFString::from_str(kind);
+        // SAFETY: live dictionary; the key outlives the lookup, and the
+        // returned value is borrowed from the dictionary.
+        let value = unsafe { atoms.value(CFRetained::as_ptr(&key).as_ptr().cast()) };
+        if value.is_null() {
+            continue;
+        }
+        // SAFETY: non-null value borrowed from a live dictionary.
+        let value: &CFType = unsafe { &*value.cast::<CFType>() };
+        let Some(data) = value.downcast_ref::<CFData>() else {
+            continue;
+        };
+        let len = data.length().max(0) as usize;
+        let ptr = data.byte_ptr();
+        if ptr.is_null() {
+            continue;
+        }
+        // SAFETY: `len` bytes at `ptr`, owned by the live dictionary.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        if let Some(bits) = record_bit_depth(kind, bytes) {
+            return Some(bits);
+        }
+    }
+    None
 }
 
 /// Read the colour description the platform parsed out of the bitstream.
@@ -75,8 +192,30 @@ pub unsafe fn read_format(format: &CMFormatDescription) -> ColourReport {
             transfer: extension_string(format, kCMFormatDescriptionExtension_TransferFunction),
             matrix: extension_string(format, kCMFormatDescriptionExtension_YCbCrMatrix),
             full_range: extension_bool(format, kCMFormatDescriptionExtension_FullRangeVideo),
+            stream_bit_depth: stream_bit_depth(format),
             ..Default::default()
         }
+    }
+}
+
+/// The 10-bit biplanar output formats, video and full range.
+pub const PIXEL_FORMAT_420_10_VIDEO: u32 = u32::from_be_bytes(*b"x420");
+pub const PIXEL_FORMAT_420_10_FULL: u32 = u32::from_be_bytes(*b"xf20");
+
+/// The output format to ask the decoder for, given what the stream carries.
+///
+/// Asking for more than the stream has gains nothing and costs a conversion;
+/// asking for less throws the extra bits away where nothing reports it.
+#[must_use]
+pub fn wanted_output_format(stream_bits: Option<u8>, full_range: Option<bool>) -> u32 {
+    if stream_bits.is_some_and(|bits| bits > 8) {
+        if full_range == Some(true) {
+            PIXEL_FORMAT_420_10_FULL
+        } else {
+            PIXEL_FORMAT_420_10_VIDEO
+        }
+    } else {
+        u32::from_be_bytes(*b"BGRA")
     }
 }
 
@@ -170,5 +309,113 @@ mod tests {
         let (name, bits) = describe_pixel_format(u32::from_be_bytes(*b"x420"));
         assert_eq!(name, "x420");
         assert_eq!(bits, Some(10));
+    }
+
+    /// Byte 17 of `hvcC` is `bit_depth_luma_minus8` in its low three bits;
+    /// reading the wrong byte yields a plausible number rather than an error,
+    /// so the offset is pinned against a record laid out by hand.
+    #[test]
+    fn hevc_bit_depth_comes_from_its_own_byte() {
+        let mut record = [0u8; 23];
+        record[0] = 1; // configurationVersion
+        record[12] = 120; // general_level_idc
+        record[16] = 0xFC | 1; // chromaFormat 4:2:0, reserved bits set
+        record[17] = 0xF8 | 2; // bit_depth_luma_minus8 = 2
+        record[18] = 0xF8 | 2;
+        assert_eq!(record_bit_depth("hvcC", &record), Some(10));
+
+        record[17] = 0xF8; // 8-bit
+        assert_eq!(record_bit_depth("hvcC", &record), Some(8));
+
+        // A record cut short must not be read past.
+        assert_eq!(record_bit_depth("hvcC", &record[..10]), None);
+    }
+
+    /// The `av1C` byte we write ourselves, read back the same way.
+    #[test]
+    fn av1_bit_depth_comes_from_the_record_we_build() {
+        // tier 1, 8-bit, colour, 4:2:0, chroma sample position 1 — the real
+        // Apollo AV1 record's third byte.
+        assert_eq!(
+            record_bit_depth("av1C", &[0x81, 0x09, 0b1000_1101]),
+            Some(8)
+        );
+        // high_bitdepth set, twelve_bit clear.
+        assert_eq!(
+            record_bit_depth("av1C", &[0x81, 0x09, 0b1100_1101]),
+            Some(10)
+        );
+        assert_eq!(
+            record_bit_depth("av1C", &[0x81, 0x09, 0b1110_1101]),
+            Some(12)
+        );
+    }
+
+    /// Truncation is about the two depths disagreeing, not about HDR: a 10-bit
+    /// SDR stream decoded to 8 bits has lost precision just the same.
+    #[test]
+    fn truncation_is_reported_without_reference_to_hdr() {
+        let sdr_ten_bit = ColourReport {
+            primaries: Some("ITU_R_709_2".into()),
+            transfer: Some("ITU_R_709_2".into()),
+            stream_bit_depth: Some(10),
+            output_bit_depth: Some(8),
+            ..Default::default()
+        };
+        assert!(!sdr_ten_bit.signals_hdr());
+        assert!(sdr_ten_bit.truncates_the_stream());
+
+        let matched = ColourReport {
+            stream_bit_depth: Some(10),
+            output_bit_depth: Some(10),
+            ..Default::default()
+        };
+        assert!(!matched.truncates_the_stream());
+
+        // Nothing known is not the same as nothing lost.
+        assert!(!ColourReport::default().truncates_the_stream());
+    }
+
+    /// Asking for ten bits when the stream has eight buys a conversion and no
+    /// precision, so the request follows the stream.
+    #[test]
+    fn the_output_format_follows_what_the_stream_carries() {
+        assert_eq!(
+            wanted_output_format(Some(8), Some(false)),
+            u32::from_be_bytes(*b"BGRA")
+        );
+        assert_eq!(
+            wanted_output_format(Some(10), Some(false)),
+            PIXEL_FORMAT_420_10_VIDEO
+        );
+        assert_eq!(
+            wanted_output_format(Some(10), Some(true)),
+            PIXEL_FORMAT_420_10_FULL
+        );
+        // An unreadable record must not silently upgrade the request.
+        assert_eq!(
+            wanted_output_format(None, None),
+            u32::from_be_bytes(*b"BGRA")
+        );
+    }
+
+    /// Values an 8-bit pipeline cannot produce are the evidence; every sample
+    /// landing on a multiple of four means the extra bits carry nothing.
+    #[test]
+    fn eight_bit_content_shifted_into_ten_bits_lands_on_the_grid() {
+        let mut shifted = LumaStats::default();
+        for eight_bit in [16u16, 32, 128, 235] {
+            shifted.observe(eight_bit << 2);
+        }
+        assert!(!shifted.finer_than_eight_bit());
+        assert_eq!(shifted.samples, 4);
+
+        let mut real = LumaStats::default();
+        for value in [65u16, 130, 511, 939] {
+            real.observe(value);
+        }
+        assert!(real.finer_than_eight_bit());
+        assert_eq!(real.min, 65);
+        assert_eq!(real.max, 939);
     }
 }
