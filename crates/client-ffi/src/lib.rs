@@ -364,6 +364,11 @@ pub struct GsaSession {
     decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Adaptive de-jitter switch for [`gsa_set_dejitter`].
     dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Live pacing figures for [`gsa_session_pacing`]: the spread of transit
+    /// drift the link delivered, and the spread after pacing. Shared rather
+    /// than pushed, because they change every frame and an overlay wants
+    /// whatever is current, not every value that ever was.
+    pacing: std::sync::Arc<(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU32)>,
     /// The negotiated codec (a `GSA_CODEC_*` flag), for `gsa_session_codec`.
     codec: u32,
     /// What of a controller this session carries (`GSA_PAD_*` flags), for
@@ -384,6 +389,8 @@ pub(crate) enum SessionReady {
         presented: PresentedSink,
         decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Transit-drift spread as delivered, and as released after pacing.
+        pacing: std::sync::Arc<(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU32)>,
         codec: u32,
         pad_caps: u32,
     },
@@ -475,6 +482,7 @@ pub unsafe extern "C" fn gsa_session_start(
             presented,
             decode_error,
             dejitter,
+            pacing,
             codec,
             pad_caps,
         }) => Box::into_raw(Box::new(GsaSession {
@@ -485,6 +493,7 @@ pub unsafe extern "C" fn gsa_session_start(
             presented,
             decode_error,
             dejitter,
+            pacing,
             codec,
             pad_caps,
         })),
@@ -507,6 +516,42 @@ pub unsafe extern "C" fn gsa_session_codec(session: *const GsaSession) -> u32 {
     }
     // SAFETY: caller contract guarantees a live handle.
     unsafe { &*session }.codec
+}
+
+/// How much the link's timing wobbled, and how much of that survived pacing.
+///
+/// Both figures are the spread (p90 − p10) of transit drift in microseconds:
+/// `delivered_us` as frames arrived, `paced_us` as they were released. The
+/// pair is the point — `paced_us` alone cannot distinguish good pacing from a
+/// link that was never troubled, and `delivered_us` alone says nothing about
+/// what was done with it.
+///
+/// Zero means not yet measured, which a session shows for its first second and
+/// a backend without a capture stamp shows forever. Show "—" rather than "0".
+///
+/// # Safety
+/// `session` must be a live handle, or NULL. `delivered_us` and `paced_us`
+/// must be writable, or NULL to skip.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_pacing(
+    session: *const GsaSession,
+    delivered_us: *mut u32,
+    paced_us: *mut u32,
+) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract guarantees a live handle.
+    let pacing = &unsafe { &*session }.pacing;
+    use std::sync::atomic::Ordering::Relaxed;
+    if !delivered_us.is_null() {
+        // SAFETY: caller contract — writable or null, checked above.
+        unsafe { *delivered_us = pacing.0.load(Relaxed) };
+    }
+    if !paced_us.is_null() {
+        // SAFETY: as above.
+        unsafe { *paced_us = pacing.1.load(Relaxed) };
+    }
 }
 
 /// What of a controller this session carries, as `GSA_PAD_*` flags. NULL
@@ -1125,6 +1170,10 @@ async fn session_loop(
         presented,
         decode_error,
         dejitter,
+        pacing: std::sync::Arc::new((
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicU32::new(0),
+        )),
         codec,
         // The agent's own pad support, straight from the backend seam rather
         // than restated here, so the two cannot drift.

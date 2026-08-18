@@ -201,6 +201,14 @@ pub(crate) fn run_session(
             gsa_client_core::CaptureClock::StreamPts,
         );
 
+        // What the link delivered and what pacing made of it, republished
+        // each frame below so an overlay can show both.
+        let pacing = std::sync::Arc::new((
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicU32::new(0),
+        ));
+        let publish = pacing.clone();
+
         let _ = ready_tx.send(crate::SessionReady::Streaming {
             input: Some(stream.input.clone()),
             // A Moonlight host fixes bitrate at negotiation, so there are no
@@ -209,6 +217,7 @@ pub(crate) fn run_session(
             presented: core.presented_sink(),
             decode_error: core.decode_error_flag(),
             dejitter: core.dejitter_flag(),
+            pacing: pacing.clone(),
             codec: crate::codec_to_flag(stream.codec),
             pad_caps: u32::from(stream.pad_caps().bits()),
         });
@@ -234,6 +243,9 @@ pub(crate) fn run_session(
                 () = stop.notified() => break,
                 frame = core.recv_encoded() => match frame {
                     Ok(Some(f)) => {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        publish.0.store(core.jitter_us(), Relaxed);
+                        publish.1.store(core.released_jitter_us(), Relaxed);
                         if let Some(cb) = cbs.on_video {
                             // SAFETY: pointer+len describe f.data for this call only.
                             unsafe {

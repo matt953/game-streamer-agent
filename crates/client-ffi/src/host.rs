@@ -305,6 +305,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
             presented,
             decode_error,
             dejitter,
+            pacing,
             codec,
             pad_caps,
         }) => Box::into_raw(Box::new(crate::GsaSession {
@@ -315,6 +316,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
             presented,
             decode_error,
             dejitter,
+            pacing,
             codec,
             pad_caps,
         })),
