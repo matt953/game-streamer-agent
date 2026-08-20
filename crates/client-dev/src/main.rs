@@ -134,6 +134,11 @@ struct Cli {
     /// to a variable-refresh display, which then never slows to the content.
     #[arg(long)]
     chase_refresh: bool,
+    /// Run the window full-screen. Apple requires full-screen for
+    /// Adaptive-Sync, so a windowed run on a variable-rate display measures a
+    /// fixed one — and reads as a VRR result unless you know that.
+    #[arg(long)]
+    fullscreen: bool,
     /// Let the window be covered by others. Off by default: presentation can
     /// only be measured while the window is actually on a display, and a
     /// covered one silently measures nothing at all.
@@ -213,6 +218,7 @@ fn main() -> Result<()> {
             !cli.no_dejitter,
             !cli.no_float,
             cli.chase_refresh,
+            cli.fullscreen,
         );
     }
 

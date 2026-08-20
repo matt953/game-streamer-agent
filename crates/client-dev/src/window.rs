@@ -258,6 +258,7 @@ pub fn run_moonlight(
     dejitter: bool,
     float_window: bool,
     chase_refresh: bool,
+    fullscreen: bool,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let mut mode = parse_mode(mode, host_mode_change)?;
@@ -315,6 +316,7 @@ pub fn run_moonlight(
         vsync,
         pacing,
         chase_refresh,
+        fullscreen,
         window_level: if float_window {
             winit::window::WindowLevel::AlwaysOnTop
         } else {
@@ -928,6 +930,9 @@ struct App {
     /// repeats honestly, at the cost of looking like a max-rate client to a
     /// variable-refresh display.
     chase_refresh: bool,
+    /// Take the whole display. Adaptive-Sync needs it on macOS, so a windowed
+    /// run cannot measure VRR however the display is configured.
+    fullscreen: bool,
     /// Where the window sits in the stack. On top by default: this is a
     /// measuring instrument, and one that can be covered measures nothing.
     window_level: winit::window::WindowLevel,
@@ -1090,6 +1095,10 @@ impl ApplicationHandler<AppEvent> for App {
                         // it — so the window sits above the others instead.
                         .with_active(true)
                         .with_window_level(self.window_level)
+                        .with_fullscreen(
+                            self.fullscreen
+                                .then(|| winit::window::Fullscreen::Borderless(None)),
+                        )
                         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0)),
                 )
                 .expect("create window"),
@@ -1100,8 +1109,32 @@ impl ApplicationHandler<AppEvent> for App {
         tracing::info!(
             level = ?self.window_level,
             visible = ?window.is_visible(),
+            fullscreen = self.fullscreen,
             "window created"
         );
+        // What the display will do about its rate, and whether this run is
+        // even eligible for it. Reported per run so no figure can be
+        // attributed to variable refresh without the evidence beside it.
+        match crate::present::display_refresh() {
+            Some(refresh) => {
+                let (low, high) = refresh.range_hz();
+                tracing::info!(
+                    variable = refresh.is_variable(),
+                    range_hz = format!("{low:.0}-{high:.0}"),
+                    max_fps = refresh.max_fps,
+                    fullscreen = self.fullscreen,
+                    adaptive_sync_possible = refresh.is_variable() && self.fullscreen,
+                    "display refresh"
+                );
+                if refresh.is_variable() && !self.fullscreen {
+                    tracing::warn!(
+                        "this display varies its refresh rate, but Adaptive-Sync needs \
+                         full-screen; run with --fullscreen or read these figures as fixed-rate"
+                    );
+                }
+            }
+            None => tracing::info!("no screen reported its refresh range"),
+        }
         let gpu = Gpu::new(window.clone(), self.vsync).expect("init wgpu");
         self.window = Some(window);
         self.gpu = Some(gpu);

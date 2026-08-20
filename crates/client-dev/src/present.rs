@@ -444,3 +444,103 @@ mod rate_tests {
         assert!(!RateMatch::new(60.0, 0.0).fits());
     }
 }
+
+/// What the display will do about its own refresh rate.
+///
+/// Read rather than assumed: a monitor set to a variable range only actually
+/// varies under conditions the app does not control — Apple requires
+/// full-screen for Adaptive-Sync — so "the user turned VRR on" and "this
+/// session is getting VRR" are different facts. Attributing a measurement to
+/// VRR without checking is how a windowed run gets reported as a VRR result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayRefresh {
+    /// Shortest and longest a frame may stay on screen, in seconds.
+    pub min_interval_s: f64,
+    pub max_interval_s: f64,
+    /// The ceiling the system reports, in Hz.
+    pub max_fps: f64,
+}
+
+impl DisplayRefresh {
+    /// Whether the display can vary its rate at all.
+    ///
+    /// Apple's own rule: the two intervals are equal on a display that cannot.
+    /// The comparison needs a tolerance because these are floating seconds and
+    /// an exact match on a fixed panel is not guaranteed to be bit-identical.
+    #[must_use]
+    pub fn is_variable(&self) -> bool {
+        (self.max_interval_s - self.min_interval_s).abs() > 1e-6
+    }
+
+    /// The rate range, in Hz, for reporting.
+    #[must_use]
+    pub fn range_hz(&self) -> (f64, f64) {
+        let hz = |interval: f64| if interval > 0.0 { 1.0 / interval } else { 0.0 };
+        // The shortest interval is the *highest* rate.
+        (hz(self.max_interval_s), hz(self.min_interval_s))
+    }
+}
+
+/// Ask the main display what it can do.
+///
+/// `None` when there is no screen to ask — a display that is asleep or absent
+/// does not enumerate, and inventing a rate for it would be worse than saying
+/// nothing.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn display_refresh() -> Option<DisplayRefresh> {
+    use objc2_app_kit::NSScreen;
+    let mtm = objc2_foundation::MainThreadMarker::new()?;
+    let screen = NSScreen::mainScreen(mtm)?;
+    Some(DisplayRefresh {
+        min_interval_s: screen.minimumRefreshInterval(),
+        max_interval_s: screen.maximumRefreshInterval(),
+        #[allow(clippy::cast_precision_loss)]
+        max_fps: screen.maximumFramesPerSecond() as f64,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn display_refresh() -> Option<DisplayRefresh> {
+    None
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::DisplayRefresh;
+
+    /// Apple's rule, and the whole basis of the check: a fixed display reports
+    /// the same interval for both bounds.
+    #[test]
+    fn a_fixed_display_reports_one_interval_twice() {
+        let fixed = DisplayRefresh {
+            min_interval_s: 1.0 / 120.0,
+            max_interval_s: 1.0 / 120.0,
+            max_fps: 120.0,
+        };
+        assert!(!fixed.is_variable());
+        let (low, high) = fixed.range_hz();
+        assert!((low - 120.0).abs() < 0.01 && (high - 120.0).abs() < 0.01);
+    }
+
+    /// And a variable one reports a range — 48 to 120 Hz being the case in
+    /// front of us.
+    #[test]
+    fn a_variable_display_reports_a_range() {
+        let variable = DisplayRefresh {
+            min_interval_s: 1.0 / 120.0,
+            max_interval_s: 1.0 / 48.0,
+            max_fps: 120.0,
+        };
+        assert!(variable.is_variable());
+        // The shortest interval is the fastest rate, which is easy to invert
+        // by accident and would report the range backwards.
+        let (low, high) = variable.range_hz();
+        assert!((low - 48.0).abs() < 0.01, "low end is 48 Hz, got {low}");
+        assert!(
+            (high - 120.0).abs() < 0.01,
+            "high end is 120 Hz, got {high}"
+        );
+    }
+}

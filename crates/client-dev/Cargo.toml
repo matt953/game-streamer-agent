@@ -35,6 +35,7 @@ gilrs = "0.11"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = { workspace = true, features = ["CFNumber", "CFDictionary", "CFString"] }
 objc2-core-graphics = { version = "0.3.2", features = ["CGDirectDisplay", "CGDisplayConfiguration"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSScreen", "NSResponder", "NSApplication"] }
 objc2-core-media = { workspace = true, features = ["CMSampleBuffer", "CMTime", "CMFormatDescription", "CMBlockBuffer"] }
 objc2-core-video = { workspace = true, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-video-toolbox = { workspace = true, features = ["VTDecompressionSession", "VTDecompressionProperties", "VTSession", "VTErrors", "objc2-core-media", "block2"] }
