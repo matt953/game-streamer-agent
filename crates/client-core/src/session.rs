@@ -796,6 +796,7 @@ mod supersede_tests {
                 height: 1,
                 pixels: vec![0; 4],
                 order: crate::PixelOrder::Rgba,
+                platform: None,
             }))
         }
     }

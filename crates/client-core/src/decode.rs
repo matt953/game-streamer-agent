@@ -33,6 +33,18 @@ pub enum PixelOrder {
         /// stream rather than a mistake.
         full_range: bool,
     },
+    /// Two planes of 8-bit samples: full-width luma, then half-resolution
+    /// interleaved Cb,Cr — the decoder's native SDR layout. Same reasoning as
+    /// the 10-bit planar case: the conversion belongs to the presenter, and
+    /// requesting RGB from the decoder instead hides a per-frame conversion
+    /// inside the decode call.
+    Nv12 {
+        full_range: bool,
+        /// Whether the stream tagged itself BT.601 rather than BT.709. The
+        /// two matrices differ in two coefficients — enough to shift every
+        /// colour, invisibly, if the tag is ignored.
+        bt601: bool,
+    },
 }
 
 impl PixelOrder {
@@ -48,6 +60,8 @@ impl PixelOrder {
             Self::P010Bt2020Pq { .. } => {
                 width * height * 2 + width.div_ceil(2) * height.div_ceil(2) * 4
             }
+            // Luma bytes, then half-resolution Cb,Cr pairs.
+            Self::Nv12 { .. } => width * height + width.div_ceil(2) * height.div_ceil(2) * 2,
         }
     }
 
@@ -58,16 +72,36 @@ impl PixelOrder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
-    /// Tightly-packed 4-byte pixels (`width * height * 4` bytes) in `order`.
-    /// Decoders emit whatever order is free for them (BGRA from
-    /// VideoToolbox, RGBA from openh264); presenters pick the matching
-    /// texture format rather than swizzling on the CPU.
+    /// Tightly-packed pixels in `order`. Decoders emit whatever order is free
+    /// for them (BGRA from VideoToolbox, RGBA from openh264); presenters pick
+    /// the matching texture format rather than swizzling on the CPU.
+    ///
+    /// Empty when `platform` carries the frame instead: copying a decoded
+    /// picture to CPU memory and back costs more than decoding it, so a
+    /// decoder that can hand its surface straight to the presenter does.
     pub pixels: Vec<u8>,
     pub order: PixelOrder,
+    /// The decoder's own surface, still on the GPU, for presenters that can
+    /// adopt it. Type-erased because this crate is platform-neutral: the
+    /// decoder and presenter of one platform agree on what is inside, and
+    /// nothing in between needs to know. `None` for CPU frames.
+    pub platform: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for DecodedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedFrame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("order", &self.order)
+            .field("pixels", &self.pixels.len())
+            .field("platform", &self.platform.is_some())
+            .finish()
+    }
 }
 
 /// What a decoder is really producing, for display alongside a stream.

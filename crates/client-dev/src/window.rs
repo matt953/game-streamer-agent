@@ -1998,6 +1998,71 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Present an 8-bit biplanar SDR frame from its two planes.
+///
+/// The decoder's native output: converting to RGB in the decode call cost
+/// about a millisecond a frame, and this shader does the same work as part of
+/// sampling. Matrix and range are substituted at build time from the stream's
+/// own tags — this host really does tag SDR as BT.601, and ignoring that
+/// shifts every colour.
+const SDR_YCBCR_SHADER: &str = r#"
+@group(0) @binding(0) var luma_tex: texture_2d<f32>;
+@group(0) @binding(1) var frame_samp: sampler;
+@group(0) @binding(2) var chroma_tex: texture_2d<f32>;
+
+const KR: f32 = __KR__;
+const KB: f32 = __KB__;
+const LUMA_OFFSET: f32 = __LUMA_OFFSET__;
+const LUMA_SPAN: f32 = __LUMA_SPAN__;
+const CHROMA_SPAN: f32 = __CHROMA_SPAN__;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var out: VsOut;
+    let x = f32((i >> 1u) & 1u) * 4.0 - 1.0;
+    let y = f32(i & 1u) * 4.0 - 1.0;
+    out.pos = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>((x + 1.0) * 0.5, 1.0 - (y + 1.0) * 0.5);
+    return out;
+}
+
+// The surface is an *Srgb format: the hardware applies the encoding, so what
+// the shader writes must be linear light.
+fn srgb_to_linear(c: f32) -> f32 {
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let y_raw = textureSample(luma_tex, frame_samp, in.uv).r * 255.0;
+    let c_raw = textureSample(chroma_tex, frame_samp, in.uv).rg * 255.0;
+
+    let kg = 1.0 - KR - KB;
+    let y = (y_raw - LUMA_OFFSET) / LUMA_SPAN;
+    let cb = (c_raw.r - 128.0) / CHROMA_SPAN;
+    let cr = (c_raw.g - 128.0) / CHROMA_SPAN;
+
+    let r = y + 2.0 * (1.0 - KR) * cr;
+    let g = y - 2.0 * KB * (1.0 - KB) / kg * cb - 2.0 * KR * (1.0 - KR) / kg * cr;
+    let b = y + 2.0 * (1.0 - KB) * cb;
+    let encoded = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(
+        srgb_to_linear(encoded.r),
+        srgb_to_linear(encoded.g),
+        srgb_to_linear(encoded.b),
+        1.0
+    );
+}
+"#;
+
 /// Solid-colour quad for the notification toast. `rect` is (x0, y0, x1, y1) in
 /// clip space; `color` is premultiplied-alpha-friendly straight RGBA.
 const BAR_SHADER: &str = r#"
@@ -2036,6 +2101,8 @@ struct Gpu {
     /// content: PQ while HDR frames are on screen, sRGB otherwise — a surface
     /// interpreting one as the other shows every colour wrong.
     surface_is_pq: bool,
+    /// Biplanar-SDR pipelines, indexed `[bt601][full_range]`.
+    sdr_ycbcr: [[wgpu::RenderPipeline; 2]; 2],
     /// The two surface personalities this machine supports.
     sdr_format: wgpu::TextureFormat,
     pq_format: Option<wgpu::TextureFormat>,
@@ -2048,6 +2115,10 @@ struct Gpu {
     overlay_bind_layout: wgpu::BindGroupLayout,
     overlay_uniform: wgpu::Buffer,
     overlay: Option<(wgpu::BindGroup, u32, u32)>,
+    /// Wraps decoder surfaces as Metal textures, when the adapter is Metal.
+    /// `None` falls back to the CPU-copy path.
+    #[cfg(target_os = "macos")]
+    vt_cache: Option<crate::vt_interop::VtTextureCache>,
     bar_pipeline: wgpu::RenderPipeline,
     bar_uniform: wgpu::Buffer,
     bar_bind: wgpu::BindGroup,
@@ -2057,8 +2128,6 @@ struct FrameTexture {
     texture: wgpu::Texture,
     /// Second plane, for planar formats. `None` for packed RGBA.
     chroma: Option<wgpu::Texture>,
-    /// Which range pipeline this frame needs.
-    full_range: bool,
     bind: wgpu::BindGroup,
     width: u32,
     height: u32,
@@ -2243,6 +2312,57 @@ impl Gpu {
         let hdr_pipeline = hdr_pipeline_for(false);
         let hdr_pipeline_full = hdr_pipeline_for(true);
 
+        // The SDR biplanar pipelines: matrix and range fixed at build, like
+        // the HDR ones — a uniform read per pixel for two per-session facts
+        // would be the wrong trade.
+        let sdr_ycbcr_for = |bt601: bool, full_range: bool| {
+            let (kr, kb) = if bt601 {
+                ("0.299", "0.114")
+            } else {
+                ("0.2126", "0.0722")
+            };
+            let (loff, lspan, cspan) = if full_range {
+                ("0.0", "255.0", "255.0")
+            } else {
+                ("16.0", "219.0", "224.0")
+            };
+            let source = SDR_YCBCR_SHADER
+                .replace("__KR__", kr)
+                .replace("__KB__", kb)
+                .replace("__LUMA_OFFSET__", loff)
+                .replace("__LUMA_SPAN__", lspan)
+                .replace("__CHROMA_SPAN__", cspan);
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("present-sdr-ycbcr"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("present-sdr-ycbcr"),
+                layout: Some(&hdr_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(sdr_format.into())],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let sdr_ycbcr = [
+            [sdr_ycbcr_for(false, false), sdr_ycbcr_for(false, true)],
+            [sdr_ycbcr_for(true, false), sdr_ycbcr_for(true, true)],
+        ];
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&bind_layout)],
@@ -2421,11 +2541,20 @@ impl Gpu {
         let overlay_pipeline = overlay_pipeline_for(sdr_format);
         let overlay_pipeline_pq = pq_format.map(overlay_pipeline_for);
 
+        // Zero-copy adoption of decoder surfaces, where the adapter is Metal.
+        #[cfg(target_os = "macos")]
+        let vt_cache = crate::vt_interop::VtTextureCache::new(&device);
+        #[cfg(target_os = "macos")]
+        if vt_cache.is_some() {
+            tracing::info!("decoder surfaces will be adopted zero-copy");
+        }
+
         Ok(Self {
             hdr_pipeline,
             hdr_pipeline_full,
             hdr_bind_layout,
             surface_is_pq,
+            sdr_ycbcr,
             sdr_format,
             pq_format,
             bar_pipeline_pq,
@@ -2434,6 +2563,7 @@ impl Gpu {
             overlay_bind_layout,
             overlay_uniform,
             overlay: None,
+            vt_cache,
             surface,
             device,
             queue,
@@ -2463,8 +2593,18 @@ impl Gpu {
             return;
         }
         // Two planes at different resolutions, uploaded as they came out of
-        // the decoder; the shader does the rest.
-        if let PixelOrder::P010Bt2020Pq { full_range } = order {
+        // the decoder; the shader does the rest. The two planar layouts share
+        // the machinery and differ only in sample width.
+        if let PixelOrder::P010Bt2020Pq { .. } | PixelOrder::Nv12 { .. } = order {
+            let (luma_format, chroma_format) = match order {
+                PixelOrder::Nv12 { .. } => {
+                    (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
+                }
+                _ => (
+                    wgpu::TextureFormat::R16Unorm,
+                    wgpu::TextureFormat::Rg16Unorm,
+                ),
+            };
             let plane = |label, w: u32, h: u32, format| {
                 self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
@@ -2481,12 +2621,12 @@ impl Gpu {
                     view_formats: &[],
                 })
             };
-            let luma = plane("luma", width, height, wgpu::TextureFormat::R16Unorm);
+            let luma = plane("luma", width, height, luma_format);
             let chroma = plane(
                 "chroma",
                 width.div_ceil(2),
                 height.div_ceil(2),
-                wgpu::TextureFormat::Rg16Unorm,
+                chroma_format,
             );
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("hdr"),
@@ -2513,7 +2653,6 @@ impl Gpu {
             self.texture = Some(FrameTexture {
                 texture: luma,
                 chroma: Some(chroma),
-                full_range,
                 bind,
                 width,
                 height,
@@ -2526,7 +2665,7 @@ impl Gpu {
         // (VideoToolbox emits BGRA, openh264 RGBA).
         let format = match order {
             PixelOrder::Rgba => wgpu::TextureFormat::Rgba8UnormSrgb,
-            PixelOrder::Bgra | PixelOrder::P010Bt2020Pq { .. } => {
+            PixelOrder::Bgra | PixelOrder::P010Bt2020Pq { .. } | PixelOrder::Nv12 { .. } => {
                 wgpu::TextureFormat::Bgra8UnormSrgb
             }
         };
@@ -2562,7 +2701,6 @@ impl Gpu {
         self.texture = Some(FrameTexture {
             texture,
             chroma: None,
-            full_range: false,
             bind,
             width,
             height,
@@ -2659,7 +2797,105 @@ impl Gpu {
             self.surface_is_pq = want_pq;
             tracing::info!(pq = want_pq, format = ?self.config.format, "surface reconfigured");
         }
-        self.ensure_texture(frame.width, frame.height, frame.order);
+        // Zero-copy first: adopt the decoder's own surface as textures and
+        // skip both per-frame copies. Falls back to the upload path for CPU
+        // frames (software decode) or a non-Metal adapter.
+        #[cfg(not(target_os = "macos"))]
+        let adopted: Option<(wgpu::BindGroup, PixelOrder)> = None;
+        #[cfg(target_os = "macos")]
+        let adopted: Option<(wgpu::BindGroup, PixelOrder)> = frame
+            .platform
+            .as_ref()
+            .and_then(|p| p.downcast_ref::<crate::decoder_vt::VtSurface>())
+            .and_then(|surface| {
+                use objc2_metal::MTLPixelFormat;
+                let cache = self.vt_cache.as_ref()?;
+                if surface.planar {
+                    // Sample width follows the layout; everything else about
+                    // the two planar paths is identical.
+                    let (m_luma, w_luma, m_chroma, w_chroma) =
+                        if matches!(frame.order, PixelOrder::Nv12 { .. }) {
+                            (
+                                MTLPixelFormat::R8Unorm,
+                                wgpu::TextureFormat::R8Unorm,
+                                MTLPixelFormat::RG8Unorm,
+                                wgpu::TextureFormat::Rg8Unorm,
+                            )
+                        } else {
+                            (
+                                MTLPixelFormat::R16Unorm,
+                                wgpu::TextureFormat::R16Unorm,
+                                MTLPixelFormat::RG16Unorm,
+                                wgpu::TextureFormat::Rg16Unorm,
+                            )
+                        };
+                    let luma = cache.adopt_plane(
+                        &self.device,
+                        surface,
+                        0,
+                        m_luma,
+                        w_luma,
+                        frame.width,
+                        frame.height,
+                    )?;
+                    let (cw, ch) = (frame.width.div_ceil(2), frame.height.div_ceil(2));
+                    let chroma =
+                        cache.adopt_plane(&self.device, surface, 1, m_chroma, w_chroma, cw, ch)?;
+                    let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("vt-hdr"),
+                        layout: &self.hdr_bind_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &luma.texture.create_view(&Default::default()),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &chroma.texture.create_view(&Default::default()),
+                                ),
+                            },
+                        ],
+                    });
+                    Some((bind, frame.order))
+                } else {
+                    let plane = cache.adopt_plane(
+                        &self.device,
+                        surface,
+                        0,
+                        MTLPixelFormat::BGRA8Unorm_sRGB,
+                        wgpu::TextureFormat::Bgra8UnormSrgb,
+                        frame.width,
+                        frame.height,
+                    )?;
+                    let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("vt-sdr"),
+                        layout: &self.bind_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &plane.texture.create_view(&Default::default()),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    });
+                    Some((bind, frame.order))
+                }
+            });
+        if adopted.is_none() {
+            self.ensure_texture(frame.width, frame.height, frame.order);
+        }
 
         // A toast is showing: write its quad (full width, bottom, slid by `s`).
         if let Some((color, slide)) = toast {
@@ -2672,60 +2908,58 @@ impl Gpu {
             }
             self.queue.write_buffer(&self.bar_uniform, 0, &bytes);
         }
-        let FrameTexture {
-            texture,
-            chroma,
-            full_range,
-            bind,
-            width: fw,
-            height: fh,
-            ..
-        } = self.texture.as_ref().expect("just ensured");
-
-        let upload = |plane: &wgpu::Texture, bytes: &[u8], w: u32, h: u32, stride: u32| {
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: plane,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                bytes,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(stride),
-                    rows_per_image: Some(h),
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-        };
-        match chroma {
-            // Planar: luma then chroma, each in its own texture. Splitting at
-            // the luma size is what the decoder packed them as.
-            Some(chroma) => {
-                let (cw, ch) = (frame.width.div_ceil(2), frame.height.div_ceil(2));
-                let split = (frame.width * frame.height * 2) as usize;
-                let (luma_bytes, chroma_bytes) = frame.pixels.split_at(split);
-                upload(
+        if let (
+            None,
+            Some(FrameTexture {
+                texture, chroma, ..
+            }),
+        ) = (&adopted, self.texture.as_ref())
+        {
+            let upload = |plane: &wgpu::Texture, bytes: &[u8], w: u32, h: u32, stride: u32| {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: plane,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(stride),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            };
+            match chroma {
+                // Planar: luma then chroma, each in its own texture. Splitting at
+                // the luma size is what the decoder packed them as.
+                Some(chroma) => {
+                    let (cw, ch) = (frame.width.div_ceil(2), frame.height.div_ceil(2));
+                    let split = (frame.width * frame.height * 2) as usize;
+                    let (luma_bytes, chroma_bytes) = frame.pixels.split_at(split);
+                    upload(
+                        texture,
+                        luma_bytes,
+                        frame.width,
+                        frame.height,
+                        frame.width * 2,
+                    );
+                    upload(chroma, chroma_bytes, cw, ch, cw * 4);
+                }
+                None => upload(
                     texture,
-                    luma_bytes,
+                    &frame.pixels,
                     frame.width,
                     frame.height,
-                    frame.width * 2,
-                );
-                upload(chroma, chroma_bytes, cw, ch, cw * 4);
+                    frame.width * 4,
+                ),
             }
-            None => upload(
-                texture,
-                &frame.pixels,
-                frame.width,
-                frame.height,
-                frame.width * 4,
-            ),
         }
 
         use wgpu::CurrentSurfaceTexture as Cst;
@@ -2763,19 +2997,34 @@ impl Gpu {
 
             // Aspect-fit letterbox via viewport.
             let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-            let (fw, fh) = (*fw as f32, *fh as f32);
+            let (fw, fh) = (frame.width as f32, frame.height as f32);
             let scale = (sw / fw).min(sh / fh);
             let (vw, vh) = (fw * scale, fh * scale);
             pass.set_viewport((sw - vw) / 2.0, (sh - vh) / 2.0, vw, vh, 0.0, 1.0);
 
-            // Planar frames need the two-texture pipeline; everything else is
-            // a straight blit.
-            pass.set_pipeline(match (chroma.is_some(), *full_range) {
-                (true, false) => &self.hdr_pipeline,
-                (true, true) => &self.hdr_pipeline_full,
-                (false, _) => &self.pipeline,
+            // The pipeline follows the frame's layout; the bind group is
+            // either this frame's adopted surface or the persistent upload
+            // texture.
+            let order = match &adopted {
+                Some((_, order)) => *order,
+                None => match self.texture.as_ref() {
+                    Some(t) => t.order,
+                    None => return Ok(false),
+                },
+            };
+            pass.set_pipeline(match order {
+                PixelOrder::P010Bt2020Pq { full_range: false } => &self.hdr_pipeline,
+                PixelOrder::P010Bt2020Pq { full_range: true } => &self.hdr_pipeline_full,
+                PixelOrder::Nv12 { full_range, bt601 } => {
+                    &self.sdr_ycbcr[usize::from(bt601)][usize::from(full_range)]
+                }
+                PixelOrder::Rgba | PixelOrder::Bgra => &self.pipeline,
             });
-            pass.set_bind_group(0, bind, &[]);
+            match (&adopted, self.texture.as_ref()) {
+                (Some((bind, _)), _) => pass.set_bind_group(0, bind, &[]),
+                (None, Some(t)) => pass.set_bind_group(0, &t.bind, &[]),
+                (None, None) => return Ok(false),
+            }
             pass.draw(0..3, 0..1);
 
             // Toast overlay: full-surface viewport, alpha-blended quad on top.

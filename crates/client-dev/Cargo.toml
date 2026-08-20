@@ -38,7 +38,8 @@ objc2-core-foundation = { workspace = true, features = ["CFNumber", "CFDictionar
 objc2-core-graphics = { version = "0.3.2", features = ["CGDirectDisplay", "CGDisplayConfiguration"] }
 objc2-app-kit = { version = "0.3.2", features = ["NSScreen", "NSResponder", "NSApplication"] }
 objc2-core-media = { workspace = true, features = ["CMSampleBuffer", "CMTime", "CMFormatDescription", "CMBlockBuffer"] }
-objc2-core-video = { workspace = true, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-core-video = { workspace = true, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn", "CVMetalTexture", "CVMetalTextureCache", "objc2-metal"] }
+objc2-metal = { workspace = true }
 objc2-video-toolbox = { workspace = true, features = ["VTDecompressionSession", "VTDecompressionProperties", "VTSession", "VTErrors", "objc2-core-media", "block2"] }
 block2 = { workspace = true }
 objc2 = { workspace = true }

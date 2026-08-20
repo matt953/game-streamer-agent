@@ -22,6 +22,8 @@ mod overlay;
 mod pairing;
 mod present;
 mod script;
+#[cfg(target_os = "macos")]
+mod vt_interop;
 mod window;
 
 use anyhow::{Context, Result};

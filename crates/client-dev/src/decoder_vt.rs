@@ -350,7 +350,8 @@ impl VideoToolboxDecoder {
             crate::hdr_probe::wanted_output_format(colour.stream_bit_depth, colour.full_range);
         self.stream_colour = StreamColour::build(
             &colour,
-            self.output_format == crate::hdr_probe::PIXEL_FORMAT_420_10_FULL,
+            self.output_format == crate::hdr_probe::PIXEL_FORMAT_420_10_FULL
+                || self.output_format == crate::hdr_probe::PIXEL_FORMAT_NV12_FULL,
         );
         self.colour = colour;
 
@@ -645,25 +646,322 @@ fn parameter_set_slot(codec: Codec, nal: &[u8]) -> Option<usize> {
 ///
 /// # Safety
 /// `image` must be a valid, decoded CVPixelBuffer.
+/// The decoder's surface, handed to the presenter still on the GPU.
+///
+/// Copying a decoded 1080p picture to CPU memory and uploading it again cost
+/// more than decoding it (about a millisecond each way, and gigabytes a
+/// second of memory traffic at 120 fps). The presenter wraps this buffer's
+/// planes as Metal textures instead; the pixels never leave the GPU. Reads —
+/// screenshots, the brightness probe — lock the buffer and copy on demand,
+/// which happens a handful of times a session rather than per frame.
+pub struct VtSurface {
+    buffer: CFRetained<CVPixelBuffer>,
+    /// Two 10-bit planes (P010) when true; packed BGRA when false.
+    pub planar: bool,
+}
+
+// SAFETY: CoreVideo buffers are reference-counted CF objects, safe to retain,
+// release and read from any thread; all mutation happened before the decoder
+// output callback handed the buffer over.
+unsafe impl Send for VtSurface {}
+// SAFETY: as above — reads only, on an immutable decoded buffer.
+unsafe impl Sync for VtSurface {}
+
+impl VtSurface {
+    #[must_use]
+    pub fn pixel_buffer(&self) -> &CVPixelBuffer {
+        &self.buffer
+    }
+}
+
 unsafe fn copy_frame(image: &CVImageBuffer, colour: Option<StreamColour>) -> Option<Decoded> {
     let pb: &CVPixelBuffer = image;
     let format = CVPixelBufferGetPixelFormatType(pb);
-    // SAFETY: valid pixel buffer, locked for the whole read.
     if format == crate::hdr_probe::PIXEL_FORMAT_420_10_VIDEO
         || format == crate::hdr_probe::PIXEL_FORMAT_420_10_FULL
     {
-        // The tables are built with the session; a 10-bit buffer without them
-        // cannot be read at all, so refusing beats guessing at a conversion.
-        // SAFETY: caller contract — a valid decoded buffer, and the format
-        // check above says it is the biplanar 10-bit layout.
-        return unsafe { copy_biplanar_10bit(pb, colour?) };
+        // A 10-bit buffer without a colour description cannot be interpreted;
+        // refusing beats showing a wrong picture.
+        // SAFETY: caller contract — a valid decoded buffer of the checked
+        // biplanar layout.
+        return unsafe { wrap_planar(pb, colour?) };
     }
-    // SAFETY: as above.
-    unsafe { copy_bgra(pb) }.map(|frame| Decoded {
-        frame,
+    if format == crate::hdr_probe::PIXEL_FORMAT_NV12_VIDEO
+        || format == crate::hdr_probe::PIXEL_FORMAT_NV12_FULL
+    {
+        let colour = colour?;
+        let width = CVPixelBufferGetWidthOfPlane(pb, 0);
+        let height = CVPixelBufferGetHeightOfPlane(pb, 0);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // SAFETY: `pb` is a live CF object; retaining is thread-safe.
+        let retained = unsafe { CFRetained::retain(std::ptr::NonNull::from(pb)) };
+        return Some(Decoded {
+            frame: DecodedFrame {
+                #[allow(clippy::cast_possible_truncation)]
+                width: width as u32,
+                #[allow(clippy::cast_possible_truncation)]
+                height: height as u32,
+                pixels: Vec::new(),
+                order: gsa_client_core::PixelOrder::Nv12 {
+                    full_range: colour.full_range,
+                    bt601: colour.bt601,
+                },
+                platform: Some(std::sync::Arc::new(VtSurface {
+                    buffer: retained,
+                    planar: true,
+                })),
+            },
+            luma: crate::hdr_probe::LumaStats::default(),
+            clipped: 0,
+        });
+    }
+    let width = CVPixelBufferGetWidth(pb);
+    let height = CVPixelBufferGetHeight(pb);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // SAFETY: `pb` is a live CF object; retaining is thread-safe.
+    let retained = unsafe { CFRetained::retain(std::ptr::NonNull::from(pb)) };
+    Some(Decoded {
+        frame: DecodedFrame {
+            #[allow(clippy::cast_possible_truncation)]
+            width: width as u32,
+            #[allow(clippy::cast_possible_truncation)]
+            height: height as u32,
+            pixels: Vec::new(),
+            order: gsa_client_core::PixelOrder::Bgra,
+            platform: Some(std::sync::Arc::new(VtSurface {
+                buffer: retained,
+                planar: false,
+            })),
+        },
         luma: crate::hdr_probe::LumaStats::default(),
         clipped: 0,
     })
+}
+
+/// Wrap a 10-bit biplanar buffer and probe its brightness, copying nothing.
+///
+/// # Safety
+/// `pb` must be a valid, decoded 10-bit biplanar CVPixelBuffer.
+unsafe fn wrap_planar(pb: &CVPixelBuffer, colour: StreamColour) -> Option<Decoded> {
+    // SAFETY: valid pixel buffer; lock for the probe's CPU read.
+    let lock = unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+    if lock != 0 {
+        return None;
+    }
+    let decoded = (|| {
+        let width = CVPixelBufferGetWidthOfPlane(pb, 0);
+        let height = CVPixelBufferGetHeightOfPlane(pb, 0);
+        let (luma_base, luma_stride) = (
+            CVPixelBufferGetBaseAddressOfPlane(pb, 0),
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
+        );
+        if luma_base.is_null() || width == 0 || height == 0 {
+            return None;
+        }
+
+        // Brightness is measured on a sample of the picture: reading two
+        // million pixels a frame to report one number cost more than
+        // decoding the frame did, and this stride still covers thousands of
+        // points spread across the image.
+        const PROBE_STRIDE: usize = 16;
+        let mut stats = crate::hdr_probe::LumaStats::default();
+        let mut clipped = 0u64;
+        let mut low_bits: u16 = 0;
+        for row in (0..height).step_by(PROBE_STRIDE) {
+            // SAFETY: row < plane height, so `width` 16-bit samples from the
+            // row start lie in the locked plane.
+            let luma = unsafe {
+                std::slice::from_raw_parts(
+                    luma_base.cast::<u8>().add(row * luma_stride).cast::<u16>(),
+                    width,
+                )
+            };
+            for col in (0..width).step_by(PROBE_STRIDE) {
+                let raw = luma[col];
+                low_bits |= raw;
+                let y = raw >> TEN_BIT_SHIFT;
+                stats.observe(y);
+                if usize::from(y) >= TEN_BIT_MAX {
+                    clipped += 1;
+                }
+            }
+        }
+        // The one reading that would make everything else wrong: the samples
+        // are ten bits at the top of a 16-bit word, and the whole picture is
+        // misread if they are anywhere else.
+        if low_bits & ((1 << TEN_BIT_SHIFT) - 1) != 0 {
+            tracing::error!(
+                low_bits = format!("{:#06x}", low_bits),
+                "10-bit samples are not left-justified in their word; \
+                 the conversion is reading them wrongly"
+            );
+        }
+
+        // SAFETY: `pb` is a live CF object; retaining is thread-safe.
+        let retained = unsafe { CFRetained::retain(std::ptr::NonNull::from(pb)) };
+        Some(Decoded {
+            frame: DecodedFrame {
+                #[allow(clippy::cast_possible_truncation)]
+                width: width as u32,
+                #[allow(clippy::cast_possible_truncation)]
+                height: height as u32,
+                pixels: Vec::new(),
+                order: gsa_client_core::PixelOrder::P010Bt2020Pq {
+                    full_range: colour.full_range,
+                },
+                platform: Some(std::sync::Arc::new(VtSurface {
+                    buffer: retained,
+                    planar: true,
+                })),
+            },
+            luma: stats,
+            clipped,
+        })
+    })();
+    // SAFETY: paired with the lock above.
+    unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+    decoded
+}
+
+/// Copy a wrapped frame's pixels out of its surface, for the rare paths that
+/// need bytes — screenshots and frame dumps. Returns the same frame with
+/// `pixels` filled and the handle dropped.
+#[must_use]
+pub fn materialise(frame: &DecodedFrame) -> Option<DecodedFrame> {
+    let surface = frame.platform.as_ref()?.downcast_ref::<VtSurface>()?;
+    let pb = surface.pixel_buffer();
+    if matches!(frame.order, gsa_client_core::PixelOrder::Nv12 { .. }) {
+        // SAFETY: a live decoded buffer of the biplanar 8-bit layout.
+        return unsafe { copy_nv12_pixels(pb) }.map(|pixels| DecodedFrame {
+            pixels,
+            platform: None,
+            ..frame.clone()
+        });
+    }
+    if surface.planar {
+        // SAFETY: a live decoded buffer of the planar layout it was wrapped as.
+        unsafe { copy_planar_pixels(pb) }.map(|pixels| DecodedFrame {
+            pixels,
+            platform: None,
+            ..frame.clone()
+        })
+    } else {
+        // SAFETY: as above, packed BGRA.
+        unsafe { copy_bgra(pb) }.map(|copied| DecodedFrame {
+            pixels: copied.pixels,
+            platform: None,
+            ..frame.clone()
+        })
+    }
+}
+
+/// The 8-bit biplanar copy-out, used only by [`materialise`].
+///
+/// # Safety
+/// `pb` must be a valid, decoded NV12 CVPixelBuffer.
+unsafe fn copy_nv12_pixels(pb: &CVPixelBuffer) -> Option<Vec<u8>> {
+    // SAFETY: valid pixel buffer; lock for CPU read access.
+    let lock = unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+    if lock != 0 {
+        return None;
+    }
+    let pixels = (|| {
+        let width = CVPixelBufferGetWidthOfPlane(pb, 0);
+        let height = CVPixelBufferGetHeightOfPlane(pb, 0);
+        let (luma_base, luma_stride) = (
+            CVPixelBufferGetBaseAddressOfPlane(pb, 0),
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
+        );
+        let (chroma_base, chroma_stride) = (
+            CVPixelBufferGetBaseAddressOfPlane(pb, 1),
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
+        );
+        let chroma_height = CVPixelBufferGetHeightOfPlane(pb, 1);
+        let chroma_width = CVPixelBufferGetWidthOfPlane(pb, 1);
+        if luma_base.is_null() || chroma_base.is_null() || width == 0 || height == 0 {
+            return None;
+        }
+        let mut pixels = vec![0u8; width * height + chroma_width * chroma_height * 2];
+        let (luma_out, chroma_out) = pixels.split_at_mut(width * height);
+        for row in 0..height {
+            // SAFETY: row < plane height; `width` bytes lie in the locked row.
+            let src = unsafe {
+                std::slice::from_raw_parts(luma_base.cast::<u8>().add(row * luma_stride), width)
+            };
+            luma_out[row * width..][..width].copy_from_slice(src);
+        }
+        for row in 0..chroma_height {
+            // SAFETY: as above; interleaved Cb,Cr pairs.
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    chroma_base.cast::<u8>().add(row * chroma_stride),
+                    chroma_width * 2,
+                )
+            };
+            chroma_out[row * chroma_width * 2..][..chroma_width * 2].copy_from_slice(src);
+        }
+        Some(pixels)
+    })();
+    // SAFETY: paired with the lock above.
+    unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+    pixels
+}
+
+/// The planar copy-out, used only by [`materialise`].
+///
+/// # Safety
+/// `pb` must be a valid, decoded 10-bit biplanar CVPixelBuffer.
+unsafe fn copy_planar_pixels(pb: &CVPixelBuffer) -> Option<Vec<u8>> {
+    // SAFETY: valid pixel buffer; lock for CPU read access.
+    let lock = unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+    if lock != 0 {
+        return None;
+    }
+    let pixels = (|| {
+        let width = CVPixelBufferGetWidthOfPlane(pb, 0);
+        let height = CVPixelBufferGetHeightOfPlane(pb, 0);
+        let (luma_base, luma_stride) = (
+            CVPixelBufferGetBaseAddressOfPlane(pb, 0),
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
+        );
+        let (chroma_base, chroma_stride) = (
+            CVPixelBufferGetBaseAddressOfPlane(pb, 1),
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
+        );
+        let chroma_height = CVPixelBufferGetHeightOfPlane(pb, 1);
+        let chroma_width = CVPixelBufferGetWidthOfPlane(pb, 1);
+        if luma_base.is_null() || chroma_base.is_null() || width == 0 || height == 0 {
+            return None;
+        }
+        let mut pixels = vec![0u8; width * height * 2 + chroma_width * chroma_height * 4];
+        let (luma_out, chroma_out) = pixels.split_at_mut(width * height * 2);
+        for row in 0..height {
+            // SAFETY: row < plane height, so `width` 16-bit samples from the
+            // row start lie in the locked plane.
+            let src = unsafe {
+                std::slice::from_raw_parts(luma_base.cast::<u8>().add(row * luma_stride), width * 2)
+            };
+            luma_out[row * width * 2..][..width * 2].copy_from_slice(src);
+        }
+        for row in 0..chroma_height {
+            // SAFETY: as above; interleaved Cb,Cr pairs, so two samples wide.
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    chroma_base.cast::<u8>().add(row * chroma_stride),
+                    chroma_width * 4,
+                )
+            };
+            chroma_out[row * chroma_width * 4..][..chroma_width * 4].copy_from_slice(src);
+        }
+        Some(pixels)
+    })();
+    // SAFETY: paired with the lock above.
+    unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+    pixels
 }
 
 /// Copy a locked BGRA pixel buffer into a tightly-packed RGBA frame.
@@ -701,6 +999,7 @@ unsafe fn copy_bgra(pb: &CVPixelBuffer) -> Option<DecodedFrame> {
             height: height as u32,
             pixels,
             order: gsa_client_core::PixelOrder::Bgra,
+            platform: None,
         })
     };
     // SAFETY: paired with the lock above.
@@ -788,24 +1087,33 @@ const TEN_BIT_MAX: usize = 1023;
 #[derive(Debug, Clone, Copy)]
 struct StreamColour {
     full_range: bool,
+    /// BT.601 rather than BT.709, from the stream's own matrix tag. Two
+    /// coefficients apart — enough to shift every colour if ignored, and this
+    /// host really does tag SDR as 601.
+    bt601: bool,
 }
 
 impl StreamColour {
-    /// `None` when the stream is not something the planar path can present,
-    /// which refuses the frame rather than showing it wrongly.
+    /// `None` when a 10-bit stream is not PQ, which refuses the frame rather
+    /// than showing it wrongly. 8-bit streams always build: their matrix tag
+    /// decides the coefficients, untagged HD meaning BT.709.
     fn build(colour: &crate::hdr_probe::ColourReport, full_range: bool) -> Option<Self> {
-        match colour.transfer.as_deref() {
-            Some(t) if t.contains("2084") => Some(Self { full_range }),
+        let bt601 = colour.matrix.as_deref().is_some_and(|m| m.contains("601"));
+        let ten_bit = colour.stream_bit_depth.is_some_and(|bits| bits > 8);
+        let pq = colour
+            .transfer
+            .as_deref()
+            .is_some_and(|t| t.contains("2084"));
+        if ten_bit && !pq {
             // HLG is the other HDR curve, and no host in play sends it.
             // Guessing at it would be worse than saying so.
-            other => {
-                tracing::warn!(
-                    transfer = other.unwrap_or("none"),
-                    "10-bit stream is not PQ; it will not be presented"
-                );
-                None
-            }
+            tracing::warn!(
+                transfer = colour.transfer.as_deref().unwrap_or("none"),
+                "10-bit stream is not PQ; it will not be presented"
+            );
+            return None;
         }
+        Some(Self { full_range, bt601 })
     }
 }
 
@@ -862,112 +1170,6 @@ fn range_constants(full_range: bool) -> (f32, f32, f32) {
 ///
 /// # Safety
 /// `pb` must be a valid, decoded 10-bit biplanar CVPixelBuffer.
-unsafe fn copy_biplanar_10bit(pb: &CVPixelBuffer, colour: StreamColour) -> Option<Decoded> {
-    // SAFETY: valid pixel buffer; lock for CPU read access.
-    let lock = unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
-    if lock != 0 {
-        return None;
-    }
-    let decoded = (|| {
-        let width = CVPixelBufferGetWidthOfPlane(pb, 0);
-        let height = CVPixelBufferGetHeightOfPlane(pb, 0);
-        let (luma_base, luma_stride) = (
-            CVPixelBufferGetBaseAddressOfPlane(pb, 0),
-            CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-        );
-        let (chroma_base, chroma_stride) = (
-            CVPixelBufferGetBaseAddressOfPlane(pb, 1),
-            CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
-        );
-        let chroma_height = CVPixelBufferGetHeightOfPlane(pb, 1);
-        let chroma_width = CVPixelBufferGetWidthOfPlane(pb, 1);
-        if luma_base.is_null() || chroma_base.is_null() || width == 0 || height == 0 {
-            return None;
-        }
-
-        // Both planes copied row by row, exactly as they came out of the
-        // decoder. No conversion: these are 10-bit BT.2020 PQ samples, which
-        // is what an HDR surface wants, and the presenter is the only thing
-        // that knows whether the display can take them. Converting here cost
-        // ~11.7 ms a frame at 1080p — more than decoding one — which capped
-        // the harness at 85 fps and put it seconds behind a 120 fps stream.
-        let mut pixels = vec![0u8; width * height * 2 + chroma_width * chroma_height * 4];
-        let (luma_out, chroma_out) = pixels.split_at_mut(width * height * 2);
-        for row in 0..height {
-            // SAFETY: row < plane height, so `width` 16-bit samples from the
-            // row start lie in the locked plane.
-            let src = unsafe {
-                std::slice::from_raw_parts(luma_base.cast::<u8>().add(row * luma_stride), width * 2)
-            };
-            luma_out[row * width * 2..][..width * 2].copy_from_slice(src);
-        }
-        for row in 0..chroma_height {
-            // SAFETY: as above; interleaved Cb,Cr pairs, so two samples wide.
-            let src = unsafe {
-                std::slice::from_raw_parts(
-                    chroma_base.cast::<u8>().add(row * chroma_stride),
-                    chroma_width * 4,
-                )
-            };
-            chroma_out[row * chroma_width * 4..][..chroma_width * 4].copy_from_slice(src);
-        }
-
-        // Brightness is still measured, but on a sample of the picture rather
-        // than all of it: reading two million pixels a frame to report one
-        // number cost more than decoding the frame did, and this stride still
-        // covers thousands of points spread across the image.
-        const PROBE_STRIDE: usize = 16;
-        let mut stats = crate::hdr_probe::LumaStats::default();
-        let mut clipped = 0u64;
-        let mut low_bits: u16 = 0;
-        for row in (0..height).step_by(PROBE_STRIDE) {
-            // SAFETY: as above.
-            let luma = unsafe {
-                std::slice::from_raw_parts(
-                    luma_base.cast::<u8>().add(row * luma_stride).cast::<u16>(),
-                    width,
-                )
-            };
-            for col in (0..width).step_by(PROBE_STRIDE) {
-                let raw = luma[col];
-                low_bits |= raw;
-                let y = raw >> TEN_BIT_SHIFT;
-                stats.observe(y);
-                if usize::from(y) >= TEN_BIT_MAX {
-                    clipped += 1;
-                }
-            }
-        }
-
-        // The one reading that would make everything else wrong: the samples
-        // are ten bits at the top of a 16-bit word, and the whole picture is
-        // misread if they are anywhere else.
-        if low_bits & ((1 << TEN_BIT_SHIFT) - 1) != 0 {
-            tracing::error!(
-                low_bits = format!("{:#06x}", low_bits),
-                "10-bit samples are not left-justified in their word; \
-                 the conversion is reading them wrongly"
-            );
-        }
-
-        Some(Decoded {
-            frame: DecodedFrame {
-                width: width as u32,
-                height: height as u32,
-                pixels,
-                order: gsa_client_core::PixelOrder::P010Bt2020Pq {
-                    full_range: colour.full_range,
-                },
-            },
-            luma: stats,
-            clipped,
-        })
-    })();
-    // SAFETY: paired with the lock above.
-    unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
-    decoded
-}
-
 /// Split an Annex-B stream into NAL unit payloads (no start codes).
 fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
     let mut nals = Vec::new();
@@ -1225,8 +1427,29 @@ mod tests {
                 .full_range
         );
 
-        // A stream that says nothing must be refused, not shown wrongly.
-        assert!(StreamColour::build(&crate::hdr_probe::ColourReport::default(), false).is_none());
+        // A *10-bit* stream that does not declare PQ must be refused, not
+        // shown wrongly.
+        let ten_bit_unknown = crate::hdr_probe::ColourReport {
+            stream_bit_depth: Some(10),
+            ..Default::default()
+        };
+        assert!(StreamColour::build(&ten_bit_unknown, false).is_none());
+
+        // An 8-bit stream always presents; its matrix tag picks the
+        // coefficients, untagged meaning BT.709.
+        let sdr = StreamColour::build(&crate::hdr_probe::ColourReport::default(), false)
+            .expect("SDR is always presentable");
+        assert!(!sdr.bt601);
+        let tagged_601 = crate::hdr_probe::ColourReport {
+            matrix: Some("ITU_R_601_4".into()),
+            ..Default::default()
+        };
+        assert!(
+            StreamColour::build(&tagged_601, false)
+                .expect("presentable")
+                .bt601,
+            "the stream's own 601 tag must reach the shader"
+        );
     }
 
     /// PQ codes are absolute, which is the whole reason brightness can be

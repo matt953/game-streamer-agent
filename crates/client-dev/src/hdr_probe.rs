@@ -397,6 +397,9 @@ pub unsafe fn read_format(format: &CMFormatDescription) -> ColourReport {
 /// The 10-bit biplanar output formats, video and full range.
 pub const PIXEL_FORMAT_420_10_VIDEO: u32 = u32::from_be_bytes(*b"x420");
 pub const PIXEL_FORMAT_420_10_FULL: u32 = u32::from_be_bytes(*b"xf20");
+/// 8-bit biplanar YCbCr — the decoder's native output for an 8-bit stream.
+pub const PIXEL_FORMAT_NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
+pub const PIXEL_FORMAT_NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
 
 /// The output format to ask the decoder for, given what the stream carries.
 ///
@@ -410,8 +413,14 @@ pub fn wanted_output_format(stream_bits: Option<u8>, full_range: Option<bool>) -
         } else {
             PIXEL_FORMAT_420_10_VIDEO
         }
+    } else if full_range == Some(true) {
+        // The decoder's own layout. Asking for BGRA instead makes the decode
+        // call pay a hidden YUV→RGB conversion — measured at about a
+        // millisecond a frame — for a conversion the presenter's shader does
+        // as part of sampling anyway.
+        PIXEL_FORMAT_NV12_FULL
     } else {
-        u32::from_be_bytes(*b"BGRA")
+        PIXEL_FORMAT_NV12_VIDEO
     }
 }
 
@@ -587,8 +596,14 @@ mod tests {
     fn the_output_format_follows_what_the_stream_carries() {
         assert_eq!(
             wanted_output_format(Some(8), Some(false)),
-            u32::from_be_bytes(*b"BGRA")
+            PIXEL_FORMAT_NV12_VIDEO,
+            "native biplanar, not BGRA: BGRA hides a per-frame conversion"
         );
+        assert_eq!(
+            wanted_output_format(Some(8), Some(true)),
+            PIXEL_FORMAT_NV12_FULL
+        );
+        assert_eq!(wanted_output_format(None, None), PIXEL_FORMAT_NV12_VIDEO);
         assert_eq!(
             wanted_output_format(Some(10), Some(false)),
             PIXEL_FORMAT_420_10_VIDEO
@@ -596,11 +611,6 @@ mod tests {
         assert_eq!(
             wanted_output_format(Some(10), Some(true)),
             PIXEL_FORMAT_420_10_FULL
-        );
-        // An unreadable record must not silently upgrade the request.
-        assert_eq!(
-            wanted_output_format(None, None),
-            u32::from_be_bytes(*b"BGRA")
         );
     }
 

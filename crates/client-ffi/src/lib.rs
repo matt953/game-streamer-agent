@@ -116,6 +116,7 @@ impl VideoDecoder for Counter {
             height: 0,
             pixels: Vec::new(),
             order: PixelOrder::Bgra,
+            platform: None,
         }))
     }
 }

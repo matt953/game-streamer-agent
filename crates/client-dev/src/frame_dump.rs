@@ -15,6 +15,18 @@ use gsa_client_core::{DecodedFrame, PixelOrder};
 
 /// Write `frame` to `path` as a 24-bit BMP.
 pub fn write_bmp(frame: &DecodedFrame, path: &std::path::Path) -> anyhow::Result<()> {
+    // A zero-copy frame's pixels live on the GPU; a screenshot is the rare
+    // path that needs bytes, so they are copied out here, on demand.
+    #[cfg(target_os = "macos")]
+    let materialised;
+    #[cfg(target_os = "macos")]
+    let frame = if frame.pixels.is_empty() && frame.platform.is_some() {
+        materialised = crate::decoder_vt::materialise(frame)
+            .ok_or_else(|| anyhow::anyhow!("could not copy the frame out of its surface"))?;
+        &materialised
+    } else {
+        frame
+    };
     let (width, height) = (frame.width as usize, frame.height as usize);
     anyhow::ensure!(
         frame.pixels.len() >= frame.order.frame_bytes(width, height),
@@ -86,6 +98,38 @@ pub fn write_bmp(frame: &DecodedFrame, path: &std::path::Path) -> anyhow::Result
                     out.extend_from_slice(&[byte(px[2]), byte(px[1]), byte(px[0])]);
                 }
             }
+            // Biplanar SDR: the display path converts on the GPU, but a
+            // screenshot has to be a picture a person can open, so the same
+            // matrix is applied here, on the handful of frames a script asks
+            // for. The output stays display-encoded — that is what a BMP is.
+            PixelOrder::Nv12 { full_range, bt601 } => {
+                let (kr, kb) = if bt601 {
+                    (0.299f32, 0.114f32)
+                } else {
+                    (0.2126, 0.0722)
+                };
+                let kg = 1.0 - kr - kb;
+                let (loff, lspan, cspan) = if full_range {
+                    (0.0f32, 255.0f32, 255.0f32)
+                } else {
+                    (16.0, 219.0, 224.0)
+                };
+                let luma_plane = &frame.pixels[..width * height];
+                let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+                let chroma_plane = &frame.pixels[width * height..];
+                for x in 0..width {
+                    let yy = (f32::from(luma_plane[y * width + x]) - loff) / lspan;
+                    let ci = (y / 2).min(ch - 1) * cw + (x / 2).min(cw - 1);
+                    let cb = (f32::from(chroma_plane[ci * 2]) - 128.0) / cspan;
+                    let cr = (f32::from(chroma_plane[ci * 2 + 1]) - 128.0) / cspan;
+                    let r = yy + 2.0 * (1.0 - kr) * cr;
+                    let g = yy - 2.0 * kb * (1.0 - kb) / kg * cb - 2.0 * kr * (1.0 - kr) / kg * cr;
+                    let b = yy + 2.0 * (1.0 - kb) * cb;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+                    out.extend_from_slice(&[byte(b), byte(g), byte(r)]);
+                }
+            }
             _ => {
                 let row = &frame.pixels[y * width * 4..(y + 1) * width * 4];
                 for px in row.chunks_exact(4) {
@@ -150,6 +194,7 @@ mod tests {
             height: 2,
             pixels: [red, blue].concat(),
             order,
+            platform: None,
         }
     }
 
@@ -182,6 +227,7 @@ mod tests {
             height: 1,
             pixels: vec![16, 16, 16, 255, 16, 16, 16, 255],
             order: PixelOrder::Bgra,
+            platform: None,
         };
         assert_eq!(brightness(&flat), (16, 0));
         let varied = DecodedFrame {
@@ -189,6 +235,7 @@ mod tests {
             height: 1,
             pixels: vec![0, 0, 0, 255, 200, 200, 200, 255],
             order: PixelOrder::Bgra,
+            platform: None,
         };
         let (mean, spread) = brightness(&varied);
         assert_eq!(mean, 100);
@@ -202,6 +249,7 @@ mod tests {
             height: 64,
             pixels: vec![0; 16],
             order: PixelOrder::Bgra,
+            platform: None,
         };
         assert!(write_bmp(&short, &std::env::temp_dir().join("gsa-short.bmp")).is_err());
     }

@@ -159,6 +159,7 @@ impl VideoDecoder for OpenH264Decoder {
             height: height as u32,
             pixels,
             order: gsa_client_core::PixelOrder::Rgba,
+            platform: None,
         }))
     }
 }
