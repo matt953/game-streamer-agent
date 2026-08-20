@@ -18,6 +18,9 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200)
 
 /// Poll interval. ENet needs servicing regularly to retransmit and to
 /// surface received packets.
+/// The longest the control loop waits with nothing arriving. Arrivals wake it
+/// immediately (see the socket peek below); this only bounds how stale queued
+/// *outgoing* work can get.
 const SERVICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 /// How often the measured link round-trip is republished to the embedder.
 const RTT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -230,6 +233,16 @@ pub fn run(
 ) -> Result<()> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| Error::Transport(format!("bind control socket: {e}")))?;
+    // A second handle onto the same socket, used only to *wait* for
+    // readability between service passes. Sleeping a fixed interval instead
+    // leaves every acknowledgement sitting unread for up to that interval —
+    // which inflates the measured round trip by the polling loop rather than
+    // the wire, and delays every host message the same way. Peeking does not
+    // consume: the ENet host still reads the datagram itself.
+    let waker = socket.try_clone().ok();
+    if let Some(w) = &waker {
+        let _ = w.set_read_timeout(Some(SERVICE_INTERVAL));
+    }
     // `Host::new` initialises the socket (non-blocking, broadcast) itself.
     let mut host = enet::Host::new(
         socket,
@@ -413,7 +426,15 @@ pub fn run(
             last_ping = std::time::Instant::now();
         }
 
-        std::thread::sleep(SERVICE_INTERVAL);
+        match &waker {
+            // Wake the moment a datagram lands (or after the interval, for
+            // outgoing work), instead of letting it wait out a sleep.
+            Some(w) => {
+                let mut probe = [0u8; 1];
+                let _ = w.peek(&mut probe);
+            }
+            None => std::thread::sleep(SERVICE_INTERVAL),
+        }
     }
 }
 
