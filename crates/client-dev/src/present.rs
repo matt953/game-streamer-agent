@@ -99,6 +99,49 @@ impl PresentLedger {
         self.last_present = Some(at);
     }
 
+    /// Whether presents landed on a fixed refresh grid, given the rate the
+    /// panel would run at if it were not varying.
+    ///
+    /// This is the only measurement here that can tell VRR from its absence.
+    /// Every other figure is identical either way whenever the content rate
+    /// divides the panel's: 60 fps on a fixed 120 Hz panel shows each frame
+    /// twice and produces exactly the 16.67 ms cadence an adapting panel
+    /// would. Content whose rate *varies* is what separates them, because a
+    /// fixed panel can only ever hold a frame for a whole number of refreshes.
+    #[must_use]
+    pub fn grid_fit(&self, refresh_hz: f64) -> Option<GridFit> {
+        if refresh_hz <= 0.0 {
+            return None;
+        }
+        let period_us = 1_000_000.0 / refresh_hz;
+        // An interval shorter than half a refresh cannot be a multiple of one,
+        // and dividing by a near-zero nearest-multiple gives a meaningless
+        // residual. Those are presents the panel coalesced, not grid samples.
+        let residuals: Vec<f64> = self
+            .intervals
+            .iter()
+            .map(|us| f64::from(*us))
+            .filter(|us| *us > period_us / 2.0)
+            .map(|us| {
+                let ratio = us / period_us;
+                // Distance to the nearest whole refresh, as a fraction of one.
+                // Zero means dead on a boundary, 0.5 means as far off as it is
+                // possible to be.
+                (ratio - ratio.round()).abs()
+            })
+            .collect();
+        if residuals.len() < 30 {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let mean = residuals.iter().sum::<f64>() / residuals.len() as f64;
+        Some(GridFit {
+            refresh_hz,
+            mean_residual: mean,
+            samples: residuals.len(),
+        })
+    }
+
     /// A snapshot for reporting; `None` until enough samples to be worth
     /// reading, since a percentile over three of them is noise.
     ///
@@ -129,6 +172,50 @@ impl PresentLedger {
             superseded: self.superseded,
             repeats: self.repeats,
         })
+    }
+}
+
+/// How far presents sat from a fixed refresh grid.
+///
+/// A frame can only leave a fixed panel on a refresh boundary, so consecutive
+/// presents differ by a whole number of refreshes and the residual is near
+/// zero. A panel changing its own rate refreshes when asked, so the residual
+/// is scattered across the whole range — averaging a quarter of a refresh, the
+/// mean of a uniform spread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridFit {
+    /// The fixed rate tested against.
+    pub refresh_hz: f64,
+    /// Mean distance to the nearest whole refresh, in refreshes: 0 is perfectly
+    /// on the grid, 0.25 is the uniform scatter of no grid at all.
+    pub mean_residual: f64,
+    pub samples: usize,
+}
+
+impl GridFit {
+    /// Halfway between "on the grid" (0) and "uniform scatter" (0.25). Chosen
+    /// as the midpoint rather than tuned, so the verdict is not fitted to the
+    /// one display in front of us.
+    const OFF_GRID: f64 = 0.125;
+
+    /// Whether the presents were pinned to a fixed grid.
+    ///
+    /// Only meaningful for content whose rate does *not* divide the refresh
+    /// rate. Frames arriving at exactly half the refresh rate land on the grid
+    /// whether or not the panel is capable of leaving it.
+    #[must_use]
+    pub fn is_fixed(&self) -> bool {
+        self.mean_residual < Self::OFF_GRID
+    }
+
+    /// What the residual says, in a word.
+    #[must_use]
+    pub fn verdict(&self) -> &'static str {
+        if self.is_fixed() {
+            "pinned"
+        } else {
+            "adapting"
+        }
     }
 }
 
@@ -284,6 +371,72 @@ mod tests {
         let summary = ledger.summary().expect("enough samples");
         assert_eq!(summary.wait_p50_us, 1_000);
         assert_eq!(summary.wait_p99_us, 16_000);
+    }
+
+    /// Build a ledger whose presents sit `intervals_us` apart.
+    fn with_intervals(intervals: impl Iterator<Item = u32>) -> PresentLedger {
+        let start = Instant::now();
+        let mut ledger = PresentLedger::default();
+        let mut at = Duration::ZERO;
+        for gap in intervals {
+            at += Duration::from_micros(u64::from(gap));
+            ledger.on_present(Duration::from_millis(1), start + at);
+        }
+        ledger
+    }
+
+    const REFRESH_120HZ_US: u32 = 8_333;
+
+    /// A panel that cannot change its rate can only hold a frame for a whole
+    /// number of refreshes, however unevenly the content arrives. Every
+    /// interval is therefore a multiple of one, and the residual collapses.
+    #[test]
+    fn a_pinned_panel_puts_every_present_on_a_refresh_boundary() {
+        // Varying content — two refreshes then three — which is exactly what a
+        // fixed panel does with a frame rate it cannot match.
+        let ledger =
+            with_intervals((0..200).map(|i| REFRESH_120HZ_US * if i % 3 == 0 { 3 } else { 2 }));
+        let fit = ledger.grid_fit(120.0).expect("enough samples");
+        assert!(
+            fit.mean_residual < 0.01,
+            "multiples of a refresh must sit on the grid, got {:.3}",
+            fit.mean_residual
+        );
+        assert!(fit.is_fixed());
+        assert_eq!(fit.verdict(), "pinned");
+    }
+
+    /// A panel changing its own rate refreshes when it is asked to, so the
+    /// intervals owe nothing to the grid and scatter across it.
+    #[test]
+    fn an_adapting_panel_scatters_across_the_grid() {
+        // Intervals spread continuously over a refresh rather than snapping to
+        // one, which is the whole signature of the panel following the content.
+        let ledger = with_intervals(
+            (0..200).map(|i: u32| REFRESH_120HZ_US * 2 + (i * 997) % REFRESH_120HZ_US),
+        );
+        let fit = ledger.grid_fit(120.0).expect("enough samples");
+        assert!(
+            fit.mean_residual > 0.2,
+            "a uniform scatter averages a quarter of a refresh, got {:.3}",
+            fit.mean_residual
+        );
+        assert!(!fit.is_fixed());
+        assert_eq!(fit.verdict(), "adapting");
+    }
+
+    /// The limitation, asserted so nobody reads a verdict this test forbids:
+    /// content at a rate that divides the refresh rate lands on the grid
+    /// whether or not the panel could leave it. Steady 60 fps on a 120 Hz
+    /// panel proves nothing, which is why this needs a varying workload.
+    #[test]
+    fn content_that_divides_the_refresh_rate_cannot_tell_them_apart() {
+        let ledger = with_intervals(std::iter::repeat_n(REFRESH_120HZ_US * 2, 200));
+        let fit = ledger.grid_fit(120.0).expect("enough samples");
+        assert!(
+            fit.is_fixed(),
+            "60 fps reads as pinned even on a panel that is adapting to it"
+        );
     }
 
     /// Percentiles over a handful of frames are noise, and a number that looks

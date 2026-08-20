@@ -1051,6 +1051,15 @@ impl App {
             unshown_pct = format!("{:.1}", s.superseded_pct()),
             ready = s.ready,
             presented = s.presented,
+            // Whether the panel held frames to its own grid or followed the
+            // content. Only this figure distinguishes the two; every other one
+            // above reads the same either way whenever the content rate
+            // divides the refresh rate.
+            grid = self
+                .presentation
+                .grid_fit(display_refresh_hz().unwrap_or_default())
+                .map(|f| format!("{} r={:.3} n={}", f.verdict(), f.mean_residual, f.samples))
+                .unwrap_or_else(|| "unknown".to_owned()),
             "presentation"
         );
     }
