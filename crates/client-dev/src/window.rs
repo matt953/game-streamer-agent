@@ -839,6 +839,11 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         },
                         dropped = stats.frames_dropped_incomplete,
                         recovered = stats.frames_recovered,
+                        // Frames the session decoded and discarded unseen
+                        // under the drop policy — the core's half of the
+                        // supersede count; the presenter's own half is
+                        // unshown_pct in the presentation line.
+                        superseded = core.superseded(),
                         // What the stream is actually pushing, as against what
                         // was asked for. Input shares the link with video as
                         // reliable control messages, so a stream near the cap
