@@ -677,6 +677,10 @@ pub struct LatencyChain {
     hold_us: VecDeque<u32>,
     /// Ready→shown wait, per presented frame (µs), where a presenter feeds it.
     present_us: VecDeque<u32>,
+    /// Capture→now measured absolutely, for backends whose clocks are synced.
+    /// When present it *is* the total — measured beats composed — and the
+    /// per-stage figures become its breakdown rather than its source.
+    total_us: VecDeque<u32>,
 }
 
 /// One stage's percentiles, µs. `None` when nothing has been measured.
@@ -731,6 +735,9 @@ impl LatencyChain {
     pub fn on_present_wait(&mut self, wait_us: u32) {
         push_capped(&mut self.present_us, wait_us);
     }
+    pub fn on_measured_total(&mut self, total_us: u32) {
+        push_capped(&mut self.total_us, total_us);
+    }
 
     #[must_use]
     pub fn summary(&self) -> LatencySummary {
@@ -739,26 +746,31 @@ impl LatencyChain {
         let decode = stage(&self.decode_us);
         let hold = stage(&self.hold_us);
         let present = stage(&self.present_us);
-        let total = match (rtt, host) {
-            (Some(rtt), Some(host)) => {
-                // Half a round trip stands in for the one-way wire; the
-                // remaining stages add if they were measured at all. Percentile
-                // sums overstate tails slightly (stages do not peak together),
-                // which errs on the honest side for a latency figure.
-                let sum = |pick: fn(StagePercentiles) -> u32| {
-                    pick(rtt) / 2
-                        + pick(host)
-                        + decode.map_or(0, pick)
-                        + hold.map_or(0, pick)
-                        + present.map_or(0, pick)
-                };
-                Some(StagePercentiles {
-                    p50_us: sum(|s| s.p50_us),
-                    p95_us: sum(|s| s.p95_us),
-                    p99_us: sum(|s| s.p99_us),
-                })
-            }
-            _ => None,
+        // A synced backend measures the total outright; every other one
+        // composes it from the stages. Measured wins when both exist.
+        let total = match stage(&self.total_us) {
+            Some(measured) => Some(measured),
+            None => match (rtt, host) {
+                (Some(rtt), Some(host)) => {
+                    // Half a round trip stands in for the one-way wire; the
+                    // remaining stages add if they were measured at all. Percentile
+                    // sums overstate tails slightly (stages do not peak together),
+                    // which errs on the honest side for a latency figure.
+                    let sum = |pick: fn(StagePercentiles) -> u32| {
+                        pick(rtt) / 2
+                            + pick(host)
+                            + decode.map_or(0, pick)
+                            + hold.map_or(0, pick)
+                            + present.map_or(0, pick)
+                    };
+                    Some(StagePercentiles {
+                        p50_us: sum(|s| s.p50_us),
+                        p95_us: sum(|s| s.p95_us),
+                        p99_us: sum(|s| s.p99_us),
+                    })
+                }
+                _ => None,
+            },
         };
         LatencySummary {
             rtt,
@@ -800,6 +812,25 @@ mod latency_chain_tests {
             + s.present.unwrap().p50_us;
         assert_eq!(total.p50_us, expected);
         assert!(total.p99_us >= total.p95_us && total.p95_us >= total.p50_us);
+    }
+
+    /// A backend with synced clocks measures the total outright, and that
+    /// measurement must win over composition: it includes the stages nobody
+    /// can measure separately (capture wait, queueing between stages).
+    #[test]
+    fn a_measured_total_beats_the_composed_one() {
+        let mut chain = filled();
+        for _ in 0..100 {
+            chain.on_measured_total(30_000);
+        }
+        let s = chain.summary();
+        assert_eq!(
+            s.total.expect("measured total").p50_us,
+            30_000,
+            "the measured figure is the total, not the stage sum"
+        );
+        // The stages still report — they are the breakdown of that total.
+        assert!(s.decode.is_some() && s.rtt.is_some());
     }
 
     /// A total made only of client-side stages would read as end-to-end while

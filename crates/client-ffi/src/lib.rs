@@ -1261,6 +1261,14 @@ async fn session_loop(
         .negotiated_codec()
         .map_or(GSA_CODEC_H264, codec_to_flag);
     let knob_caps = knobs.as_ref().map(|k| k.caps());
+    // The latency chain, republished about once a second for
+    // `gsa_session_latency` — measured outright on this backend, since its
+    // clocks are synced.
+    let latency = std::sync::Arc::new(std::sync::Mutex::new(
+        gsa_client_core::LatencySummary::default(),
+    ));
+    let mut last_latency_publish = std::time::Instant::now();
+
     let _ = ready_tx.send(SessionReady::Streaming {
         input,
         knobs,
@@ -1271,11 +1279,7 @@ async fn session_loop(
             std::sync::atomic::AtomicU32::new(0),
             std::sync::atomic::AtomicU32::new(0),
         )),
-        // The gsa path does not compose the chain yet; its clock sync gives
-        // absolute latency instead. Empty means every stage reads unknown.
-        latency: std::sync::Arc::new(std::sync::Mutex::new(
-            gsa_client_core::LatencySummary::default(),
-        )),
+        latency: latency.clone(),
         codec,
         // The agent's own pad support, straight from the backend seam rather
         // than restated here, so the two cannot drift.
@@ -1358,6 +1362,12 @@ async fn session_loop(
             }
             frame = client.recv_encoded() => match frame {
                 Ok(Some(f)) => {
+                    if last_latency_publish.elapsed() >= std::time::Duration::from_secs(1) {
+                        last_latency_publish = std::time::Instant::now();
+                        if let Ok(mut slot) = latency.lock() {
+                            *slot = client.latency_chain();
+                        }
+                    }
                     if let Some(cb) = cbs.on_video {
                         // SAFETY: pointer+len describe f.data for the call only.
                         unsafe {

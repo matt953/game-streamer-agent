@@ -382,6 +382,10 @@ impl Client {
                 } if client_ts_us == sent => {
                     let now = self.clock.now_us();
                     self.stream.clock_sync_mut().record(sent, now, agent_ts_us);
+                    // The same exchange is a measured round trip — the wire
+                    // stage of the unified latency chain.
+                    #[allow(clippy::cast_possible_truncation)]
+                    self.stream.on_link_rtt((now - sent) as u32);
                 }
                 A2C::Pong { .. } => continue, // stale pong; ignore
                 other => return Err(Error::Session(format!("expected pong, got {other:?}"))),
@@ -683,6 +687,13 @@ impl Client {
     #[must_use]
     pub fn stats(&self) -> StatsSummary {
         self.stream.stats()
+    }
+
+    /// Per-stage latency percentiles and the total — measured outright here,
+    /// since this backend's clocks are synced, rather than composed.
+    #[must_use]
+    pub fn latency_chain(&self) -> LatencySummary {
+        self.stream.latency_chain()
     }
 
     /// Presentation-side health summary (fed by [`PresentedSink`]).

@@ -442,6 +442,9 @@ impl StreamSession {
         };
         let now = self.clock.now_us();
         let latency_us = self.absolute_latency_us(now, gated.capture_ts_us);
+        if let Some(total) = latency_us {
+            self.latency.on_measured_total(total);
+        }
         // Decode happens app-side and is unmeasurable here: record 0.
         self.stats.on_frame_decoded(latency_us, 0);
         Ok(Some(EncodedFrame {
@@ -484,6 +487,9 @@ impl StreamSession {
                     let decode_us = (now - decode_start) as u32;
                     self.latency.on_decode(decode_us);
                     let latency_us = self.absolute_latency_us(now, gated.capture_ts_us);
+                    if let Some(total) = latency_us {
+                        self.latency.on_measured_total(total);
+                    }
                     self.stats.on_frame_decoded(latency_us, decode_us);
                     return Ok(Some(FrameOutput {
                         frame,
