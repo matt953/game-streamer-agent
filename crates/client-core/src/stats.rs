@@ -145,6 +145,70 @@ impl LatencyStats {
     }
 }
 
+/// Where a cadence break happened, measured as frames arrive.
+///
+/// "The host's own screen looked smooth but the stream stuttered" does not say
+/// whose fault it is: a capture running behind a loaded GPU drops frames
+/// without the host's monitor showing anything, and so does a network that
+/// delivers late. Both look identical downstream.
+///
+/// Two gaps separate them, and neither needs the clocks to agree — each is a
+/// difference within a single clock, so the unknown offset cancels:
+///
+/// - **capture gap**, between consecutive frames' capture stamps. Large means
+///   the host did not produce a frame for that long. Nothing downstream can
+///   fix it.
+/// - **arrival gap**, between consecutive frames reaching us. Large *while the
+///   capture gap is normal* means the host produced on time and the frame was
+///   late getting here — the network, or our own receive path.
+#[derive(Debug, Default)]
+pub struct ArrivalCadence {
+    last_capture_ts: Option<u32>,
+    last_arrival_us: Option<u64>,
+    /// Rolling arrival gaps (µs), for the median that sets "normal".
+    gaps_us: VecDeque<u32>,
+    /// Breaks the host had already made by the time it stamped the frame.
+    pub captured_late: u64,
+    /// Breaks that appeared between the host stamping a frame and us holding
+    /// it, with the capture cadence intact.
+    pub delivered_late: u64,
+    /// Worst single delivery excursion (µs): how far one frame slipped
+    /// relative to its own capture cadence.
+    pub worst_slip_us: u32,
+}
+
+impl ArrivalCadence {
+    pub fn on_arrival(&mut self, capture_ts_us: u32, arrival_us: u64) {
+        let (Some(prev_cap), Some(prev_arr)) = (self.last_capture_ts, self.last_arrival_us) else {
+            self.last_capture_ts = Some(capture_ts_us);
+            self.last_arrival_us = Some(arrival_us);
+            return;
+        };
+        let cap_gap = gsa_core::time::wire_ts_delta_us(capture_ts_us, prev_cap);
+        let arr_gap = u32::try_from(arrival_us.saturating_sub(prev_arr)).unwrap_or(u32::MAX);
+        self.last_capture_ts = Some(capture_ts_us);
+        self.last_arrival_us = Some(arrival_us);
+
+        // The same threshold presentation uses, so the two counts can be read
+        // against each other rather than being two different questions.
+        let sorted: Vec<u32> = self.gaps_us.iter().copied().collect();
+        let median = percentile(&sorted, 50).unwrap_or(0);
+        let limit = (median.saturating_mul(STUTTER_FACTOR)).max(STUTTER_MIN_US);
+        push_capped(&mut self.gaps_us, arr_gap);
+
+        // A capture gap this size means the frame did not exist any earlier;
+        // when it arrived is beside the point. Checked first for that reason.
+        if cap_gap > limit {
+            self.captured_late += 1;
+            return;
+        }
+        if arr_gap > limit {
+            self.delivered_late += 1;
+            self.worst_slip_us = self.worst_slip_us.max(arr_gap.saturating_sub(cap_gap));
+        }
+    }
+}
+
 /// Presentation-side health: fed by the embedder (or harness) each time a
 /// frame is handed to the display. Cadence gaps are the ground truth for
 /// smoothness — rates alone hide bad pacing.
@@ -501,5 +565,94 @@ mod tests {
         assert!(sum.latency_ms_p50.unwrap() < 20.0);
         // The short window sees only the spike.
         assert!(sum.recent_latency_ms_p50.unwrap() > 90.0);
+    }
+}
+
+#[cfg(test)]
+mod arrival_tests {
+    use super::ArrivalCadence;
+
+    const FRAME_US: u32 = 16_667;
+
+    /// Feed a steady stream, then one frame with the given capture and arrival
+    /// gaps, and say how it was classified.
+    fn classify(cap_gap_us: u32, arr_gap_us: u32) -> (u64, u64) {
+        let mut cadence = ArrivalCadence::default();
+        let mut capture = 1_000_000u32;
+        let mut arrival = 5_000_000u64;
+        // Enough steady frames for the median to mean something.
+        for _ in 0..60 {
+            cadence.on_arrival(capture, arrival);
+            capture = capture.wrapping_add(FRAME_US);
+            arrival += u64::from(FRAME_US);
+        }
+        let before = (cadence.captured_late, cadence.delivered_late);
+        cadence.on_arrival(
+            capture.wrapping_add(cap_gap_us - FRAME_US),
+            arrival + u64::from(arr_gap_us) - u64::from(FRAME_US),
+        );
+        (
+            cadence.captured_late - before.0,
+            cadence.delivered_late - before.1,
+        )
+    }
+
+    /// The host stopped producing frames. It arrived late because it did not
+    /// exist any earlier — nothing downstream could have helped.
+    #[test]
+    fn a_frame_the_host_never_made_is_captured_late() {
+        let (captured, delivered) = classify(100_000, 100_000);
+        assert_eq!((captured, delivered), (1, 0));
+    }
+
+    /// The host produced on cadence and the frame took an extra 80 ms to
+    /// reach us. That is the network or our receive path, and it is the only
+    /// case worth chasing on this side.
+    #[test]
+    fn a_frame_that_was_made_on_time_but_arrived_late_is_delivered_late() {
+        let (captured, delivered) = classify(FRAME_US, 100_000);
+        assert_eq!((captured, delivered), (0, 1));
+    }
+
+    /// The ordinary case must count as neither, or every frame is a fault.
+    #[test]
+    fn a_frame_on_cadence_is_not_a_break_at_all() {
+        let (captured, delivered) = classify(FRAME_US, FRAME_US);
+        assert_eq!((captured, delivered), (0, 0));
+    }
+
+    /// A frame the host made late but that then travelled quickly must still
+    /// be blamed on capture: the gap was already in the stamps.
+    #[test]
+    fn capture_is_checked_before_delivery() {
+        let (captured, delivered) = classify(120_000, 20_000);
+        assert_eq!(
+            (captured, delivered),
+            (1, 0),
+            "the break existed before the network saw it"
+        );
+    }
+
+    /// The slip is how far the frame fell behind its own capture cadence, not
+    /// the raw arrival gap — otherwise a slow-but-steady stream reads as a
+    /// huge excursion.
+    #[test]
+    fn the_slip_measures_the_excursion_not_the_gap() {
+        let mut cadence = ArrivalCadence::default();
+        let mut capture = 1_000_000u32;
+        let mut arrival = 5_000_000u64;
+        for _ in 0..60 {
+            cadence.on_arrival(capture, arrival);
+            capture = capture.wrapping_add(FRAME_US);
+            arrival += u64::from(FRAME_US);
+        }
+        // Made on cadence, arrived 100 ms after the previous frame.
+        cadence.on_arrival(capture, arrival + 100_000 - u64::from(FRAME_US));
+        assert_eq!(cadence.delivered_late, 1);
+        let slip = cadence.worst_slip_us;
+        assert!(
+            (80_000..=90_000).contains(&slip),
+            "expected roughly 83 ms of slip, got {slip}"
+        );
     }
 }

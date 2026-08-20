@@ -41,6 +41,8 @@ pub struct StreamSession {
     recovery: std::sync::Arc<dyn RecoverySink>,
     stats: LatencyStats,
     present: stats::PresentStats,
+    /// Where cadence breaks entered the stream: at capture, or in transit.
+    arrival: stats::ArrivalCadence,
     presented_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, std::time::Instant)>,
     presented_tx: tokio::sync::mpsc::UnboundedSender<(u32, std::time::Instant)>,
     /// Backend-maintained counters for frames it could not deliver whole.
@@ -144,6 +146,7 @@ impl StreamSession {
             recovery,
             stats: LatencyStats::default(),
             present: stats::PresentStats::default(),
+            arrival: stats::ArrivalCadence::default(),
             presented_rx: presented.1,
             presented_tx: presented.0,
             dropped,
@@ -351,6 +354,16 @@ impl StreamSession {
         )
     }
 
+    /// Where cadence breaks came from, as frames arrived.
+    #[must_use]
+    pub fn arrival_cadence(&self) -> (u64, u64, u32) {
+        (
+            self.arrival.captured_late,
+            self.arrival.delivered_late,
+            self.arrival.worst_slip_us,
+        )
+    }
+
     /// Presentation-side health summary (fed by [`PresentedSink`]).
     pub fn present_stats(&mut self) -> stats::PresentSummary {
         self.drain_presented();
@@ -435,6 +448,9 @@ impl StreamSession {
     async fn gate(&mut self, f: BackendFrame, backlog: bool) -> Result<Option<BackendFrame>> {
         let arrival_us = f.arrival_us;
         self.stats.on_frame_complete(f.data.len(), arrival_us);
+        // Before any gating or pacing: this has to see the stream as it was
+        // delivered, not as we chose to release it.
+        self.arrival.on_arrival(f.capture_ts_us, arrival_us);
         // A decoder-rejected frame breaks the chain even when delivery looked
         // clean, so it is handled exactly like a gap.
         if self

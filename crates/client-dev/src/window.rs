@@ -785,6 +785,18 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         // capture stamps: the source hitched, we only carried
                         // it. Separates "fix the client" from "cannot".
                         src_stutters = present.src_stutters,
+                        // Where the breaks entered, measured on arrival and
+                        // before any pacing: the host never made the frame, or
+                        // it was late reaching us. Only this pair says whether
+                        // the client can do anything about them.
+                        cadence = {
+                            let (captured, delivered, slip) = core.arrival_cadence();
+                            format!(
+                                "{captured} captured-late / {delivered} delivered-late \
+                                 (worst slip {:.0}ms)",
+                                f64::from(slip) / 1000.0
+                            )
+                        },
                         latency_absolute = core.latency_is_absolute(),
                         // The de-jitter's own signal. A flat zero means it has
                         // never measured anything, not that the link is clean.
