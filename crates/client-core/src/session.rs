@@ -89,6 +89,8 @@ pub struct StreamSession {
     frame_interval_us: u32,
     /// Previous capture stamp, for measuring the stream's frame interval.
     last_capture_for_interval: Option<u32>,
+    /// Recent capture gaps, for the interval percentile.
+    interval_gaps: std::collections::VecDeque<u32>,
     /// Total time frames have been held back to smooth delivery, and how many
     /// were held. The latency side of the trade: smoothness gained is
     /// meaningless without the delay paid for it, and the hold happens before
@@ -184,6 +186,7 @@ impl StreamSession {
             // figure is replaced within a second of frames arriving.
             frame_interval_us: 16_667,
             last_capture_for_interval: None,
+            interval_gaps: std::collections::VecDeque::new(),
             hold_total_us: 0,
             held_frames: 0,
             dejitter_skipped_backlog: 0,
@@ -236,21 +239,37 @@ impl StreamSession {
     /// encodes on change, so a 60 fps request over 30 fps content delivers
     /// every 33 ms. The hold cap is a number of frames, so it has to be the
     /// real interval or the policy is not the one the mode names.
-    fn learn_frame_interval(&mut self, capture_ts_us: u32) {
+    /// Learn the stream's frame interval; returns this frame's capture gap.
+    ///
+    /// The interval is a low percentile of recent gaps, not an average. Under
+    /// change-driven encoding a still screen makes consecutive stamps sit
+    /// hundreds of milliseconds apart, and an average ingests those idle gaps
+    /// as if they were the frame rate — inflating the one-frame hold budget
+    /// into tens of milliseconds of real latency. The *shortest* common gap
+    /// is the cadence the host actually produces at; idle time only ever
+    /// lands in the upper tail, where a low percentile never looks.
+    fn learn_frame_interval(&mut self, capture_ts_us: u32) -> Option<u32> {
+        const WIN: usize = 64;
         let Some(previous) = self.last_capture_for_interval else {
             self.last_capture_for_interval = Some(capture_ts_us);
-            return;
+            return None;
         };
         self.last_capture_for_interval = Some(capture_ts_us);
         let gap = gsa_core::time::wire_ts_delta_us(capture_ts_us, previous);
         // A gap outside this range is a stall or a stamp that wrapped oddly,
         // not a cadence: 8 ms is 120 fps and 200 ms is 5 fps.
-        if !(8_000..=200_000).contains(&gap) {
-            return;
+        if (8_000..=200_000).contains(&gap) {
+            if self.interval_gaps.len() == WIN {
+                self.interval_gaps.pop_front();
+            }
+            self.interval_gaps.push_back(gap);
+            if self.interval_gaps.len() >= 8 {
+                let mut sorted: Vec<u32> = self.interval_gaps.iter().copied().collect();
+                sorted.sort_unstable();
+                self.frame_interval_us = sorted[sorted.len() / 4];
+            }
         }
-        // Slow exponential average: the interval is a property of the stream,
-        // and a single late frame must not move the policy.
-        self.frame_interval_us = (self.frame_interval_us * 7 + gap) / 8;
+        Some(gap)
     }
 
     /// Fold a released frame into the output measure.
@@ -657,7 +676,17 @@ impl StreamSession {
         const WARMUP_US: u64 = 2_000_000;
         let now = self.clock.now_us();
         self.first_gate_us.get_or_insert(now);
-        self.learn_frame_interval(capture_ts_us);
+        let capture_gap = self.learn_frame_interval(capture_ts_us);
+        // A frame arriving after a content pause says nothing about the
+        // link: the gap is the host's own idle time, and reading it as
+        // jitter is what wakes the smoother on film content and static
+        // screens. It is shown immediately and kept out of the window.
+        let content_pause =
+            capture_gap.is_none_or(|gap| gap > self.frame_interval_us.saturating_mul(2));
+        if content_pause {
+            self.latency.on_hold(0);
+            return;
+        }
         // Measured on this clock, not from `arrival_us`. Every stage stamps
         // with a `MediaClock` of its own, and each one starts its epoch when
         // it is built — so a drift window filled from the backend's stamps and
@@ -892,5 +921,71 @@ mod supersede_tests {
             .expect("a frame");
         assert_eq!(out.frame_id, 1, "the oldest, not the newest");
         assert_eq!(session.superseded(), 0);
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use gsa_client_backend_api::{CaptureClock, RecoverySink};
+
+    #[derive(Debug)]
+    struct NoRecovery;
+    impl RecoverySink for NoRecovery {
+        fn request_keyframe(&self) {}
+    }
+
+    fn session() -> super::StreamSession {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        super::StreamSession::with_capture_clock(
+            rx,
+            std::sync::Arc::new(NoRecovery),
+            gsa_core::time::MediaClock::new(),
+            crate::ClockSync::default(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            CaptureClock::StreamPts,
+        )
+    }
+
+    /// The failure this guards: change-driven encoding makes a still screen
+    /// look like a slow frame rate, and an averaged interval then inflates
+    /// the one-frame hold budget into tens of milliseconds of real latency.
+    /// Idle gaps land in the upper tail; the learned cadence must not move.
+    #[test]
+    fn idle_gaps_do_not_inflate_the_learned_interval() {
+        let mut s = session();
+        let mut ts = 1_000_000u32;
+        // A 24 fps film with a still shot every second or so: nine real
+        // frames, then a 180 ms pause, repeated.
+        for _ in 0..12 {
+            for _ in 0..9 {
+                ts = ts.wrapping_add(41_667);
+                let _ = s.learn_frame_interval(ts);
+            }
+            ts = ts.wrapping_add(180_000);
+            let _ = s.learn_frame_interval(ts);
+        }
+        let learned = s.frame_interval_us();
+        assert!(
+            (40_000..=44_000).contains(&learned),
+            "24 fps with stills must still learn ~41.7 ms, got {learned}"
+        );
+    }
+
+    /// A steady stream still learns its actual rate — the percentile must not
+    /// bias a clean cadence downward either.
+    #[test]
+    fn a_steady_cadence_is_learned_exactly() {
+        let mut s = session();
+        let mut ts = 1_000_000u32;
+        for _ in 0..40 {
+            ts = ts.wrapping_add(8_333);
+            let _ = s.learn_frame_interval(ts);
+        }
+        let learned = s.frame_interval_us();
+        assert!(
+            (8_000..=8_700).contains(&learned),
+            "120 fps must learn ~8.3 ms, got {learned}"
+        );
     }
 }
