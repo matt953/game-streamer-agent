@@ -2,6 +2,7 @@
 //! `cargo xtask ci-e2e` runs the loopback pipeline and asserts on it; the
 //! JSON report it writes is the latency-ledger artifact (spec 13).
 
+mod bench;
 mod logs;
 mod shaper;
 mod taint;
@@ -72,6 +73,24 @@ enum Cmd {
         #[arg(long)]
         identity: Option<String>,
     },
+    /// Run a game's own benchmark over a Moonlight session, unattended: a
+    /// real 60 fps workload, driven through its menus, with a screenshot of
+    /// every step and the results frame at the end.
+    Bench {
+        /// The Moonlight host's cleartext address.
+        #[arg(long, default_value = "192.168.50.184:47989")]
+        host: std::net::SocketAddr,
+        /// Where the screenshots and log go.
+        #[arg(long, default_value = "target/bench")]
+        out: PathBuf,
+        #[arg(long, default_value = "hevc")]
+        codec: String,
+        #[arg(long, default_value = "balanced")]
+        pacing: String,
+        /// Passed straight to the client, for `--jitter-ms` and the like.
+        #[arg(long = "client-arg")]
+        client_args: Vec<String>,
+    },
     /// Clean-room check (spec 16): fail if a shipped artifact contains the
     /// name of a project we may not derive from. Run before any release.
     TaintAudit {
@@ -119,6 +138,13 @@ fn main() -> Result<()> {
             }
         }
         Cmd::DevSign { identity } => dev_sign(identity),
+        Cmd::Bench {
+            host,
+            out,
+            codec,
+            pacing,
+            client_args,
+        } => bench::bench(host, &out, &codec, &pacing, &client_args),
         Cmd::TaintAudit { paths } => taint::taint_audit(paths),
     }
 }
