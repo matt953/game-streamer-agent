@@ -28,12 +28,13 @@ pub enum PacingMode {
     #[default]
     Balanced,
     /// Balanced, and never ask the host for more frames than the display can
-    /// show — one below its refresh rate.
+    /// show — one below its refresh rate — and never drop one.
     ///
-    /// Removes the case where the stream and the panel run at almost the same
-    /// rate and beat against each other. Costs a frame per second of content
-    /// and misbehaves on a display whose rate varies, since "the refresh rate"
-    /// is then not one number.
+    /// Staying below the refresh rate is what makes not dropping affordable:
+    /// the display always has a slot free, so a frame never has to be
+    /// discarded to keep up. Dropping as well would defeat the point of the
+    /// mode. Costs a frame per second of content, and misbehaves on a display
+    /// whose rate varies, since "the refresh rate" is then not one number.
     BalancedFpsLimit,
     /// Never discard a frame, whatever it costs.
     ///
@@ -64,11 +65,13 @@ impl PacingMode {
     /// arrives.
     ///
     /// Dropping keeps latency from growing; keeping guarantees every frame is
-    /// seen. That is the whole difference between the fastest mode and the
-    /// smoothest one.
+    /// seen. The two modes that never drop do it for different reasons:
+    /// [`Self::Smoothest`] pays for it in queue depth, while
+    /// [`Self::BalancedFpsLimit`] pays for it by asking for fewer frames in
+    /// the first place.
     #[must_use]
     pub fn drops_unshown(self) -> bool {
-        !matches!(self, Self::Smoothest)
+        !matches!(self, Self::Smoothest | Self::BalancedFpsLimit)
     }
 
     /// Whether any holding happens at all.
@@ -141,18 +144,18 @@ mod tests {
         assert!(PacingMode::LowestLatency.drops_unshown());
     }
 
-    /// The smoothest mode is the only one that refuses to drop, and it pays
-    /// for that in depth. Both halves have to be true or the name lies.
+    /// Two modes never drop a frame, and they buy that differently: the
+    /// smoothest one queues deeper, the limiting one asks for fewer frames.
+    /// The reference client defines both that way — "limits the FPS value to
+    /// the display refresh rate - 1 and never drops frames" — and a limiting
+    /// mode that dropped would defeat its own purpose.
     #[test]
-    fn only_the_smoothest_mode_keeps_every_frame() {
+    fn the_modes_that_never_drop_are_the_smoothest_and_the_limited_one() {
         assert!(!PacingMode::Smoothest.drops_unshown());
+        assert!(!PacingMode::BalancedFpsLimit.drops_unshown());
         assert!(PacingMode::Smoothest.hold_cap_us(AT_60) > PacingMode::Balanced.hold_cap_us(AT_60));
 
-        for mode in [
-            PacingMode::LowestLatency,
-            PacingMode::Balanced,
-            PacingMode::BalancedFpsLimit,
-        ] {
+        for mode in [PacingMode::LowestLatency, PacingMode::Balanced] {
             assert!(mode.drops_unshown(), "{} must drop", mode.label());
         }
     }

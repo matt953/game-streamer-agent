@@ -117,6 +117,8 @@ pub(crate) struct MoonlightOpts {
     /// only today, so asking for more would negotiate a stream they cannot
     /// show.
     pub decode_codecs: Vec<gsa_core::media::Codec>,
+    /// The latency-for-smoothness trade for the shared session to enforce.
+    pub pacing: gsa_client_core::PacingMode,
 }
 
 impl MoonlightOpts {
@@ -200,6 +202,7 @@ pub(crate) fn run_session(
             // real, absolute latency is not.
             gsa_client_core::CaptureClock::StreamPts,
         );
+        core.set_pacing(opts.pacing);
 
         // What the link delivered and what pacing made of it, republished
         // each frame below so an overlay can show both.
@@ -230,10 +233,26 @@ pub(crate) fn run_session(
             crate::boost_thread_qos();
             let audio_ctx = audio_ctx;
             while let Ok(pcm) = audio_rx.recv() {
-                if let Some(cb) = on_audio {
-                    // SAFETY: pointer+len describe this owned buffer for the
-                    // call; the embedder copies whatever it keeps.
-                    unsafe { cb(audio_ctx.0, pcm.as_ptr(), pcm.len()) };
+                // Bound the backlog before delivering: a sink that blocks (a full
+                // platform audio buffer) lets this channel grow during a stall,
+                // and every queued packet plays that far behind the live video —
+                // a desync that never heals, because the queue only drains by
+                // underrun. Keeping only the newest few packets means a stall is
+                // followed by a jump back to live rather than a permanent lag.
+                const MAX_QUEUED_PACKETS: usize = 5; // ~50 ms at 10 ms a packet
+                let mut queued = std::collections::VecDeque::from([pcm]);
+                while let Ok(more) = audio_rx.try_recv() {
+                    queued.push_back(more);
+                    if queued.len() > MAX_QUEUED_PACKETS {
+                        queued.pop_front();
+                    }
+                }
+                for pcm in queued {
+                    if let Some(cb) = on_audio {
+                        // SAFETY: pointer+len describe this owned buffer for the
+                        // call; the embedder copies what it keeps.
+                        unsafe { cb(audio_ctx.0, pcm.as_ptr(), pcm.len()) };
+                    }
                 }
             }
         });

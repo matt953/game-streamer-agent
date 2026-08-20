@@ -270,12 +270,17 @@ pub unsafe extern "C" fn gsa_host_session_start(
         } else {
             bitrate_kbps
         },
+        pacing: crate::pacing_from_u32(mode.pacing),
         mode: {
             let (width, height, fps) = mode.resolve();
             gsa_backend_moonlight::StreamMode {
                 width,
                 height,
-                fps,
+                // The one mode that touches the request: staying a frame
+                // below the display's rate is what stops the two cadences
+                // beating. The embedder passes its display's rate as `fps`,
+                // so that is the figure to stay below.
+                fps: crate::pacing_from_u32(mode.pacing).requested_fps(fps, Some(fps)),
                 allow_host_mode_change: mode.allow_host_mode_change != 0,
                 hdr: mode.hdr != 0,
                 ..Default::default()

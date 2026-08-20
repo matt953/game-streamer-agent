@@ -220,6 +220,28 @@ pub struct GsaStreamMode {
     /// whose display cannot do HDR answers in SDR without saying so, so what
     /// arrived is reported per session rather than assumed from this.
     pub hdr: u32,
+    /// The latency-for-smoothness trade, one of the `GSA_PACING_*` values.
+    /// The whole policy — how long a frame may be held, whether an unshown
+    /// frame is dropped for a newer one, what rate to ask the host for — is
+    /// resolved from this one value in the shared core, so a platform cannot
+    /// quietly mean something different by the same setting. Out-of-range
+    /// values fall back to Balanced, the recommended default.
+    pub pacing: u32,
+}
+
+/// `GsaStreamMode::pacing` values, matching the reference client's modes.
+pub const GSA_PACING_LOWEST_LATENCY: u32 = 0;
+pub const GSA_PACING_BALANCED: u32 = 1;
+pub const GSA_PACING_BALANCED_FPS_LIMIT: u32 = 2;
+pub const GSA_PACING_SMOOTHEST: u32 = 3;
+
+pub(crate) fn pacing_from_u32(value: u32) -> gsa_client_core::PacingMode {
+    match value {
+        GSA_PACING_LOWEST_LATENCY => gsa_client_core::PacingMode::LowestLatency,
+        GSA_PACING_BALANCED_FPS_LIMIT => gsa_client_core::PacingMode::BalancedFpsLimit,
+        GSA_PACING_SMOOTHEST => gsa_client_core::PacingMode::Smoothest,
+        _ => gsa_client_core::PacingMode::Balanced,
+    }
 }
 
 impl GsaStreamMode {
@@ -1189,10 +1211,26 @@ async fn session_loop(
         boost_thread_qos(); // audio must not be starved by background work
         let audio_ctx = audio_ctx;
         while let Ok(pcm) = audio_rx.recv() {
-            if let Some(cb) = on_audio {
-                // SAFETY: pointer+len describe this owned buffer for the call;
-                // the embedder copies what it keeps.
-                unsafe { cb(audio_ctx.0, pcm.as_ptr(), pcm.len()) };
+            // Bound the backlog before delivering: a sink that blocks (a full
+            // platform audio buffer) lets this channel grow during a stall,
+            // and every queued packet plays that far behind the live video —
+            // a desync that never heals, because the queue only drains by
+            // underrun. Keeping only the newest few packets means a stall is
+            // followed by a jump back to live rather than a permanent lag.
+            const MAX_QUEUED_PACKETS: usize = 5; // ~50 ms at 10 ms a packet
+            let mut queued = std::collections::VecDeque::from([pcm]);
+            while let Ok(more) = audio_rx.try_recv() {
+                queued.push_back(more);
+                if queued.len() > MAX_QUEUED_PACKETS {
+                    queued.pop_front();
+                }
+            }
+            for pcm in queued {
+                if let Some(cb) = on_audio {
+                    // SAFETY: pointer+len describe this owned buffer for the
+                    // call; the embedder copies what it keeps.
+                    unsafe { cb(audio_ctx.0, pcm.as_ptr(), pcm.len()) };
+                }
             }
         }
     });
