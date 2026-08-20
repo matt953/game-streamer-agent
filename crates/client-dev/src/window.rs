@@ -37,6 +37,10 @@ enum AppEvent {
     Frame(Box<DecodedFrame>),
     /// Rolling received video goodput (Mb/s), for the title HUD.
     RecvMbps(Option<f64>),
+    /// Fresh overlay text from the session loop — the stream's half of the
+    /// on-screen stats. The presenter appends its own half (pads, display)
+    /// and rasterises.
+    Overlay(Vec<String>),
     /// What the decoder is actually producing, once it has configured itself.
     VideoFormat(gsa_client_core::VideoFormat),
     /// Agent-pushed notification (e.g. host confirmed the virtual pad plugged).
@@ -704,6 +708,27 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
             let mut reported_format: Option<gsa_client_core::VideoFormat> = None;
             let deadline = (seconds > 0)
                 .then(|| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
+            // A termination signal must run the same teardown as a clean
+            // exit. Without this, Ctrl-C or a killed process skips the
+            // session cancel below, the host keeps the session, and the next
+            // connect resumes into a stream that never sends a frame — the
+            // grey screen. (SIGKILL still cannot be caught; nothing can.)
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            let interrupted = async move {
+                match (&mut sigint, &mut sigterm) {
+                    (Some(int), Some(term)) => {
+                        tokio::select! {
+                            _ = int.recv() => {},
+                            _ = term.recv() => {},
+                        }
+                    }
+                    _ => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(interrupted);
             let result = loop {
                 if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     break Ok(());
@@ -714,19 +739,33 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 // it will not give up.
                 let received = if frames == 0 && first_frame_s > 0 {
                     let wait = std::time::Duration::from_secs(first_frame_s);
-                    match tokio::time::timeout(wait, core.recv_frame(decoder.as_mut())).await {
-                        Ok(received) => received,
-                        Err(_) => {
-                            break Err(anyhow::anyhow!(
-                                "no video {first_frame_s}s after the session started — the host \
-                                 is almost certainly still holding an earlier session. Clear it \
-                                 with:\n  cargo run -q --release -p gsa-backend-moonlight \
-                                 --example launch -- {addr} {app_id}"
-                            ));
+                    tokio::select! {
+                        () = &mut interrupted => {
+                            tracing::info!("termination signal; tearing the session down");
+                            break Ok(());
+                        }
+                        r = tokio::time::timeout(wait, core.recv_frame(decoder.as_mut())) => {
+                            match r {
+                                Ok(received) => received,
+                                Err(_) => {
+                                    break Err(anyhow::anyhow!(
+                                        "no video {first_frame_s}s after the session started — the host \
+                                         is almost certainly still holding an earlier session. Clear it \
+                                         with:\n  cargo run -q --release -p gsa-backend-moonlight \
+                                         --example launch -- {addr} {app_id}"
+                                    ));
+                                }
+                            }
                         }
                     }
                 } else {
-                    core.recv_frame(decoder.as_mut()).await
+                    tokio::select! {
+                        () = &mut interrupted => {
+                            tracing::info!("termination signal; tearing the session down");
+                            break Ok(());
+                        }
+                        r = core.recv_frame(decoder.as_mut()) => r,
+                    }
                 };
                 let Some(out) = received? else {
                     break Ok(());
@@ -891,6 +930,55 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         },
                         "moonlight stream stats"
                     );
+
+                    // The same figures, for eyes: the presenter composites
+                    // these over the stream, appending its own half.
+                    let chain = core.latency_chain();
+                    let stage_ms = |s: Option<gsa_client_core::StagePercentiles>| {
+                        s.map_or_else(
+                            || "     —".to_owned(),
+                            |p| {
+                                format!(
+                                    "{:5.1} {:5.1} {:5.1}",
+                                    f64::from(p.p50_us) / 1000.0,
+                                    f64::from(p.p95_us) / 1000.0,
+                                    f64::from(p.p99_us) / 1000.0
+                                )
+                            },
+                        )
+                    };
+                    let lines = vec![
+                        format!(
+                            "fps {:5.1}  low1 {:5.1}  {}",
+                            f64::from(present.fps_x100) / 100.0,
+                            f64::from(present.low1_fps_x100) / 100.0,
+                            decoder
+                                .video_format()
+                                .map_or_else(|| "-".to_string(), |f| f.label())
+                        ),
+                        format!(
+                            "recv {} Mb/s  frames {}  drop {}  sup {}",
+                            stats
+                                .recv_mbps
+                                .map_or_else(|| "-".to_owned(), |m| format!("{m:.1}")),
+                            frames,
+                            stats.frames_dropped_incomplete,
+                            core.superseded()
+                        ),
+                        format!(
+                            "jitter {:.1} -> {:.1} ms  hold {:.1} ms",
+                            f64::from(core.jitter_us()) / 1000.0,
+                            f64::from(core.released_jitter_us()) / 1000.0,
+                            f64::from(core.mean_hold_us()) / 1000.0
+                        ),
+                        "latency  p50   p95   p99  (ms)".to_owned(),
+                        format!("  rtt   {}", stage_ms(chain.rtt)),
+                        format!("  host  {}", stage_ms(chain.host)),
+                        format!("  decode{}", stage_ms(chain.decode)),
+                        format!("  hold  {}", stage_ms(chain.hold)),
+                        format!("  total {}", stage_ms(chain.total)),
+                    ];
+                    let _ = proxy.send_event(AppEvent::Overlay(lines));
                 }
                 if proxy
                     .send_event(AppEvent::Frame(Box::new(out.frame)))
@@ -1068,6 +1156,11 @@ struct App {
     latest_ready_at: Option<std::time::Instant>,
     latest_shown: bool,
     presentation: crate::present::PresentLedger,
+    /// The session loop's half of the on-screen stats, refreshed with its
+    /// stats tick; the presenter appends its own half before rasterising.
+    overlay_stream_lines: Vec<String>,
+    /// The last rumble the host asked for, for the pad line.
+    last_rumble: Option<(u16, u16)>,
     /// Redraws that reached no display, because the window is hidden.
     occluded: u64,
     /// The trade in force, which decides whether an unshown frame may be
@@ -1216,6 +1309,48 @@ impl App {
                 .unwrap_or_else(|| "unknown".to_owned()),
             "presentation"
         );
+    }
+
+    /// Rebuild the on-screen stats from the session's lines plus what only
+    /// the presenter knows: pacing mode, display behaviour, controllers.
+    fn refresh_overlay(&mut self) {
+        let mut lines = self.overlay_stream_lines.clone();
+        lines.push(format!("mode    {}", self.pacing.label()));
+        if let Some(s) = self.presentation.summary() {
+            lines.push(format!(
+                "present wait {:.1}ms  repeats {:.1}%  unshown {:.1}%",
+                f64::from(s.wait_p50_us) / 1000.0,
+                s.repeat_pct(),
+                s.superseded_pct()
+            ));
+            if let Some(hz) = display_refresh_hz() {
+                let grid = self.presentation.grid_fit(hz).map_or("grid ?", |f| {
+                    if f.is_fixed() { "pinned" } else { "adapting" }
+                });
+                lines.push(format!("display {hz:.0}Hz {grid}"));
+            }
+        }
+        // Controllers: what is plugged, what the host asked of it. Absent
+        // rather than blank when nothing is connected.
+        let pads = if self.gamepad.is_some() { 1 } else { 0 };
+        #[cfg(target_os = "macos")]
+        let pads = pads + usize::from(self.platform_pad.is_some());
+        if pads > 0 {
+            let motion = if self.motion_hz > 0 {
+                format!("  motion {}Hz", self.motion_hz)
+            } else {
+                String::new()
+            };
+            let rumble = self
+                .last_rumble
+                .map(|(low, high)| format!("  rumble {low}/{high}"))
+                .unwrap_or_default();
+            lines.push(format!("pads    {pads}{motion}{rumble}"));
+        }
+        let image = crate::overlay::rasterise(&lines);
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_overlay(&image);
+        }
     }
 
     fn update_title(&self) {
@@ -1438,12 +1573,17 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::Rumble { low, high } => {
+                self.last_rumble = Some((low, high));
                 #[cfg(target_os = "macos")]
                 if let Some(pad) = &mut self.platform_pad {
                     pad.rumble(low, high);
                 }
                 #[cfg(not(target_os = "macos"))]
                 let _ = (low, high);
+            }
+            AppEvent::Overlay(lines) => {
+                self.overlay_stream_lines = lines;
+                self.refresh_overlay();
             }
             AppEvent::MotionRequested { rate_hz } => {
                 tracing::info!(rate_hz, "host asked for motion");
@@ -1824,6 +1964,40 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Textured quad for the stats overlay, positioned by a uniform rect.
+///
+/// The overlay's values are sRGB; on the PQ surface they come out dimmer than
+/// on the SDR one, which is acceptable for an instrument readout and saves a
+/// second encode path.
+const OVERLAY_SHADER: &str = r#"
+struct Rect { rect: vec4<f32> };
+@group(0) @binding(0) var overlay_tex: texture_2d<f32>;
+@group(0) @binding(1) var overlay_samp: sampler;
+@group(0) @binding(2) var<uniform> r: Rect;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var xs = array<f32, 6>(r.rect.x, r.rect.z, r.rect.x, r.rect.z, r.rect.z, r.rect.x);
+    var ys = array<f32, 6>(r.rect.y, r.rect.y, r.rect.w, r.rect.y, r.rect.w, r.rect.w);
+    var us = array<f32, 6>(0.0, 1.0, 0.0, 1.0, 1.0, 0.0);
+    var vs = array<f32, 6>(0.0, 0.0, 1.0, 0.0, 1.0, 1.0);
+    var out: VsOut;
+    out.pos = vec4<f32>(xs[i], ys[i], 0.0, 1.0);
+    out.uv = vec2<f32>(us[i], vs[i]);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(overlay_tex, overlay_samp, in.uv);
+}
+"#;
+
 /// Solid-colour quad for the notification toast. `rect` is (x0, y0, x1, y1) in
 /// clip space; `color` is premultiplied-alpha-friendly straight RGBA.
 const BAR_SHADER: &str = r#"
@@ -1867,6 +2041,13 @@ struct Gpu {
     pq_format: Option<wgpu::TextureFormat>,
     /// The toast pipeline for the PQ surface, when there is one.
     bar_pipeline_pq: Option<wgpu::RenderPipeline>,
+    /// Stats overlay: pipelines per surface format, layout, position uniform,
+    /// and the current text texture when there is one.
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_pipeline_pq: Option<wgpu::RenderPipeline>,
+    overlay_bind_layout: wgpu::BindGroupLayout,
+    overlay_uniform: wgpu::Buffer,
+    overlay: Option<(wgpu::BindGroup, u32, u32)>,
     bar_pipeline: wgpu::RenderPipeline,
     bar_uniform: wgpu::Buffer,
     bar_bind: wgpu::BindGroup,
@@ -2161,6 +2342,85 @@ impl Gpu {
         let bar_pipeline = bar_pipeline_for(sdr_format);
         let bar_pipeline_pq = pq_format.map(bar_pipeline_for);
 
+        // The stats overlay: a textured quad whose position arrives by
+        // uniform, compiled per surface format like the toast.
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay"),
+            source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER.into()),
+        });
+        let overlay_bind_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("overlay"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let overlay_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("overlay"),
+            bind_group_layouts: &[Some(&overlay_bind_layout)],
+            ..Default::default()
+        });
+        let overlay_pipeline_for = |format: wgpu::TextureFormat| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("overlay"),
+                layout: Some(&overlay_layout),
+                vertex: wgpu::VertexState {
+                    module: &overlay_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &overlay_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let overlay_pipeline = overlay_pipeline_for(sdr_format);
+        let overlay_pipeline_pq = pq_format.map(overlay_pipeline_for);
+
         Ok(Self {
             hdr_pipeline,
             hdr_pipeline_full,
@@ -2169,6 +2429,11 @@ impl Gpu {
             sdr_format,
             pq_format,
             bar_pipeline_pq,
+            overlay_pipeline,
+            overlay_pipeline_pq,
+            overlay_bind_layout,
+            overlay_uniform,
+            overlay: None,
             surface,
             device,
             queue,
@@ -2303,6 +2568,64 @@ impl Gpu {
             height,
             order,
         });
+    }
+
+    /// Replace the stats overlay with a freshly rasterised image.
+    fn set_overlay(&mut self, image: &crate::overlay::OverlayImage) {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("overlay"),
+            size: wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(image.width * 4),
+                rows_per_image: Some(image.height),
+            },
+            wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("overlay"),
+            layout: &self.overlay_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &texture.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.overlay_uniform.as_entire_binding(),
+                },
+            ],
+        });
+        self.overlay = Some((bind, image.width, image.height));
     }
 
     /// The presented (letterboxed) content rectangle in surface pixels:
@@ -2464,6 +2787,36 @@ impl Gpu {
                     &self.bar_pipeline
                 });
                 pass.set_bind_group(0, &self.bar_bind, &[]);
+                pass.draw(0..6, 0..1);
+            }
+
+            // The stats overlay, top-left. Rasterised oversize and drawn
+            // slightly smaller: the linear sampler softens the downscale,
+            // which reads better than nearest-integer glyph blocks.
+            if let Some((bind, w, h)) = &self.overlay {
+                const DRAW_SCALE: f32 = 0.85;
+                let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+                let (x0, y0) = (16.0f32, 16.0f32);
+                let (x1, y1) = (x0 + *w as f32 * DRAW_SCALE, y0 + *h as f32 * DRAW_SCALE);
+                let rect = [
+                    x0 / sw * 2.0 - 1.0,
+                    1.0 - y0 / sh * 2.0,
+                    x1 / sw * 2.0 - 1.0,
+                    1.0 - y1 / sh * 2.0,
+                ];
+                let mut bytes = [0u8; 16];
+                for (i, v) in rect.iter().enumerate() {
+                    bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+                }
+                self.queue.write_buffer(&self.overlay_uniform, 0, &bytes);
+                pass.set_pipeline(if self.surface_is_pq {
+                    self.overlay_pipeline_pq
+                        .as_ref()
+                        .unwrap_or(&self.overlay_pipeline)
+                } else {
+                    &self.overlay_pipeline
+                });
+                pass.set_bind_group(0, bind, &[]);
                 pass.draw(0..6, 0..1);
             }
         }

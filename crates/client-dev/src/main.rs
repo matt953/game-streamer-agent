@@ -18,6 +18,7 @@ mod headless;
 mod input_capture;
 mod moonlight;
 mod netsim;
+mod overlay;
 mod pairing;
 mod present;
 mod script;
