@@ -63,6 +63,7 @@ Reported as **p50 / p95 / p99** per stage, in ms, on the stream overlays
 | **dejitter_duty** | frames paced vs skipped-for-backlog: whether the smoother actually ran. |
 | **latency_growth** | change in transit drift since the session's first frame, in real ms. The one figure a *steady* backlog shows up in: a queue that fills once and never drains has no spread at all. Small and stable (either sign) is healthy; large and climbing is a filling queue. |
 | **superseded** | frames decoded and then discarded unseen under the drop policy (still decoded — the reference chain needs them). |
+| **content_pauses** | frames released immediately because their capture gap was the host's own idle time (change-driven encoding pausing on a still screen). Kept out of the jitter signal and the hold budget; the count proves the exclusion ran rather than merely that nothing went wrong. |
 | **dropped / recovered** | frames lost to the wire vs rebuilt from FEC parity. |
 | **recv_mbps** | rolling received goodput — what actually arrived and survived, vs what was requested. |
 
