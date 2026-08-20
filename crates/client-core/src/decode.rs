@@ -16,6 +16,46 @@ use gsa_core::Result;
 pub enum PixelOrder {
     Rgba,
     Bgra,
+    /// Two planes of 10-bit samples in 16-bit words, BT.2020 primaries, PQ
+    /// transfer: full-width luma followed by half-resolution interleaved
+    /// Cb,Cr. Not converted, because there is nothing to convert *to* until
+    /// the destination is known.
+    ///
+    /// An HDR surface wants exactly these values, so converting on the way
+    /// out would mean undoing it again; and converting to SDR on the CPU
+    /// costs more per frame than decoding one. Either way the choice belongs
+    /// to the presenter, which is the only part that knows what the display
+    /// can accept.
+    P010Bt2020Pq {
+        /// Whether the samples use the full 0-1023 range rather than studio
+        /// 64-940. Carried rather than assumed: reading limited-range samples
+        /// as full crushes blacks and clips whites, which looks like a bad
+        /// stream rather than a mistake.
+        full_range: bool,
+    },
+}
+
+impl PixelOrder {
+    /// Bytes one frame occupies at this size.
+    ///
+    /// Planar formats are not `width * height * 4`, and a presenter that
+    /// assumes they are reads past the end of the buffer.
+    #[must_use]
+    pub fn frame_bytes(self, width: usize, height: usize) -> usize {
+        match self {
+            Self::Rgba | Self::Bgra => width * height * 4,
+            // Luma, then half-resolution chroma pairs; two bytes a sample.
+            Self::P010Bt2020Pq { .. } => {
+                width * height * 2 + width.div_ceil(2) * height.div_ceil(2) * 4
+            }
+        }
+    }
+
+    /// Whether these samples carry more than an SDR display can show.
+    #[must_use]
+    pub fn is_hdr(self) -> bool {
+        matches!(self, Self::P010Bt2020Pq { .. })
+    }
 }
 
 #[derive(Debug, Clone)]

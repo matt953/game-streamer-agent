@@ -17,23 +17,33 @@ use anyhow::{Context, Result, bail};
 /// Shadow of the Tomb Raider's benchmark, as published by the host.
 const SOTR_APP_ID: u32 = 1_825_961_046;
 
-/// Menu navigation by pointer position, because no count of keypresses is
-/// reliable here.
+/// Menu navigation by pointer position, with real time between the steps.
 ///
-/// Both menus *wrap*, so over-pressing Up reaches no edge to count from — six
-/// Ups over the five selectable main-menu entries is a net one Up, which is a
-/// different item every time. And the starting selection follows the mouse, so
-/// there is no fixed origin either. A keyboard sequence is right by luck and
-/// silently walks into Challenge Tombs the run after; two runs did exactly
-/// that and were reported as benchmark results.
+/// Both menus *wrap*, so over-pressing an arrow key reaches no edge to count
+/// from — six Ups over five selectable entries is a net one Up, which walked
+/// two runs into Challenge Tombs. And the starting selection follows the
+/// mouse, so counting from it has no fixed origin either. Clicking where an
+/// item is drawn depends on neither.
 ///
-/// Clicking where an item is drawn depends on neither. `[R] Run Benchmark` is
-/// still a footer action of the Display and Graphics page, so it is pressed
-/// only once that page is open.
-const NAVIGATION: &str = "30s at:0.13,0.41 click 8s at:0.13,0.357 click 10s r";
+/// The gaps are generous on purpose. A click sent too soon after a pointer
+/// move lands at the *old* position: one run opened MOUSE instead of DISPLAY
+/// AND GRAPHICS because y=0.41 is OPTIONS in the main menu and MOUSE in the
+/// submenu, and the move had not been applied yet. That race is why an
+/// identical script worked minutes earlier and then did not.
+///
+/// `[R] RUN BENCHMARK` is a footer action of the Display and Graphics page and
+/// does nothing until that page is open. The pause before it is the window for
+/// setting resolution and refresh by hand, which the game keeps rather than
+/// taking from the stream.
+const NAVIGATION: &str = "50s at:0.13,0.41 click 20s at:0.13,0.357 click 30s r";
 
 /// The benchmark itself, then a frame of the results.
-const BENCHMARK: &str = "220s shot";
+///
+/// The benchmark's own running time, no longer than it needs to be. It was
+/// raised to 320 s while the harness was capped at 85 fps by a CPU colour
+/// conversion and everything ran late; with that gone the run is back to its
+/// normal length and the extra wait was dead time at the end of every run.
+const BENCHMARK: &str = "200s shot";
 
 pub fn bench(
     host: std::net::SocketAddr,
@@ -55,10 +65,21 @@ pub fn bench(
         .arg(host.to_string())
         .args(["--moonlight-app", &SOTR_APP_ID.to_string()])
         .args(["--codecs", codec])
-        .args(["--moonlight-mode", "1920x1080@60"])
+        // The geometry of the *stream*, which is not the geometry the game
+        // renders at: the game keeps its own resolution setting and is
+        // downscaled into whatever is asked for here. So this does not lower
+        // the host's load — only changing the game's own setting does. Asking
+        // for less than the game renders just adds a downscale.
+        .args(["--moonlight-mode", "1920x1080@120"])
+        // Enough headroom that the encoder, not the ceiling, decides the
+        // bitrate. At 1440p120 a 20 Mb/s cap is the thing being measured.
+        .args(["--moonlight-mbps", "100"])
+        // A request, not a guarantee — what actually arrives is reported per
+        // session and is part of what this run is checking.
+        .arg("--moonlight-hdr")
         // Longer than the script, so the session outlives it rather than
         // cutting the results frame off at the end.
-        .args(["--moonlight-seconds", "300"])
+        .args(["--moonlight-seconds", "400"])
         .args(["--present-mode", "vsync"])
         .args(["--pacing", pacing])
         .arg("--dump-frame")
@@ -77,7 +98,54 @@ pub fn bench(
         bail!("the client exited with {status}; see {}", log.display());
     }
 
+    // A host that reports itself free can still be winding the previous
+    // session down, and one that is still holding it accepts the connection
+    // and then sends nothing. The client gives up on that in seconds, so the
+    // cheap answer is to clear the host properly and go again rather than
+    // hand a person a grey screen and ask them to run a command.
+    if std::fs::read_to_string(&log).is_ok_and(|t| t.contains("no video")) {
+        println!("no video — clearing the host and retrying once…");
+        clear_host(host)?;
+        let mut handle =
+            std::fs::File::create(&log).with_context(|| format!("create {}", log.display()))?;
+        let status = client
+            .stdout(handle.try_clone().context("clone log handle")?)
+            .stderr(handle.try_clone().context("clone log handle")?)
+            .status()
+            .context("run gsa-client-dev")?;
+        let _ = &mut handle;
+        if !status.success() {
+            bail!("the client exited with {status}; see {}", log.display());
+        }
+    }
+
     report(out, &log)
+}
+
+/// Resume the host's stranded session and quit it cleanly.
+///
+/// Killing it is what leaves the next attempt with no picture, so this goes
+/// through the same path a real client would.
+fn clear_host(host: std::net::SocketAddr) -> Result<()> {
+    let _ = Command::new(env!("CARGO"))
+        .args([
+            "run",
+            "--quiet",
+            "--release",
+            "-p",
+            "gsa-backend-moonlight",
+            "--example",
+            "launch",
+            "--",
+        ])
+        .arg(host.to_string())
+        .arg(SOTR_APP_ID.to_string())
+        .output()
+        .context("clear the host's session")?;
+    // The host reports itself free before it actually is, so the wait is not
+    // optional — this is the race that produced the grey screens.
+    std::thread::sleep(std::time::Duration::from_secs(20));
+    Ok(())
 }
 
 /// Refuse to start against a host that is still holding a session.
@@ -199,9 +267,8 @@ mod tests {
         let script = format!("{NAVIGATION} {BENCHMARK}");
         let steps = script.split_whitespace().collect::<Vec<_>>();
 
-        // No arrow keys anywhere. This is the whole fix: two runs walked into
-        // Challenge Tombs on a sequence that had worked before, because six
-        // Ups over five wrapping entries is a net one Up.
+        // No arrow keys. Both menus wrap, so a count of Downs has no edge to
+        // start from and lands somewhere different every run.
         for arrow in ["up", "down", "left", "right"] {
             assert!(
                 !steps.contains(&arrow),
@@ -231,7 +298,7 @@ mod tests {
         assert!(r > clicks[1], "R only works once that page is open");
 
         // And the benchmark's own running time is waited out before the shot.
-        assert!(script.contains("220s shot"));
+        assert!(script.contains("200s shot"));
     }
 
     #[test]

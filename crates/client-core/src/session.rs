@@ -72,6 +72,11 @@ pub struct StreamSession {
     /// that shows nothing however well it works. This is the same quantity
     /// taken after the hold, and it is the one that should shrink.
     released_jitter_us: u32,
+    /// Drift at the first release, and how far it has moved since — real
+    /// milliseconds of latency gained, the one figure a steady backlog shows
+    /// up in.
+    first_release_drift_us: Option<u32>,
+    latency_growth_us: i64,
     released_win: std::collections::VecDeque<u32>,
     /// The latency-for-smoothness trade this session is making.
     pacing: crate::PacingMode,
@@ -93,6 +98,10 @@ pub struct StreamSession {
     dejitter_ran: u64,
     dejitter_active: bool,
     first_gate_us: Option<u64>,
+    /// Frames decoded and then discarded because newer ones were already
+    /// queued — the drop half of the pacing policy, enforced here so every
+    /// embedder gets it.
+    superseded: u64,
 }
 
 impl std::fmt::Debug for StreamSession {
@@ -163,6 +172,8 @@ impl StreamSession {
             jitter_win: std::collections::VecDeque::new(),
             last_jitter_us: 0,
             released_jitter_us: 0,
+            first_release_drift_us: None,
+            latency_growth_us: 0,
             released_win: std::collections::VecDeque::new(),
             pacing: crate::PacingMode::default(),
             // Until measured, assume 60 fps: it is the commonest rate and the
@@ -175,6 +186,7 @@ impl StreamSession {
             dejitter_ran: 0,
             dejitter_active: false,
             first_gate_us: None,
+            superseded: 0,
         }
     }
 
@@ -241,6 +253,22 @@ impl StreamSession {
     fn note_release(&mut self, capture_ts_us: u32) {
         const WIN: usize = 64;
         let drift = transit_drift_us(self.clock.now_us(), capture_ts_us);
+        // How much further behind the stream we are than when it started.
+        //
+        // The offset between the host's clock and ours is unknown, so drift
+        // has no absolute meaning — but it is *constant*, so it cancels from a
+        // difference and this is real milliseconds of latency gained or lost.
+        //
+        // Needed because every other figure here is a spread, and a backlog
+        // that fills once and never drains has no spread at all: a queue two
+        // seconds deep looks identical to a perfect stream in jitter terms,
+        // while the picture arrives two seconds after the sound.
+        match self.first_release_drift_us {
+            None => self.first_release_drift_us = Some(drift),
+            Some(first) => {
+                self.latency_growth_us = i64::from(drift) - i64::from(first);
+            }
+        }
         if self.released_win.len() == WIN {
             self.released_win.pop_front();
         }
@@ -250,6 +278,16 @@ impl StreamSession {
             sorted.sort_unstable();
             self.released_jitter_us = sorted[sorted.len() * 9 / 10] - sorted[sorted.len() / 10];
         }
+    }
+
+    /// Latency gained since the session's first frame, in microseconds.
+    ///
+    /// Positive means the picture is further behind the host than it was at
+    /// the start — a queue that filled and never drained. Negative means it
+    /// caught up.
+    #[must_use]
+    pub fn latency_growth_us(&self) -> i64 {
+        self.latency_growth_us
     }
 
     /// Whether glass-to-glass latency exists for this backend. False under
@@ -354,6 +392,12 @@ impl StreamSession {
         )
     }
 
+    /// Frames decoded but discarded unseen under the drop policy.
+    #[must_use]
+    pub fn superseded(&self) -> u64 {
+        self.superseded
+    }
+
     /// Where cadence breaks came from, as frames arrived.
     #[must_use]
     pub fn arrival_cadence(&self) -> (u64, u64, u32) {
@@ -390,6 +434,13 @@ impl StreamSession {
     }
 
     /// Receive frames until one decodes. `None` when the stream ends.
+    ///
+    /// The pacing mode's drop policy is enforced *here*, not by the presenter:
+    /// in a mode that drops, a decoded frame with newer complete frames
+    /// already queued behind it is superseded — decoded (the reference chain
+    /// needs it) but never returned — so every embedder inherits the policy
+    /// instead of re-implementing it per platform. In the modes that never
+    /// drop, every decoded frame is returned in order.
     pub async fn recv_frame(
         &mut self,
         decoder: &mut dyn VideoDecoder,
@@ -401,6 +452,14 @@ impl StreamSession {
             let decode_start = self.clock.now_us();
             match decoder.decode(&gated.data) {
                 Ok(Some(frame)) => {
+                    // Newer frames are already waiting: showing this one would
+                    // only delay them, so it is dropped now unless the mode
+                    // promises every frame is seen. Decode still happened —
+                    // skipping it would corrupt every later frame.
+                    if self.pacing.drops_unshown() && !self.frames_rx.is_empty() {
+                        self.superseded += 1;
+                        continue;
+                    }
                     let now = self.clock.now_us();
                     let decode_us = (now - decode_start) as u32;
                     let latency_us = self.absolute_latency_us(now, gated.capture_ts_us);
@@ -677,5 +736,121 @@ mod dejitter_signal_tests {
         let capture = u32::MAX - 1_000;
         let arrival = u64::from(u32::MAX) + 4_000;
         assert_eq!(transit_drift_us(arrival, capture), 5_000);
+    }
+}
+
+#[cfg(test)]
+mod supersede_tests {
+    use gsa_client_backend_api::{BackendFrame, CaptureClock, RecoverySink};
+
+    /// A decoder that "decodes" every access unit into a one-pixel frame and
+    /// remembers how many it was fed, so the test can tell decoded-then-
+    /// discarded from never-decoded — only the second corrupts a stream.
+    struct CountingDecoder {
+        fed: usize,
+    }
+
+    impl crate::VideoDecoder for CountingDecoder {
+        fn decode(&mut self, _au: &[u8]) -> gsa_core::Result<Option<crate::DecodedFrame>> {
+            self.fed += 1;
+            Ok(Some(crate::DecodedFrame {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 4],
+                order: crate::PixelOrder::Rgba,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoRecovery;
+    impl RecoverySink for NoRecovery {
+        fn request_keyframe(&self) {}
+    }
+
+    fn session_with_frames(
+        count: u32,
+    ) -> (
+        super::StreamSession,
+        tokio::sync::mpsc::UnboundedSender<BackendFrame>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = super::StreamSession::with_capture_clock(
+            rx,
+            std::sync::Arc::new(NoRecovery),
+            gsa_core::time::MediaClock::new(),
+            crate::ClockSync::default(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            CaptureClock::StreamPts,
+        );
+        // The pacing hold is not what is under test, and a paced release
+        // would stall the drain this test measures.
+        session
+            .dejitter_flag()
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..count {
+            let _ = tx.send(BackendFrame {
+                data: vec![0u8; 16],
+                frame_id: i + 1,
+                keyframe: i == 0,
+                capture_ts_us: 1_000_000 + i * 16_667,
+                arrival_us: u64::from(1_000_000 + i * 16_667),
+            });
+        }
+        (session, tx)
+    }
+
+    /// The drop policy lives in the session, not the presenter: with newer
+    /// frames already queued, older decoded frames are discarded here and
+    /// only the newest comes out. Every frame is still *decoded* — dropping
+    /// one before the decoder would corrupt everything referencing it.
+    #[tokio::test]
+    async fn a_dropping_mode_returns_only_the_newest_queued_frame() {
+        let (mut session, _tx) = session_with_frames(4);
+        session.set_pacing(crate::PacingMode::LowestLatency);
+        let mut decoder = CountingDecoder { fed: 0 };
+        let out = session
+            .recv_frame(&mut decoder)
+            .await
+            .expect("recv works")
+            .expect("a frame");
+        assert_eq!(out.frame_id, 4, "only the newest is worth showing");
+        assert_eq!(decoder.fed, 4, "but every frame fed the reference chain");
+        assert_eq!(session.superseded(), 3);
+    }
+
+    /// The mode that promises every frame is seen must get every frame, in
+    /// order, however deep the backlog.
+    #[tokio::test]
+    async fn a_never_drop_mode_returns_every_frame_in_order() {
+        let (mut session, _tx) = session_with_frames(4);
+        session.set_pacing(crate::PacingMode::Smoothest);
+        let mut decoder = CountingDecoder { fed: 0 };
+        for expected in 1..=4 {
+            let out = session
+                .recv_frame(&mut decoder)
+                .await
+                .expect("recv works")
+                .expect("a frame");
+            assert_eq!(out.frame_id, expected);
+        }
+        assert_eq!(session.superseded(), 0);
+    }
+
+    /// Balanced-with-FPS-limit is the other never-drop mode — the reference
+    /// client's definition, and the parity bug this guards against.
+    #[tokio::test]
+    async fn the_limited_mode_also_never_drops() {
+        let (mut session, _tx) = session_with_frames(3);
+        session.set_pacing(crate::PacingMode::BalancedFpsLimit);
+        let mut decoder = CountingDecoder { fed: 0 };
+        let out = session
+            .recv_frame(&mut decoder)
+            .await
+            .expect("recv works")
+            .expect("a frame");
+        assert_eq!(out.frame_id, 1, "the oldest, not the newest");
+        assert_eq!(session.superseded(), 0);
     }
 }

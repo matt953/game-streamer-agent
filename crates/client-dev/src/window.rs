@@ -474,7 +474,9 @@ fn run_script(
     const KEY_HELD: std::time::Duration = std::time::Duration::from_millis(60);
     /// A frame decoded right after a keypress still shows the old screen, so
     /// the shot waits for the application to react.
-    const SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+    /// How long a pointer move is given to take effect before a click.
+    const POINTER_SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
 
     tracing::info!(
         steps = steps.len(),
@@ -510,9 +512,25 @@ fn run_script(
                 input.send(vec![gsa_client_core::InputEvent::MouseMove(
                     gsa_client_core::MouseMove::Absolute { x, y, ts_us },
                 )]);
-                // A menu that highlights on hover needs a moment to redraw
-                // before a click is worth sending.
-                std::thread::sleep(KEY_HELD);
+                // A full-screen game reads raw mouse motion rather than the
+                // system cursor, so an absolute reposition alone changes
+                // nothing it can see — the highlight stays where it was and
+                // the click that follows lands on the wrong item, or on
+                // nothing. A relative nudge is the event it is actually
+                // watching for; equal and opposite, so the position set above
+                // is what survives.
+                for (dx, dy) in [(1.0, 1.0), (-1.0, -1.0)] {
+                    input.send(vec![gsa_client_core::InputEvent::MouseMove(
+                        gsa_client_core::MouseMove::Relative { dx, dy, ts_us },
+                    )]);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                // Long enough for the host to have actually applied the move
+                // before anything is clicked. A shorter gap is a race: the
+                // click lands at the pointer's old position, which is how a
+                // run opened MOUSE instead of DISPLAY AND GRAPHICS while an
+                // identical script had worked minutes earlier.
+                std::thread::sleep(POINTER_SETTLE);
                 tracing::info!(step = index + 1, x, y, "script pointer");
             }
             Step::Click => {
@@ -807,6 +825,13 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         jitter_out_us = core.released_jitter_us(),
                         // The price of that smoothing, invisible downstream.
                         mean_hold_us = core.mean_hold_us(),
+                        // Milliseconds further behind the host than at the
+                        // first frame. Every other figure here is a spread,
+                        // and a queue that fills once and never drains has no
+                        // spread — so this is the only one a steady backlog
+                        // shows up in.
+                        latency_growth_ms =
+                            format!("{:+.0}", core.latency_growth_us() as f64 / 1000.0),
                         frame_interval_us = core.frame_interval_us(),
                         dejitter_duty = {
                             let (ran, skipped) = core.dejitter_duty();
@@ -814,6 +839,15 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         },
                         dropped = stats.frames_dropped_incomplete,
                         recovered = stats.frames_recovered,
+                        // What the stream is actually pushing, as against what
+                        // was asked for. Input shares the link with video as
+                        // reliable control messages, so a stream near the cap
+                        // is the difference between "input is slow" being the
+                        // link or the host — and without this the two cannot
+                        // be told apart.
+                        recv_mbps = stats
+                            .recv_mbps
+                            .map_or_else(|| "—".to_owned(), |m| format!("{m:.1}")),
                         "moonlight stream stats"
                     );
                 }
@@ -1126,6 +1160,10 @@ impl App {
             unshown_pct = format!("{:.1}", s.superseded_pct()),
             ready = s.ready,
             presented = s.presented,
+            // Whether HDR is actually reaching the panel, as opposed to being
+            // requested: a PQ surface passes the signal through, anything else
+            // means the shader tone-mapped it away.
+            hdr_out = self.gpu.as_ref().is_some_and(|g| g.surface_is_pq),
             // Whether the panel held frames to its own grid or followed the
             // content. Only this figure distinguishes the two; every other one
             // above reads the same either way whenever the content rate
@@ -1653,6 +1691,98 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Present a 10-bit BT.2020 PQ frame from its two planes.
+///
+/// The whole conversion lives here rather than on the CPU. Doing it per pixel
+/// in Rust cost ~11.7 ms a frame at 1080p — more than decoding one — which
+/// capped the harness at 85 fps and made it fall permanently behind a 120 fps
+/// stream. The GPU does the same work as part of sampling.
+///
+/// `PQ_OUT` is substituted at build time: with an HDR surface the PQ signal is
+/// passed straight through to the display, and only when the surface cannot
+/// take it is anything tone-mapped away.
+const HDR_SHADER: &str = r#"
+@group(0) @binding(0) var luma_tex: texture_2d<f32>;
+@group(0) @binding(1) var frame_samp: sampler;
+@group(0) @binding(2) var chroma_tex: texture_2d<f32>;
+
+const PQ_OUT: bool = __PQ_OUT__;
+// Studio range is 64-940 for luma and 64-960 for chroma about 512; full range
+// uses all 1024 codes. Reading one as the other crushes blacks and clips
+// whites, so it is carried from the stream rather than assumed.
+const LUMA_OFFSET: f32 = __LUMA_OFFSET__;
+const LUMA_SPAN: f32 = __LUMA_SPAN__;
+const CHROMA_SPAN: f32 = __CHROMA_SPAN__;
+// BT.2408 diffuse white: the nit level that means "paper white" in PQ.
+const SDR_WHITE_NITS: f32 = 203.0;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var out: VsOut;
+    let x = f32((i >> 1u) & 1u) * 4.0 - 1.0;
+    let y = f32(i & 1u) * 4.0 - 1.0;
+    out.pos = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>((x + 1.0) * 0.5, 1.0 - (y + 1.0) * 0.5);
+    return out;
+}
+
+// SMPTE ST 2084, code value to absolute luminance in nits.
+fn pq_eotf(code: f32) -> f32 {
+    let m1 = 0.1593017578125;
+    let m2 = 78.84375;
+    let c1 = 0.8359375;
+    let c2 = 18.8515625;
+    let c3 = 18.6875;
+    let e = pow(max(code, 0.0), 1.0 / m2);
+    let num = max(e - c1, 0.0);
+    let den = c2 - c3 * e;
+    return 10000.0 * pow(num / max(den, 1e-6), 1.0 / m1);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // Ten bits sit at the top of a 16-bit word, so a normalised sample is
+    // short of full scale by exactly 65535/65472; correcting it here is what
+    // keeps white at white.
+    let to_code = 65535.0 / 65472.0;
+    let y_raw = textureSample(luma_tex, frame_samp, in.uv).r * to_code;
+    let c_raw = textureSample(chroma_tex, frame_samp, in.uv).rg * to_code;
+
+    let y = (y_raw * 1023.0 - LUMA_OFFSET) / LUMA_SPAN;
+    let cb = (c_raw.r * 1023.0 - 512.0) / CHROMA_SPAN;
+    let cr = (c_raw.g * 1023.0 - 512.0) / CHROMA_SPAN;
+
+    // BT.2020 non-constant luminance: the matrix applies to the PQ-encoded
+    // signal, not to light, so this stays in the encoded domain.
+    let r = y + 1.47460 * cr;
+    let g = y - 0.16455 * cb - 0.57135 * cr;
+    let b = y + 1.88140 * cb;
+    let rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+
+    if (PQ_OUT) {
+        // The display decodes PQ itself; handing it anything else would mean
+        // undoing the encoding only to have it reapplied.
+        return vec4<f32>(rgb, 1.0);
+    }
+
+    // No HDR surface available: decode to light, refer it to diffuse white,
+    // and convert BT.2020 to BT.709. Clamped first, so out-of-gamut values
+    // cannot come back as negative light through the matrix.
+    let nits = vec3<f32>(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b));
+    let scene = clamp(nits / SDR_WHITE_NITS, vec3<f32>(0.0), vec3<f32>(1.0));
+    let out_r = 1.66050 * scene.r - 0.58764 * scene.g - 0.07285 * scene.b;
+    let out_g = -0.12455 * scene.r + 1.13290 * scene.g - 0.00835 * scene.b;
+    let out_b = -0.01812 * scene.r - 0.10057 * scene.g + 1.11869 * scene.b;
+    // The surface is *Srgb, so the hardware applies the OETF: emit light.
+    return vec4<f32>(clamp(vec3<f32>(out_r, out_g, out_b), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
 /// Solid-colour quad for the notification toast. `rect` is (x0, y0, x1, y1) in
 /// clip space; `color` is premultiplied-alpha-friendly straight RGBA.
 const BAR_SHADER: &str = r#"
@@ -1681,6 +1811,15 @@ struct Gpu {
     sampler: wgpu::Sampler,
     bind_layout: wgpu::BindGroupLayout,
     texture: Option<FrameTexture>,
+    /// Pipeline and layout for planar 10-bit HDR frames, which need two
+    /// textures rather than one.
+    hdr_pipeline: wgpu::RenderPipeline,
+    /// The same, for a stream that uses the full 0-1023 range.
+    hdr_pipeline_full: wgpu::RenderPipeline,
+    hdr_bind_layout: wgpu::BindGroupLayout,
+    /// Whether the surface takes PQ directly. When it does the stream reaches
+    /// the panel as HDR; when it does not the shader tone-maps instead.
+    surface_is_pq: bool,
     bar_pipeline: wgpu::RenderPipeline,
     bar_uniform: wgpu::Buffer,
     bar_bind: wgpu::BindGroup,
@@ -1688,6 +1827,10 @@ struct Gpu {
 
 struct FrameTexture {
     texture: wgpu::Texture,
+    /// Second plane, for planar formats. `None` for packed RGBA.
+    chroma: Option<wgpu::Texture>,
+    /// Which range pipeline this frame needs.
+    full_range: bool,
     bind: wgpu::BindGroup,
     width: u32,
     height: u32,
@@ -1704,13 +1847,53 @@ impl Gpu {
             ..Default::default()
         }))
         .context("no adapter")?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .context("request device")?;
+        // 16-bit normalised textures are not on by default, and the planar
+        // 10-bit path cannot be built without them. Requested only when the
+        // adapter has them, so a device that lacks them still starts and
+        // falls back to the packed path.
+        let sixteen_bit = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: if sixteen_bit {
+                wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            } else {
+                wgpu::Features::empty()
+            },
+            ..Default::default()
+        }))
+        .context("request device")?;
+        if !sixteen_bit {
+            tracing::warn!("no 16-bit texture support; 10-bit frames cannot be presented");
+        }
 
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .context("surface unsupported")?;
+
+        // Ask for HDR10 before settling for SDR. `formats` deliberately lists
+        // only what `Auto` can pick, which is never HDR, so the HDR-capable
+        // formats have to be read from `format_capabilities` instead.
+        let caps = surface.get_capabilities(&adapter);
+        let pq = caps.format_capabilities.iter().find(|f| {
+            f.color_spaces.contains(wgpu::SurfaceColorSpaces::BT2100_PQ)
+                && matches!(
+                    f.format,
+                    wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rgb10a2Unorm
+                )
+        });
+        let surface_is_pq = if let Some(f) = pq {
+            config.format = f.format;
+            config.color_space = wgpu::SurfaceColorSpace::Bt2100Pq;
+            tracing::info!(format = ?f.format, "HDR surface: BT.2100 PQ");
+            true
+        } else {
+            tracing::info!(
+                format = ?config.format,
+                "no HDR surface available; HDR frames will be tone-mapped to SDR"
+            );
+            false
+        };
         // Vsync is what a phone, a TV and a monitor all do, so it is the only
         // mode under which presentation timing means anything. The immediate
         // mode is kept for measuring delivery in isolation.
@@ -1746,6 +1929,78 @@ impl Gpu {
                 },
             ],
         });
+        // Same as the SDR layout with a second texture: luma and chroma are
+        // separate planes and separate resolutions, so they cannot share one.
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let hdr_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hdr"),
+            entries: &[
+                texture_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                texture_entry(2),
+            ],
+        });
+        let hdr_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hdr"),
+            bind_group_layouts: &[Some(&hdr_bind_layout)],
+            ..Default::default()
+        });
+        // One pipeline per range, rather than a uniform read on every pixel of
+        // every frame for a value that changes once a session.
+        let hdr_pipeline_for = |full_range: bool| {
+            let (offset, luma_span, chroma_span) = if full_range {
+                ("0.0", "1023.0", "1023.0")
+            } else {
+                ("64.0", "876.0", "896.0")
+            };
+            let source = HDR_SHADER
+                .replace("__PQ_OUT__", if surface_is_pq { "true" } else { "false" })
+                .replace("__LUMA_OFFSET__", offset)
+                .replace("__LUMA_SPAN__", luma_span)
+                .replace("__CHROMA_SPAN__", chroma_span);
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("present-hdr"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("present-hdr"),
+                layout: Some(&hdr_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(config.format.into())],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let hdr_pipeline = hdr_pipeline_for(false);
+        let hdr_pipeline_full = hdr_pipeline_for(true);
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&bind_layout)],
@@ -1842,6 +2097,10 @@ impl Gpu {
         });
 
         Ok(Self {
+            hdr_pipeline,
+            hdr_pipeline_full,
+            hdr_bind_layout,
+            surface_is_pq,
             surface,
             device,
             queue,
@@ -1870,11 +2129,73 @@ impl Gpu {
         {
             return;
         }
+        // Two planes at different resolutions, uploaded as they came out of
+        // the decoder; the shader does the rest.
+        if let PixelOrder::P010Bt2020Pq { full_range } = order {
+            let plane = |label, w: u32, h: u32, format| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                })
+            };
+            let luma = plane("luma", width, height, wgpu::TextureFormat::R16Unorm);
+            let chroma = plane(
+                "chroma",
+                width.div_ceil(2),
+                height.div_ceil(2),
+                wgpu::TextureFormat::Rg16Unorm,
+            );
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hdr"),
+                layout: &self.hdr_bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &luma.create_view(&Default::default()),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            &chroma.create_view(&Default::default()),
+                        ),
+                    },
+                ],
+            });
+            self.texture = Some(FrameTexture {
+                texture: luma,
+                chroma: Some(chroma),
+                full_range,
+                bind,
+                width,
+                height,
+                order,
+            });
+            return;
+        }
+
         // Match the decoder's byte order so no CPU swizzle ever happens
         // (VideoToolbox emits BGRA, openh264 RGBA).
         let format = match order {
             PixelOrder::Rgba => wgpu::TextureFormat::Rgba8UnormSrgb,
-            PixelOrder::Bgra => wgpu::TextureFormat::Bgra8UnormSrgb,
+            PixelOrder::Bgra | PixelOrder::P010Bt2020Pq { .. } => {
+                wgpu::TextureFormat::Bgra8UnormSrgb
+            }
         };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("frame"),
@@ -1907,6 +2228,8 @@ impl Gpu {
         });
         self.texture = Some(FrameTexture {
             texture,
+            chroma: None,
+            full_range: false,
             bind,
             width,
             height,
@@ -1943,31 +2266,59 @@ impl Gpu {
         }
         let FrameTexture {
             texture,
+            chroma,
+            full_range,
             bind,
             width: fw,
             height: fh,
             ..
         } = self.texture.as_ref().expect("just ensured");
 
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
+        let upload = |plane: &wgpu::Texture, bytes: &[u8], w: u32, h: u32, stride: u32| {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: plane,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        match chroma {
+            // Planar: luma then chroma, each in its own texture. Splitting at
+            // the luma size is what the decoder packed them as.
+            Some(chroma) => {
+                let (cw, ch) = (frame.width.div_ceil(2), frame.height.div_ceil(2));
+                let split = (frame.width * frame.height * 2) as usize;
+                let (luma_bytes, chroma_bytes) = frame.pixels.split_at(split);
+                upload(
+                    texture,
+                    luma_bytes,
+                    frame.width,
+                    frame.height,
+                    frame.width * 2,
+                );
+                upload(chroma, chroma_bytes, cw, ch, cw * 4);
+            }
+            None => upload(
                 texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &frame.pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(frame.width * 4),
-                rows_per_image: Some(frame.height),
-            },
-            wgpu::Extent3d {
-                width: frame.width,
-                height: frame.height,
-                depth_or_array_layers: 1,
-            },
-        );
+                &frame.pixels,
+                frame.width,
+                frame.height,
+                frame.width * 4,
+            ),
+        }
 
         use wgpu::CurrentSurfaceTexture as Cst;
         #[allow(clippy::items_after_statements)]
@@ -2009,7 +2360,13 @@ impl Gpu {
             let (vw, vh) = (fw * scale, fh * scale);
             pass.set_viewport((sw - vw) / 2.0, (sh - vh) / 2.0, vw, vh, 0.0, 1.0);
 
-            pass.set_pipeline(&self.pipeline);
+            // Planar frames need the two-texture pipeline; everything else is
+            // a straight blit.
+            pass.set_pipeline(match (chroma.is_some(), *full_range) {
+                (true, false) => &self.hdr_pipeline,
+                (true, true) => &self.hdr_pipeline_full,
+                (false, _) => &self.pipeline,
+            });
             pass.set_bind_group(0, bind, &[]);
             pass.draw(0..3, 0..1);
 

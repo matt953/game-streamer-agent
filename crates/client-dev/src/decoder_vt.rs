@@ -20,7 +20,7 @@
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 
 use block2::RcBlock;
 use objc2_core_foundation::{
@@ -103,7 +103,7 @@ pub struct VideoToolboxDecoder {
     mapping: DisplayMapping,
     /// How decoded samples become displayable pixels, built once from the
     /// stream's own colour description rather than per frame.
-    conversion: Option<Arc<Conversion>>,
+    stream_colour: Option<StreamColour>,
     /// Whether the output format has been reported once.
     reported_output: bool,
     /// Whether a frame carrying actual variation has been measured.
@@ -141,7 +141,7 @@ impl VideoToolboxDecoder {
             colour: crate::hdr_probe::ColourReport::default(),
             output_format: PIXEL_FORMAT_BGRA,
             mapping,
-            conversion: None,
+            stream_colour: None,
             reported_output: false,
             reported_luma: false,
             reported_metadata: false,
@@ -348,11 +348,10 @@ impl VideoToolboxDecoder {
         );
         self.output_format =
             crate::hdr_probe::wanted_output_format(colour.stream_bit_depth, colour.full_range);
-        self.conversion = Some(Arc::new(Conversion::build(
+        self.stream_colour = StreamColour::build(
             &colour,
             self.output_format == crate::hdr_probe::PIXEL_FORMAT_420_10_FULL,
-            self.mapping,
-        )));
+        );
         self.colour = colour;
 
         let session = match create_session(&format, self.output_format) {
@@ -562,7 +561,7 @@ impl VideoToolboxDecoder {
         )?;
 
         let (tx, rx) = mpsc::sync_channel::<Option<Decoded>>(1);
-        let conversion = self.conversion.clone();
+        let stream_colour = self.stream_colour;
         let handler = RcBlock::new(
             move |status: i32,
                   _flags: VTDecodeInfoFlags,
@@ -572,7 +571,7 @@ impl VideoToolboxDecoder {
                 let frame = if status == 0 && !image.is_null() {
                     // SAFETY: non-null decoded image buffer from VideoToolbox,
                     // valid for the duration of this callback.
-                    unsafe { copy_frame(&*image, conversion.as_deref()) }
+                    unsafe { copy_frame(&*image, stream_colour) }
                 } else {
                     None
                 };
@@ -646,7 +645,7 @@ fn parameter_set_slot(codec: Codec, nal: &[u8]) -> Option<usize> {
 ///
 /// # Safety
 /// `image` must be a valid, decoded CVPixelBuffer.
-unsafe fn copy_frame(image: &CVImageBuffer, conversion: Option<&Conversion>) -> Option<Decoded> {
+unsafe fn copy_frame(image: &CVImageBuffer, colour: Option<StreamColour>) -> Option<Decoded> {
     let pb: &CVPixelBuffer = image;
     let format = CVPixelBufferGetPixelFormatType(pb);
     // SAFETY: valid pixel buffer, locked for the whole read.
@@ -657,7 +656,7 @@ unsafe fn copy_frame(image: &CVImageBuffer, conversion: Option<&Conversion>) -> 
         // cannot be read at all, so refusing beats guessing at a conversion.
         // SAFETY: caller contract — a valid decoded buffer, and the format
         // check above says it is the biplanar 10-bit layout.
-        return unsafe { copy_biplanar_10bit(pb, conversion?) };
+        return unsafe { copy_biplanar_10bit(pb, colour?) };
     }
     // SAFETY: as above.
     unsafe { copy_bgra(pb) }.map(|frame| Decoded {
@@ -778,163 +777,35 @@ const TEN_BIT_SHIFT: u32 = 6;
 const TEN_BIT_MAX: usize = 1023;
 
 /// The YCbCr→RGB matrix the stream asked to be read with.
+/// What the presenter cannot infer from the samples themselves.
 ///
-/// Honoured rather than assumed: a host may tag an HD stream BT.601, and
-/// decoding it as BT.709 shifts every colour slightly with nothing to show
-/// for it. The two coefficients are all that differ between the standards.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ColourMatrix {
-    kr: f32,
-    kb: f32,
+/// The shader does the conversion now, but it cannot guess how the values
+/// are encoded, and reading them under the wrong assumption gives a washed-out
+/// or crushed picture that reads as a bad stream rather than as a bug. So the
+/// stream's own colour description is still required before any 10-bit frame
+/// is interpreted — it is carried to the GPU instead of baked into per-pixel
+/// tables.
+#[derive(Debug, Clone, Copy)]
+struct StreamColour {
+    full_range: bool,
 }
 
-impl ColourMatrix {
-    const BT601: Self = Self {
-        kr: 0.299,
-        kb: 0.114,
-    };
-    const BT709: Self = Self {
-        kr: 0.2126,
-        kb: 0.0722,
-    };
-    const BT2020: Self = Self {
-        kr: 0.2627,
-        kb: 0.0593,
-    };
-
-    /// BT.709 is the fallback: it is what an untagged HD stream means, and
-    /// every stream reaching this decoder is HD.
-    fn from_report(colour: &crate::hdr_probe::ColourReport) -> Self {
-        match colour.matrix.as_deref() {
-            Some(m) if m.contains("2020") => Self::BT2020,
-            Some(m) if m.contains("601") => Self::BT601,
-            _ => Self::BT709,
-        }
-    }
-}
-
-/// How to turn what the decoder produced into what the window can show.
-///
-/// An SDR stream needs only the matrix. A PQ stream needs its curve undone
-/// and its gamut narrowed as well, and skipping that does not fail — it
-/// produces a washed-out, oversaturated picture that reads as a bad stream.
-enum Conversion {
-    Sdr(Box<ConversionTables>),
-    Pq(Box<PqTables>),
-}
-
-impl Conversion {
-    fn build(
-        colour: &crate::hdr_probe::ColourReport,
-        full_range: bool,
-        mapping: DisplayMapping,
-    ) -> Self {
-        let matrix = ColourMatrix::from_report(colour);
+impl StreamColour {
+    /// `None` when the stream is not something the planar path can present,
+    /// which refuses the frame rather than showing it wrongly.
+    fn build(colour: &crate::hdr_probe::ColourReport, full_range: bool) -> Option<Self> {
         match colour.transfer.as_deref() {
-            Some(t) if t.contains("2084") => {
-                Self::Pq(Box::new(PqTables::build(matrix, full_range, mapping)))
-            }
-            // HLG is the other HDR curve. No host in play sends it, and
-            // guessing at it would be worse than saying so.
-            Some(t) if t.contains("HLG") => {
+            Some(t) if t.contains("2084") => Some(Self { full_range }),
+            // HLG is the other HDR curve, and no host in play sends it.
+            // Guessing at it would be worse than saying so.
+            other => {
                 tracing::warn!(
-                    transfer = t,
-                    "HLG transfer is not converted; the picture will be shown as if SDR"
+                    transfer = other.unwrap_or("none"),
+                    "10-bit stream is not PQ; it will not be presented"
                 );
-                Self::Sdr(Box::new(ConversionTables::build(matrix, full_range)))
+                None
             }
-            _ => Self::Sdr(Box::new(ConversionTables::build(matrix, full_range))),
         }
-    }
-
-    /// One 10-bit sample triple to 8-bit RGB.
-    fn rgb(&self, y: usize, cb: usize, cr: usize) -> [u8; 3] {
-        match self {
-            Self::Sdr(t) => {
-                let luma = t.luma[y];
-                [
-                    clamp_u8(luma + t.r_from_cr[cr]),
-                    clamp_u8(luma + t.g_from_cb[cb] + t.g_from_cr[cr]),
-                    clamp_u8(luma + t.b_from_cb[cb]),
-                ]
-            }
-            Self::Pq(t) => t.rgb(y, cb, cr),
-        }
-    }
-}
-
-/// PQ decode, gamut narrowing and SDR re-encode, all as lookups.
-///
-/// The curve is per-component and the gamut is a matrix in linear light, so
-/// the order matters: decode PQ first, convert primaries second, encode last.
-struct PqTables {
-    /// Luma and chroma contributions, in PQ-coded RGB.
-    luma: [f32; 1024],
-    r_from_cr: [f32; 1024],
-    g_from_cb: [f32; 1024],
-    g_from_cr: [f32; 1024],
-    b_from_cb: [f32; 1024],
-    /// PQ code value to linear light, scaled so reference white is 1.0.
-    eotf: [f32; 1024],
-    /// Linear light back to an 8-bit SDR display value.
-    encode: [u8; 1024],
-}
-
-impl PqTables {
-    fn build(matrix: ColourMatrix, full_range: bool, mapping: DisplayMapping) -> Self {
-        let (kr, kb) = (matrix.kr, matrix.kb);
-        let kg = 1.0 - kr - kb;
-        let (luma_offset, luma_span, chroma_span) = range_constants(full_range);
-        let mut t = Self {
-            luma: [0.0; 1024],
-            r_from_cr: [0.0; 1024],
-            g_from_cb: [0.0; 1024],
-            g_from_cr: [0.0; 1024],
-            b_from_cb: [0.0; 1024],
-            eotf: [0.0; 1024],
-            encode: [0; 1024],
-        };
-        for sample in 0..1024usize {
-            t.luma[sample] = (sample as f32 - luma_offset) / luma_span;
-            let c = (sample as f32 - 512.0) / chroma_span;
-            t.r_from_cr[sample] = 2.0 * (1.0 - kr) * c;
-            t.b_from_cb[sample] = 2.0 * (1.0 - kb) * c;
-            t.g_from_cb[sample] = -2.0 * kb * (1.0 - kb) / kg * c;
-            t.g_from_cr[sample] = -2.0 * kr * (1.0 - kr) / kg * c;
-            let code = sample as f32 / TEN_BIT_MAX as f32;
-            t.eotf[sample] = pq_eotf_nits(code) / mapping.sdr_white_nits;
-            t.encode[sample] = (srgb_encode(code) * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        t
-    }
-
-    fn rgb(&self, y: usize, cb: usize, cr: usize) -> [u8; 3] {
-        let luma = self.luma[y];
-        let coded = [
-            luma + self.r_from_cr[cr],
-            luma + self.g_from_cb[cb] + self.g_from_cr[cr],
-            luma + self.b_from_cb[cb],
-        ];
-        // Bounded before the matrix, not after. Above display white there is
-        // nothing left to show, and carrying a value of 40 into a conversion
-        // whose green row subtracts a fraction of red drags green far negative
-        // — highlights come out magenta rather than merely clipped.
-        let linear = coded.map(|v| {
-            let index = (v * TEN_BIT_MAX as f32).clamp(0.0, TEN_BIT_MAX as f32) as usize;
-            self.eotf[index].min(1.0)
-        });
-        // BT.2020 to BT.709 primaries, in linear light. Out-of-gamut results
-        // are normal for saturated colour and clip on the way out.
-        let (r, g, b) = (linear[0], linear[1], linear[2]);
-        let narrowed = [
-            1.6605 * r - 0.5876 * g - 0.0728 * b,
-            -0.1246 * r + 1.1329 * g - 0.0083 * b,
-            -0.0182 * r - 0.1006 * g + 1.1187 * b,
-        ];
-        narrowed.map(|v| {
-            let index = (v * TEN_BIT_MAX as f32).clamp(0.0, TEN_BIT_MAX as f32) as usize;
-            self.encode[index]
-        })
     }
 }
 
@@ -955,7 +826,7 @@ fn reference_white_code(nits: f32, offset: f32, span: f32) -> u16 {
 }
 
 /// The PQ EOTF (SMPTE ST 2084), code value in [0,1] to absolute nits.
-fn pq_eotf_nits(code: f32) -> f32 {
+pub fn pq_eotf_nits(code: f32) -> f32 {
     const M1: f32 = 2610.0 / 16384.0;
     const M2: f32 = 2523.0 / 4096.0 * 128.0;
     const C1: f32 = 3424.0 / 4096.0;
@@ -968,16 +839,6 @@ fn pq_eotf_nits(code: f32) -> f32 {
         return 10_000.0;
     }
     (numerator / denominator).powf(1.0 / M1) * 10_000.0
-}
-
-/// Linear light to an sRGB display value, both in [0,1].
-fn srgb_encode(linear: f32) -> f32 {
-    let v = linear.clamp(0.0, 1.0);
-    if v <= 0.003_130_8 {
-        12.92 * v
-    } else {
-        1.055 * v.powf(1.0 / 2.4) - 0.055
-    }
 }
 
 /// Where black and white sit, and how far chroma swings, for each range.
@@ -1001,7 +862,7 @@ fn range_constants(full_range: bool) -> (f32, f32, f32) {
 ///
 /// # Safety
 /// `pb` must be a valid, decoded 10-bit biplanar CVPixelBuffer.
-unsafe fn copy_biplanar_10bit(pb: &CVPixelBuffer, conversion: &Conversion) -> Option<Decoded> {
+unsafe fn copy_biplanar_10bit(pb: &CVPixelBuffer, colour: StreamColour) -> Option<Decoded> {
     // SAFETY: valid pixel buffer; lock for CPU read access.
     let lock = unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
     if lock != 0 {
@@ -1024,53 +885,61 @@ unsafe fn copy_biplanar_10bit(pb: &CVPixelBuffer, conversion: &Conversion) -> Op
             return None;
         }
 
-        let mut pixels = vec![0u8; width * height * 4];
+        // Both planes copied row by row, exactly as they came out of the
+        // decoder. No conversion: these are 10-bit BT.2020 PQ samples, which
+        // is what an HDR surface wants, and the presenter is the only thing
+        // that knows whether the display can take them. Converting here cost
+        // ~11.7 ms a frame at 1080p — more than decoding one — which capped
+        // the harness at 85 fps and put it seconds behind a 120 fps stream.
+        let mut pixels = vec![0u8; width * height * 2 + chroma_width * chroma_height * 4];
+        let (luma_out, chroma_out) = pixels.split_at_mut(width * height * 2);
+        for row in 0..height {
+            // SAFETY: row < plane height, so `width` 16-bit samples from the
+            // row start lie in the locked plane.
+            let src = unsafe {
+                std::slice::from_raw_parts(luma_base.cast::<u8>().add(row * luma_stride), width * 2)
+            };
+            luma_out[row * width * 2..][..width * 2].copy_from_slice(src);
+        }
+        for row in 0..chroma_height {
+            // SAFETY: as above; interleaved Cb,Cr pairs, so two samples wide.
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    chroma_base.cast::<u8>().add(row * chroma_stride),
+                    chroma_width * 4,
+                )
+            };
+            chroma_out[row * chroma_width * 4..][..chroma_width * 4].copy_from_slice(src);
+        }
+
+        // Brightness is still measured, but on a sample of the picture rather
+        // than all of it: reading two million pixels a frame to report one
+        // number cost more than decoding the frame did, and this stride still
+        // covers thousands of points spread across the image.
+        const PROBE_STRIDE: usize = 16;
         let mut stats = crate::hdr_probe::LumaStats::default();
         let mut clipped = 0u64;
-        // Every sample OR'd together: if any low bit is ever set, the samples
-        // are not where this code reads them from.
         let mut low_bits: u16 = 0;
-
-        for row in 0..height {
-            // SAFETY: row < plane height, so the row start and `width`
-            // 16-bit samples from it lie in the locked plane.
+        for row in (0..height).step_by(PROBE_STRIDE) {
+            // SAFETY: as above.
             let luma = unsafe {
                 std::slice::from_raw_parts(
                     luma_base.cast::<u8>().add(row * luma_stride).cast::<u16>(),
                     width,
                 )
             };
-            let chroma_row = (row / 2).min(chroma_height.saturating_sub(1));
-            // SAFETY: as above; the chroma plane is interleaved Cb,Cr pairs.
-            let chroma = unsafe {
-                std::slice::from_raw_parts(
-                    chroma_base
-                        .cast::<u8>()
-                        .add(chroma_row * chroma_stride)
-                        .cast::<u16>(),
-                    chroma_width * 2,
-                )
-            };
-            let out = &mut pixels[row * width * 4..][..width * 4];
-            for col in 0..width {
+            for col in (0..width).step_by(PROBE_STRIDE) {
                 let raw = luma[col];
                 low_bits |= raw;
-                let y = (raw >> TEN_BIT_SHIFT) as usize;
-                stats.observe(y as u16);
-                let chroma_col = (col / 2).min(chroma_width.saturating_sub(1));
-                let cb = (chroma[chroma_col * 2] >> TEN_BIT_SHIFT) as usize;
-                let cr = (chroma[chroma_col * 2 + 1] >> TEN_BIT_SHIFT) as usize;
-                let rgb = conversion.rgb(y.min(TEN_BIT_MAX), cb, cr);
-                if rgb == [255, 255, 255] {
+                let y = raw >> TEN_BIT_SHIFT;
+                stats.observe(y);
+                if usize::from(y) >= TEN_BIT_MAX {
                     clipped += 1;
                 }
-                let px = &mut out[col * 4..][..4];
-                px[..3].copy_from_slice(&rgb);
-                px[3] = 255;
             }
         }
 
-        // The one reading that would make everything above wrong: the samples
+        // The one reading that would make everything else wrong: the samples
         // are ten bits at the top of a 16-bit word, and the whole picture is
         // misread if they are anywhere else.
         if low_bits & ((1 << TEN_BIT_SHIFT) - 1) != 0 {
@@ -1086,7 +955,9 @@ unsafe fn copy_biplanar_10bit(pb: &CVPixelBuffer, conversion: &Conversion) -> Op
                 width: width as u32,
                 height: height as u32,
                 pixels,
-                order: gsa_client_core::PixelOrder::Rgba,
+                order: gsa_client_core::PixelOrder::P010Bt2020Pq {
+                    full_range: colour.full_range,
+                },
             },
             luma: stats,
             clipped,
@@ -1095,48 +966,6 @@ unsafe fn copy_biplanar_10bit(pb: &CVPixelBuffer, conversion: &Conversion) -> Op
     // SAFETY: paired with the lock above.
     unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
     decoded
-}
-
-/// Per-component contributions for every possible 10-bit sample.
-///
-/// A table rather than arithmetic per pixel: this runs on two million pixels
-/// a frame, and the tables are a thousand entries built once.
-struct ConversionTables {
-    luma: [i32; 1024],
-    r_from_cr: [i32; 1024],
-    g_from_cb: [i32; 1024],
-    g_from_cr: [i32; 1024],
-    b_from_cb: [i32; 1024],
-}
-
-impl ConversionTables {
-    fn build(matrix: ColourMatrix, full_range: bool) -> Self {
-        let (kr, kb) = (matrix.kr, matrix.kb);
-        let kg = 1.0 - kr - kb;
-        let (luma_offset, luma_span, chroma_span) = range_constants(full_range);
-        let mut tables = Self {
-            luma: [0; 1024],
-            r_from_cr: [0; 1024],
-            g_from_cb: [0; 1024],
-            g_from_cr: [0; 1024],
-            b_from_cb: [0; 1024],
-        };
-        for sample in 0..1024usize {
-            let y = (sample as f32 - luma_offset) / luma_span;
-            tables.luma[sample] = (y * 255.0 * 256.0) as i32;
-            let c = (sample as f32 - 512.0) / chroma_span;
-            tables.r_from_cr[sample] = (2.0 * (1.0 - kr) * c * 255.0 * 256.0) as i32;
-            tables.b_from_cb[sample] = (2.0 * (1.0 - kb) * c * 255.0 * 256.0) as i32;
-            tables.g_from_cb[sample] = (-2.0 * kb * (1.0 - kb) / kg * c * 255.0 * 256.0) as i32;
-            tables.g_from_cr[sample] = (-2.0 * kr * (1.0 - kr) / kg * c * 255.0 * 256.0) as i32;
-        }
-        tables
-    }
-}
-
-/// Round a Q8 fixed-point value to a byte, clipping out-of-gamut results.
-fn clamp_u8(value: i32) -> u8 {
-    ((value + 128) >> 8).clamp(0, 255) as u8
 }
 
 /// Split an Annex-B stream into NAL unit payloads (no start codes).
@@ -1291,7 +1120,6 @@ fn err(msg: &'static str) -> impl Fn() -> Error {
 #[cfg(test)]
 mod tests {
     use super::parameter_set_slot;
-    use crate::decoder::DisplayMapping;
     use gsa_core::media::Codec;
 
     /// The two codecs keep the NAL type in different bits, so each one's
@@ -1325,67 +1153,6 @@ mod tests {
 
     use super::*;
 
-    /// Convert one sample the way the pixel loop does.
-    fn to_rgb(tables: &ConversionTables, y: usize, cb: usize, cr: usize) -> [u8; 3] {
-        let luma = tables.luma[y];
-        [
-            clamp_u8(luma + tables.r_from_cr[cr]),
-            clamp_u8(luma + tables.g_from_cb[cb] + tables.g_from_cr[cr]),
-            clamp_u8(luma + tables.b_from_cb[cb]),
-        ]
-    }
-
-    /// Video range does not start at zero. Reading its floor and ceiling as
-    /// full range washes out black and clips white, which looks like a bad
-    /// stream rather than a bad conversion.
-    #[test]
-    fn video_range_endpoints_land_on_black_and_white() {
-        let tables = ConversionTables::build(ColourMatrix::BT709, false);
-        assert_eq!(to_rgb(&tables, 64, 512, 512), [0, 0, 0]);
-        assert_eq!(to_rgb(&tables, 940, 512, 512), [255, 255, 255]);
-        // Below the floor is legal in the bitstream and clips to black.
-        assert_eq!(to_rgb(&tables, 0, 512, 512), [0, 0, 0]);
-
-        let full = ConversionTables::build(ColourMatrix::BT709, true);
-        assert_eq!(to_rgb(&full, 0, 512, 512), [0, 0, 0]);
-        assert_eq!(to_rgb(&full, 1023, 512, 512), [255, 255, 255]);
-    }
-
-    /// The matrices differ only in two coefficients, and the difference is
-    /// small enough to look like nothing until a saturated colour is checked.
-    #[test]
-    fn the_matrices_disagree_where_they_should() {
-        let (bt601, bt709) = (
-            ConversionTables::build(ColourMatrix::BT601, false),
-            ConversionTables::build(ColourMatrix::BT709, false),
-        );
-        // Mid luma with a full red chroma excursion.
-        let (y, cb, cr) = (502, 512, 960);
-        assert_ne!(to_rgb(&bt601, y, cb, cr), to_rgb(&bt709, y, cb, cr));
-        // Grey has no chroma excursion, so every matrix agrees on it.
-        assert_eq!(to_rgb(&bt601, y, 512, 512), to_rgb(&bt709, y, 512, 512));
-    }
-
-    /// The tag is followed, not guessed: this host labels 1080p BT.601, and
-    /// overriding that with the "obvious" HD matrix would shift every colour.
-    #[test]
-    fn the_streams_own_matrix_tag_is_honoured() {
-        let tagged = |m: &str| {
-            ColourMatrix::from_report(&crate::hdr_probe::ColourReport {
-                matrix: Some(m.into()),
-                ..Default::default()
-            })
-        };
-        assert_eq!(tagged("ITU_R_601_4"), ColourMatrix::BT601);
-        assert_eq!(tagged("ITU_R_709_2"), ColourMatrix::BT709);
-        assert_eq!(tagged("ITU_R_2020"), ColourMatrix::BT2020);
-        // Untagged HD means BT.709.
-        assert_eq!(
-            ColourMatrix::from_report(&crate::hdr_probe::ColourReport::default()),
-            ColourMatrix::BT709
-        );
-    }
-
     /// Inverse PQ: absolute nits to a code value in [0,1].
     fn pq_code_for(nits: f32) -> f32 {
         const M1: f32 = 2610.0 / 16384.0;
@@ -1405,51 +1172,6 @@ mod tests {
             assert!(
                 (round_tripped - nits).abs() < nits * 0.01 + 0.01,
                 "{nits} nits came back as {round_tripped}"
-            );
-        }
-    }
-
-    /// A PQ stream shown on an SDR window hangs on where reference white sits:
-    /// too low and the desktop glares, too high and it is a grey wash. Neither
-    /// fails — they just look wrong, so the anchor is pinned here.
-    #[test]
-    fn reference_white_reaches_white_and_black_stays_black() {
-        let mapping = DisplayMapping::default();
-        let tables = PqTables::build(ColourMatrix::BT2020, false, mapping);
-        let luma_code = |code: f32| (64.0 + code * 876.0).round() as usize;
-
-        let white = tables.rgb(luma_code(pq_code_for(mapping.sdr_white_nits)), 512, 512);
-        for channel in white {
-            assert!(channel >= 250, "reference white came out at {white:?}");
-        }
-
-        assert_eq!(tables.rgb(luma_code(0.0), 512, 512), [0, 0, 0]);
-
-        // Above reference white there is nothing left to give: highlights clip
-        // rather than wrapping around.
-        let highlight = tables.rgb(luma_code(pq_code_for(1000.0)), 512, 512);
-        assert_eq!(highlight, [255, 255, 255]);
-
-        // And the midpoint must actually sit between the two.
-        let mid = tables.rgb(luma_code(pq_code_for(50.0)), 512, 512);
-        assert!(
-            (1..255).contains(&mid[0]),
-            "50 nits collapsed to {mid:?} instead of a mid grey"
-        );
-    }
-
-    /// Grey is grey in any gamut: the BT.2020 to BT.709 matrix must leave the
-    /// neutral axis alone, which is the one error it can make invisibly.
-    #[test]
-    fn narrowing_the_gamut_leaves_neutrals_neutral() {
-        let tables = PqTables::build(ColourMatrix::BT2020, false, DisplayMapping::default());
-        for nits in [5.0f32, 50.0, 150.0] {
-            let code = (64.0 + pq_code_for(nits) * 876.0).round() as usize;
-            let [r, g, b] = tables.rgb(code, 512, 512);
-            assert!(
-                r.abs_diff(g) <= 1 && g.abs_diff(b) <= 1,
-                "{nits} nits of grey came out as {:?}",
-                [r, g, b]
             );
         }
     }
@@ -1484,30 +1206,27 @@ mod tests {
         assert_eq!(ycbcr_matrix(2), None);
     }
 
-    /// The whole point of carrying the codes: a PQ stream must reach the PQ
-    /// conversion. Reaching the SDR one is the silent failure.
+    /// The whole point of carrying the codes: only a stream that declares PQ
+    /// may be presented down the planar path. Guessing at anything else shows
+    /// a wrong picture that reads as a bad stream.
     #[test]
-    fn a_pq_description_selects_the_pq_conversion() {
+    fn only_a_pq_description_is_presentable() {
         let pq = crate::hdr_probe::ColourReport {
             primaries: Some("ITU_R_2020".into()),
             transfer: Some("SMPTE_ST_2084_PQ".into()),
             matrix: Some("ITU_R_2020".into()),
             ..Default::default()
         };
-        assert!(matches!(
-            Conversion::build(&pq, false, DisplayMapping::default()),
-            Conversion::Pq(_)
-        ));
+        let colour = StreamColour::build(&pq, false).expect("PQ is presentable");
+        assert!(!colour.full_range);
+        assert!(
+            StreamColour::build(&pq, true)
+                .expect("full range carried")
+                .full_range
+        );
 
-        // And a stream that says nothing must not be treated as PQ.
-        assert!(matches!(
-            Conversion::build(
-                &crate::hdr_probe::ColourReport::default(),
-                false,
-                DisplayMapping::default()
-            ),
-            Conversion::Sdr(_)
-        ));
+        // A stream that says nothing must be refused, not shown wrongly.
+        assert!(StreamColour::build(&crate::hdr_probe::ColourReport::default(), false).is_none());
     }
 
     /// PQ codes are absolute, which is the whole reason brightness can be

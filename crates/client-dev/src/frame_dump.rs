@@ -17,7 +17,7 @@ use gsa_client_core::{DecodedFrame, PixelOrder};
 pub fn write_bmp(frame: &DecodedFrame, path: &std::path::Path) -> anyhow::Result<()> {
     let (width, height) = (frame.width as usize, frame.height as usize);
     anyhow::ensure!(
-        frame.pixels.len() >= width * height * 4,
+        frame.pixels.len() >= frame.order.frame_bytes(width, height),
         "frame is {} bytes, short of {}x{}",
         frame.pixels.len(),
         width,
@@ -44,15 +44,59 @@ pub fn write_bmp(frame: &DecodedFrame, path: &std::path::Path) -> anyhow::Result
     // BMP stores blue, green, red, and its rows run bottom to top.
     let swap_red_blue = matches!(frame.order, PixelOrder::Rgba);
     for y in (0..height).rev() {
-        let row = &frame.pixels[y * width * 4..(y + 1) * width * 4];
         let start = out.len();
-        for px in row.chunks_exact(4) {
-            let (b, g, r) = if swap_red_blue {
-                (px[2], px[1], px[0])
-            } else {
-                (px[0], px[1], px[2])
-            };
-            out.extend_from_slice(&[b, g, r]);
+        match frame.order {
+            // Planar HDR: the display path converts on the GPU, but a
+            // screenshot has to be a picture a person can open, so this is the
+            // one place the conversion is still done on the CPU. It runs on
+            // the handful of frames a script asks for, not on every frame.
+            PixelOrder::P010Bt2020Pq { full_range } => {
+                let (offset, luma_span, chroma_span) = if full_range {
+                    (0.0f32, 1023.0f32, 1023.0f32)
+                } else {
+                    (64.0, 876.0, 896.0)
+                };
+                let luma_plane = &frame.pixels[..width * height * 2];
+                let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+                let chroma_plane = &frame.pixels[width * height * 2..];
+                let sample = |plane: &[u8], index: usize| -> f32 {
+                    f32::from(u16::from_le_bytes([plane[index * 2], plane[index * 2 + 1]]) >> 6)
+                };
+                for x in 0..width {
+                    let yy = (sample(luma_plane, y * width + x) - offset) / luma_span;
+                    let ci = (y.min(ch - 1) / 2).min(ch - 1) * cw + (x / 2).min(cw - 1);
+                    let cb = (sample(chroma_plane, ci * 2) - 512.0) / chroma_span;
+                    let cr = (sample(chroma_plane, ci * 2 + 1) - 512.0) / chroma_span;
+                    // BT.2020 non-constant luminance, then PQ decoded and
+                    // referred to diffuse white so the dump is viewable.
+                    let coded = [
+                        yy + 1.474_60 * cr,
+                        yy - 0.164_55 * cb - 0.571_35 * cr,
+                        yy + 1.881_40 * cb,
+                    ];
+                    let light =
+                        coded.map(|c| crate::decoder_vt::pq_eotf_nits(c.clamp(0.0, 1.0)) / 203.0);
+                    let px = [
+                        1.660_50 * light[0] - 0.587_64 * light[1] - 0.072_85 * light[2],
+                        -0.124_55 * light[0] + 1.132_90 * light[1] - 0.008_35 * light[2],
+                        -0.018_12 * light[0] - 0.100_57 * light[1] + 1.118_69 * light[2],
+                    ];
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let byte = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+                    out.extend_from_slice(&[byte(px[2]), byte(px[1]), byte(px[0])]);
+                }
+            }
+            _ => {
+                let row = &frame.pixels[y * width * 4..(y + 1) * width * 4];
+                for px in row.chunks_exact(4) {
+                    let (b, g, r) = if swap_red_blue {
+                        (px[2], px[1], px[0])
+                    } else {
+                        (px[0], px[1], px[2])
+                    };
+                    out.extend_from_slice(&[b, g, r]);
+                }
+            }
         }
         out.resize(start + stride, 0);
     }
