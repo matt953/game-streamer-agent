@@ -891,6 +891,9 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         // supersede count; the presenter's own half is
                         // unshown_pct in the presentation line.
                         superseded = core.superseded(),
+                        // Proof the pause exclusion ran, when content pauses:
+                        // a quiet smoother alone cannot show the fix worked.
+                        content_pauses = core.content_pauses(),
                         // What the stream is actually pushing, as against what
                         // was asked for. Input shares the link with video as
                         // reliable control messages, so a stream near the cap

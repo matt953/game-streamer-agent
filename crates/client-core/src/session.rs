@@ -91,6 +91,10 @@ pub struct StreamSession {
     last_capture_for_interval: Option<u32>,
     /// Recent capture gaps, for the interval percentile.
     interval_gaps: std::collections::VecDeque<u32>,
+    /// Frames released immediately because their capture gap was the host's
+    /// own idle time — evidence the pause exclusion ran, not just that
+    /// nothing went wrong around it.
+    content_pauses: u64,
     /// Total time frames have been held back to smooth delivery, and how many
     /// were held. The latency side of the trade: smoothness gained is
     /// meaningless without the delay paid for it, and the hold happens before
@@ -187,6 +191,7 @@ impl StreamSession {
             frame_interval_us: 16_667,
             last_capture_for_interval: None,
             interval_gaps: std::collections::VecDeque::new(),
+            content_pauses: 0,
             hold_total_us: 0,
             held_frames: 0,
             dejitter_skipped_backlog: 0,
@@ -429,6 +434,12 @@ impl StreamSession {
     #[must_use]
     pub fn latency_chain(&self) -> stats::LatencySummary {
         self.latency.summary()
+    }
+
+    /// Frames shown immediately because their gap was the host's own pause.
+    #[must_use]
+    pub fn content_pauses(&self) -> u64 {
+        self.content_pauses
     }
 
     /// Frames decoded but discarded unseen under the drop policy.
@@ -684,6 +695,10 @@ impl StreamSession {
         let content_pause =
             capture_gap.is_none_or(|gap| gap > self.frame_interval_us.saturating_mul(2));
         if content_pause {
+            // Counted so a test can prove this path actually fired: "the
+            // smoother stayed asleep" alone cannot distinguish a fix that
+            // worked from a scenario that never exercised it.
+            self.content_pauses = self.content_pauses.saturating_add(1);
             self.latency.on_hold(0);
             return;
         }
