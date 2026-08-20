@@ -224,6 +224,8 @@ pub struct PresentStats {
     /// Cadence breaks already present in the SOURCE (capture-ts gaps): the
     /// game hitched; the stream merely carried it.
     src_stutters: u64,
+    /// Rolling source gaps, for the median that sets "normal" above.
+    src_gaps_us: VecDeque<u32>,
     last_capture_ts: Option<u32>,
     freezes: u64,
     freeze_us_total: u64,
@@ -260,8 +262,21 @@ impl PresentStats {
     pub fn on_presented(&mut self, latency_us: Option<u32>, capture_ts_us: u32, now_us: u64) {
         if let Some(prev_ts) = self.last_capture_ts {
             let src_gap = capture_ts_us.wrapping_sub(prev_ts);
-            if src_gap > STUTTER_MIN_US && src_gap < 10_000_000 {
-                self.src_stutters += 1;
+            // Judged against the source's own cadence, like the presented
+            // check below — a flat floor sits under 24 fps content's normal
+            // 41.7 ms interval and flags nearly every ordinary frame.
+            let median = {
+                let v: Vec<u32> = self.src_gaps_us.iter().copied().collect();
+                percentile(&v, 50)
+            };
+            if src_gap < 10_000_000 {
+                if let Some(m) = median
+                    && src_gap > m.saturating_mul(STUTTER_FACTOR)
+                    && src_gap > STUTTER_MIN_US
+                {
+                    self.src_stutters += 1;
+                }
+                push_capped(&mut self.src_gaps_us, src_gap);
             }
         }
         self.last_capture_ts = Some(capture_ts_us);
@@ -852,5 +867,46 @@ mod latency_chain_tests {
         // And unmeasured stages stay unknown rather than zero.
         assert!(s.rtt.is_none());
         assert!(s.host.is_none());
+    }
+}
+
+#[cfg(test)]
+mod src_stutter_tests {
+    use super::PresentStats;
+
+    /// The failure the fix guards: 24 fps content has a legitimate 41.7 ms
+    /// interval, above the flat 40 ms floor — a threshold that ignores the
+    /// source's own cadence flags nearly every ordinary frame as a stutter.
+    #[test]
+    fn a_steady_slow_cadence_is_not_a_source_stutter() {
+        let mut p = PresentStats::default();
+        let mut ts = 1_000_000u32;
+        let mut now = 5_000_000u64;
+        for _ in 0..120 {
+            p.on_presented(None, ts, now);
+            ts = ts.wrapping_add(41_667);
+            now += 41_667;
+        }
+        assert_eq!(
+            p.summary().src_stutters,
+            0,
+            "24 fps at its own steady cadence is not stuttering"
+        );
+    }
+
+    /// A real source hitch — one frame at many times the cadence — must still
+    /// be counted, or the fix would have silenced the metric entirely.
+    #[test]
+    fn a_real_source_hitch_still_counts() {
+        let mut p = PresentStats::default();
+        let mut ts = 1_000_000u32;
+        let mut now = 5_000_000u64;
+        for i in 0..120 {
+            let gap = if i == 100 { 200_000 } else { 41_667 };
+            ts = ts.wrapping_add(gap);
+            now += u64::from(gap);
+            p.on_presented(None, ts, now);
+        }
+        assert_eq!(p.summary().src_stutters, 1, "the hitch and only the hitch");
     }
 }
