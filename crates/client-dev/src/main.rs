@@ -20,6 +20,7 @@ mod moonlight;
 mod netsim;
 mod pairing;
 mod present;
+mod script;
 mod window;
 
 use anyhow::{Context, Result};
@@ -146,6 +147,12 @@ struct Cli {
     #[arg(long, default_value = "balanced",
           value_parser = ["lowest-latency", "balanced", "balanced-fps-limit", "smoothest"])]
     pacing: String,
+    /// Drive the session with a timed sequence instead of a person: waits,
+    /// keypresses and screenshots, e.g.
+    /// `"30s down down enter 10s down down down 10s r 220s shot"`.
+    /// `shot` writes to `--dump-frame`.
+    #[arg(long)]
+    input_script: Option<String>,
     /// Turn the de-jitter off. Only useful next to `--jitter-ms`: it is the
     /// control half of the experiment, since a smoothing that cannot be
     /// switched off cannot be shown to have done anything.
@@ -199,6 +206,10 @@ fn main() -> Result<()> {
             &cli.present_mode,
             netsim::Jitter::new(cli.jitter_ms, cli.jitter_seed),
             gsa_client_core::PacingMode::from_name(&cli.pacing).unwrap_or_default(),
+            match cli.input_script.as_deref() {
+                Some(text) => Some(script::parse(text).map_err(|e| anyhow::anyhow!(e))?),
+                None => None,
+            },
             !cli.no_dejitter,
             !cli.no_float,
             cli.chase_refresh,

@@ -3,6 +3,7 @@
 //! the event loop; presentation uploads the frame as a texture and draws an
 //! aspect-fit quad (GPU scaling — HiDPI handled by physical-pixel surface).
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -253,6 +254,7 @@ pub fn run_moonlight(
     present_mode: &str,
     jitter: Option<crate::netsim::Jitter>,
     pacing: gsa_client_core::PacingMode,
+    input_script: Option<Vec<crate::script::Step>>,
     dejitter: bool,
     float_window: bool,
     chase_refresh: bool,
@@ -301,6 +303,7 @@ pub fn run_moonlight(
                     mapping,
                     jitter,
                     pacing,
+                    input_script,
                     dejitter,
                 },
                 &proxy,
@@ -451,6 +454,64 @@ fn streamable_fps(panel_hz: u32) -> u32 {
         .unwrap_or(30)
 }
 
+/// Walk a script: press what it says, wait what it says, and save a frame
+/// after every step.
+///
+/// A keypress is a down and an up with a gap between: an application that
+/// samples input on a timer can miss a press and release in the same instant,
+/// and a menu that misses one keypress walks somewhere else entirely.
+fn run_script(
+    steps: &[crate::script::Step],
+    input: &std::sync::Arc<dyn gsa_client_core::InputSink>,
+    shot_request: &std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    shots_dir: Option<&Path>,
+) {
+    use crate::script::Step;
+    const KEY_HELD: std::time::Duration = std::time::Duration::from_millis(60);
+    /// A frame decoded right after a keypress still shows the old screen, so
+    /// the shot waits for the application to react.
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
+    tracing::info!(
+        steps = steps.len(),
+        runtime_s = crate::script::duration(steps).as_secs(),
+        "driving the session from a script"
+    );
+    for (index, step) in steps.iter().enumerate() {
+        match *step {
+            Step::Wait(d) => std::thread::sleep(d),
+            Step::Key(usage) => {
+                let now = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_micros() as u64)
+                };
+                input.send(vec![gsa_client_core::InputEvent::Key {
+                    usage,
+                    down: true,
+                    ts_us: now(),
+                }]);
+                std::thread::sleep(KEY_HELD);
+                input.send(vec![gsa_client_core::InputEvent::Key {
+                    usage,
+                    down: false,
+                    ts_us: now(),
+                }]);
+                tracing::info!(step = index + 1, key = step.slug(), "script key");
+            }
+            Step::Shot => {}
+        }
+        if let Some(dir) = shots_dir {
+            std::thread::sleep(SETTLE);
+            let name = format!("step-{:02}-{}.bmp", index + 1, step.slug());
+            if let Ok(mut slot) = shot_request.lock() {
+                *slot = Some(dir.join(name));
+            }
+        }
+    }
+    tracing::info!("script finished");
+}
+
 /// Which decoded frame `--dump-frame` writes.
 const DUMP_AT_FRAME: u64 = 120;
 
@@ -469,6 +530,8 @@ struct MoonlightRun {
     jitter: Option<crate::netsim::Jitter>,
     /// The latency-for-smoothness trade this run makes.
     pacing: gsa_client_core::PacingMode,
+    /// A timed sequence to drive the session with, instead of a person.
+    input_script: Option<Vec<crate::script::Step>>,
     /// Whether to smooth the imposed jitter — the control half of the A/B.
     dejitter: bool,
 }
@@ -486,6 +549,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
         mapping,
         jitter,
         pacing,
+        input_script,
         dejitter,
     } = run;
     let outcome = (|| -> Result<()> {
@@ -549,6 +613,22 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 bitrate_mbps.saturating_mul(1_000_000),
             ));
 
+            // Drive the session from a script when one was given, and save a
+            // frame after every step: a sequence that walked the wrong menu
+            // has to show *which* step went wrong, not merely that one did.
+            let shot_request: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let _script = input_script.clone().map(|steps| {
+                let input = stream.input.clone();
+                let requests = shot_request.clone();
+                let shots_dir = dump_frame
+                    .as_ref()
+                    .and_then(|p| p.parent().map(Path::to_path_buf));
+                std::thread::Builder::new()
+                    .name("gsa-input-script".into())
+                    .spawn(move || run_script(&steps, &input, &requests, shots_dir.as_deref()))
+            });
+
             // A synthetic pad, for probing what the host does once a controller
             // exists. Real pads come from `GamepadCapture`; this exists so
             // protocol work does not wait on hardware being awake.
@@ -577,6 +657,14 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                     && let Err(e) = crate::frame_dump::write_bmp(&out.frame, path)
                 {
                     tracing::warn!(error = %e, "could not write the decoded frame");
+                }
+                // A script asked for a frame; the next decoded one answers it.
+                let wanted = shot_request.lock().ok().and_then(|mut slot| slot.take());
+                if let Some(path) = wanted {
+                    match crate::frame_dump::write_bmp(&out.frame, &path) {
+                        Ok(()) => tracing::info!(path = %path.display(), "script shot"),
+                        Err(e) => tracing::warn!(error = %e, "could not write the script shot"),
+                    }
                 }
                 // Drain the host's own messages. The channel is unbounded, and
                 // what arrives on it is the only record of what the host did
