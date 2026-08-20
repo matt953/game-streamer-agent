@@ -985,6 +985,13 @@ impl App {
     /// at a size the display can hold it is also a pixel-for-pixel view of
     /// what the host sent, with no resampling in the way.
     fn fit_window_to(&mut self, width: u32, height: u32) {
+        // Nothing to fit to in full-screen: the window already owns the
+        // display. Resizing it there reconfigures the surface to the stream's
+        // size while the drawable stays screen-sized, so the picture is drawn
+        // into one corner of a mostly unpainted surface.
+        if self.fullscreen {
+            return;
+        }
         if self.fitted == Some((width, height)) {
             return;
         }
