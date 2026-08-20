@@ -656,3 +656,170 @@ mod arrival_tests {
         );
     }
 }
+
+/// The latency chain, stage by stage, with percentiles per stage.
+///
+/// Every figure is either a duration measured on one clock or a round trip,
+/// which is what lets a protocol with no clock sync still produce an honest
+/// end-to-end number: the reference client's overlay is built the same way.
+///
+/// A stage a backend cannot measure stays empty and must be shown as unknown
+/// ("—"), never as zero — a zero here reads as "instant", which is a claim.
+#[derive(Debug, Default)]
+pub struct LatencyChain {
+    /// Control-link round trips, as reported by the transport (µs).
+    rtt_us: VecDeque<u32>,
+    /// Host capture→encode, measured on the host and carried per frame (µs).
+    host_us: VecDeque<u32>,
+    /// Client decode, per frame (µs).
+    decode_us: VecDeque<u32>,
+    /// De-jitter hold, per released frame (µs).
+    hold_us: VecDeque<u32>,
+    /// Ready→shown wait, per presented frame (µs), where a presenter feeds it.
+    present_us: VecDeque<u32>,
+}
+
+/// One stage's percentiles, µs. `None` when nothing has been measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagePercentiles {
+    pub p50_us: u32,
+    pub p95_us: u32,
+    pub p99_us: u32,
+}
+
+fn stage(window: &VecDeque<u32>) -> Option<StagePercentiles> {
+    if window.len() < 5 {
+        return None;
+    }
+    let sorted: Vec<u32> = window.iter().copied().collect();
+    Some(StagePercentiles {
+        p50_us: percentile(&sorted, 50)?,
+        p95_us: percentile(&sorted, 95)?,
+        p99_us: percentile(&sorted, 99)?,
+    })
+}
+
+/// The chain's summary: per-stage percentiles plus the composed total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LatencySummary {
+    pub rtt: Option<StagePercentiles>,
+    pub host: Option<StagePercentiles>,
+    pub decode: Option<StagePercentiles>,
+    pub hold: Option<StagePercentiles>,
+    pub present: Option<StagePercentiles>,
+    /// The stages summed, per percentile, using half the round trip for the
+    /// wire. Composed from what was measured, so it excludes host capture
+    /// wait and display scanout — and it is `None` until the two stages that
+    /// dominate honesty (wire and host) both exist, because a "total" made
+    /// only of client-side figures would masquerade as end-to-end.
+    pub total: Option<StagePercentiles>,
+}
+
+impl LatencyChain {
+    pub fn on_rtt(&mut self, rtt_us: u32) {
+        push_capped(&mut self.rtt_us, rtt_us);
+    }
+    pub fn on_host(&mut self, host_us: u32) {
+        push_capped(&mut self.host_us, host_us);
+    }
+    pub fn on_decode(&mut self, decode_us: u32) {
+        push_capped(&mut self.decode_us, decode_us);
+    }
+    pub fn on_hold(&mut self, hold_us: u32) {
+        push_capped(&mut self.hold_us, hold_us);
+    }
+    pub fn on_present_wait(&mut self, wait_us: u32) {
+        push_capped(&mut self.present_us, wait_us);
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> LatencySummary {
+        let rtt = stage(&self.rtt_us);
+        let host = stage(&self.host_us);
+        let decode = stage(&self.decode_us);
+        let hold = stage(&self.hold_us);
+        let present = stage(&self.present_us);
+        let total = match (rtt, host) {
+            (Some(rtt), Some(host)) => {
+                // Half a round trip stands in for the one-way wire; the
+                // remaining stages add if they were measured at all. Percentile
+                // sums overstate tails slightly (stages do not peak together),
+                // which errs on the honest side for a latency figure.
+                let sum = |pick: fn(StagePercentiles) -> u32| {
+                    pick(rtt) / 2
+                        + pick(host)
+                        + decode.map_or(0, pick)
+                        + hold.map_or(0, pick)
+                        + present.map_or(0, pick)
+                };
+                Some(StagePercentiles {
+                    p50_us: sum(|s| s.p50_us),
+                    p95_us: sum(|s| s.p95_us),
+                    p99_us: sum(|s| s.p99_us),
+                })
+            }
+            _ => None,
+        };
+        LatencySummary {
+            rtt,
+            host,
+            decode,
+            hold,
+            present,
+            total,
+        }
+    }
+}
+
+#[cfg(test)]
+mod latency_chain_tests {
+    use super::LatencyChain;
+
+    fn filled() -> LatencyChain {
+        let mut chain = LatencyChain::default();
+        for i in 0..100u32 {
+            chain.on_rtt(2_000 + i * 10);
+            chain.on_host(4_000 + i * 20);
+            chain.on_decode(3_000);
+            chain.on_hold(8_000);
+            chain.on_present_wait(1_500);
+        }
+        chain
+    }
+
+    /// The total is composed the way the reference overlay's readers compose
+    /// it: half the round trip, plus every measured duration.
+    #[test]
+    fn the_total_is_half_rtt_plus_the_measured_stages() {
+        let s = filled().summary();
+        let total = s.total.expect("all stages measured");
+        let expected = s.rtt.unwrap().p50_us / 2
+            + s.host.unwrap().p50_us
+            + s.decode.unwrap().p50_us
+            + s.hold.unwrap().p50_us
+            + s.present.unwrap().p50_us;
+        assert_eq!(total.p50_us, expected);
+        assert!(total.p99_us >= total.p95_us && total.p95_us >= total.p50_us);
+    }
+
+    /// A total made only of client-side stages would read as end-to-end while
+    /// omitting the wire and the host — the two parts people actually ask
+    /// about. Without either, there is no total.
+    #[test]
+    fn no_total_without_the_wire_and_the_host() {
+        let mut chain = LatencyChain::default();
+        for _ in 0..100 {
+            chain.on_decode(3_000);
+            chain.on_hold(8_000);
+        }
+        let s = chain.summary();
+        assert!(
+            s.total.is_none(),
+            "client-only stages must not claim a total"
+        );
+        assert!(s.decode.is_some());
+        // And unmeasured stages stay unknown rather than zero.
+        assert!(s.rtt.is_none());
+        assert!(s.host.is_none());
+    }
+}

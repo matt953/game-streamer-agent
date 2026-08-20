@@ -307,6 +307,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
         Ok(crate::SessionReady::Streaming {
             input,
             knobs,
+            latency,
             presented,
             decode_error,
             dejitter,
@@ -318,6 +319,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
             thread: Some(thread),
             input,
             knobs,
+            latency,
             presented,
             decode_error,
             dejitter,

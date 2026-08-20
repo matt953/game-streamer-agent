@@ -41,6 +41,10 @@ pub struct BackendFrame {
     /// Host-side stamp, interpreted per [`SessionCaps::capture_clock`]. µs,
     /// wrapping — the core's clock sync handles the wrap.
     pub capture_ts_us: u32,
+    /// Capture-to-encode time measured *on the host* and carried per frame,
+    /// where the backend's wire provides it. A duration on a single clock, so
+    /// it needs no sync — it is the host's own share of the latency chain.
+    pub host_latency_us: Option<u32>,
     /// Client-clock µs at **true reception**. Must be stamped on the receive
     /// path, before any pacing or release logic: arrival stamps feed
     /// delay-based bandwidth estimation, and a frame stamped at release time
@@ -159,6 +163,10 @@ pub enum BackendEvent {
         sensor: MotionSensor,
         rate_hz: u16,
     },
+    /// The control link's measured round-trip time — the wire's share of the
+    /// latency chain, measured as a round trip on one clock so it needs no
+    /// sync. Periodic; smoothed by the transport's own estimator.
+    LinkRtt { rtt_us: u32 },
     /// Periodic host encoder telemetry (bits/s). A field the backend cannot
     /// know is 0, meaning unmeasured: display it as "—", not as zero.
     EncodeStats {

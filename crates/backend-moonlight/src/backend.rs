@@ -635,6 +635,7 @@ fn receive_media(
                         // would make every frame look perfectly timed and the
                         // window would never engage.
                         capture_ts_us: stream_clock_us(frame.timestamp),
+                        host_latency_us: frame.host_latency_us,
                         arrival_us,
                     };
                     if frames.send(out).is_err() {

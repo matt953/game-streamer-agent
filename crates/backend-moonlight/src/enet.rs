@@ -19,6 +19,8 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200)
 /// Poll interval. ENet needs servicing regularly to retransmit and to
 /// surface received packets.
 const SERVICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
+/// How often the measured link round-trip is republished to the embedder.
+const RTT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Commands sent per service tick before ENet is serviced again. High enough
 /// that ordinary input never queues, bounded so a runaway producer cannot
@@ -78,6 +80,10 @@ pub enum HostMessage {
         left_params: [u8; 10],
         right_params: [u8; 10],
     },
+    /// The control peer's round-trip time, republished about once a second.
+    /// ENet measures it on its own acknowledgements — a same-clock round trip,
+    /// which is what makes it a real wire figure with no clock sync anywhere.
+    LinkRtt { rtt_us: u32 },
     /// A message type not acted on here, surfaced so callers can log it rather
     /// than discard it silently.
     ///
@@ -117,6 +123,9 @@ impl HostMessage {
                     right,
                 },
             )),
+            Self::LinkRtt { rtt_us } => {
+                Some(gsa_client_backend_api::BackendEvent::LinkRtt { rtt_us })
+            }
             Self::SetLed { controller, rgb } => {
                 Some(gsa_client_backend_api::BackendEvent::Feedback(
                     gsa_client_backend_api::GamepadFeedback::Led {
@@ -245,6 +254,7 @@ pub fn run(
     // rather than every time it arrives.
     let mut seen_kinds = std::collections::HashSet::new();
     let mut last_ping = std::time::Instant::now();
+    let mut last_rtt = std::time::Instant::now();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
     loop {
@@ -378,6 +388,18 @@ pub fn run(
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // Publish the link's round trip about once a second. ENet keeps its
+        // own smoothed estimate from acknowledgements; reading it costs
+        // nothing and the receiver treats it as telemetry, not control.
+        if connected && last_rtt.elapsed() >= RTT_INTERVAL {
+            last_rtt = std::time::Instant::now();
+            if let Some(peer) = host.connected_peers_mut().next() {
+                #[allow(clippy::cast_possible_truncation)]
+                let rtt_us = peer.round_trip_time().as_micros().min(u128::from(u32::MAX)) as u32;
+                let _ = events.send(HostMessage::LinkRtt { rtt_us });
             }
         }
 

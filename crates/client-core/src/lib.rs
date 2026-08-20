@@ -22,7 +22,7 @@ pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
 pub use pacing::PacingMode;
 pub use reassembly::Reassembler;
 pub use session::StreamSession;
-pub use stats::{ClockSync, LatencyStats, StatsSummary};
+pub use stats::{ClockSync, LatencyStats, LatencySummary, StagePercentiles, StatsSummary};
 
 use gsa_core::media::VideoMode;
 use gsa_core::time::MediaClock;
@@ -763,6 +763,10 @@ impl ReceiveTask {
                             frame_id: frame.frame_id,
                             keyframe: frame.kind == gsa_core::media::FrameKind::Idr,
                             capture_ts_us: frame.capture_ts_us,
+                            // The gsa agent does not yet report its own
+                            // capture-to-encode time per frame; its clock
+                            // sync gives absolute latency instead.
+                            host_latency_us: None,
                             arrival_us,
                         };
                         if self.frames_tx.send(frame).is_err() {

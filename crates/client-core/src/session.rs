@@ -43,6 +43,9 @@ pub struct StreamSession {
     present: stats::PresentStats,
     /// Where cadence breaks entered the stream: at capture, or in transit.
     arrival: stats::ArrivalCadence,
+    /// The latency chain, stage by stage, composed the way the reference
+    /// client's overlay is: durations and round trips, no clock sync.
+    latency: stats::LatencyChain,
     presented_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, std::time::Instant)>,
     presented_tx: tokio::sync::mpsc::UnboundedSender<(u32, std::time::Instant)>,
     /// Backend-maintained counters for frames it could not deliver whole.
@@ -156,6 +159,7 @@ impl StreamSession {
             stats: LatencyStats::default(),
             present: stats::PresentStats::default(),
             arrival: stats::ArrivalCadence::default(),
+            latency: stats::LatencyChain::default(),
             presented_rx: presented.1,
             presented_tx: presented.0,
             dropped,
@@ -392,6 +396,22 @@ impl StreamSession {
         )
     }
 
+    /// The transport measured a control-link round trip; add it to the chain.
+    pub fn on_link_rtt(&mut self, rtt_us: u32) {
+        self.latency.on_rtt(rtt_us);
+    }
+
+    /// A presenter measured how long a decoded frame waited to be shown.
+    pub fn on_present_wait(&mut self, wait_us: u32) {
+        self.latency.on_present_wait(wait_us);
+    }
+
+    /// Per-stage latency percentiles and the composed total.
+    #[must_use]
+    pub fn latency_chain(&self) -> stats::LatencySummary {
+        self.latency.summary()
+    }
+
     /// Frames decoded but discarded unseen under the drop policy.
     #[must_use]
     pub fn superseded(&self) -> u64 {
@@ -462,6 +482,7 @@ impl StreamSession {
                     }
                     let now = self.clock.now_us();
                     let decode_us = (now - decode_start) as u32;
+                    self.latency.on_decode(decode_us);
                     let latency_us = self.absolute_latency_us(now, gated.capture_ts_us);
                     self.stats.on_frame_decoded(latency_us, decode_us);
                     return Ok(Some(FrameOutput {
@@ -510,6 +531,9 @@ impl StreamSession {
         // Before any gating or pacing: this has to see the stream as it was
         // delivered, not as we chose to release it.
         self.arrival.on_arrival(f.capture_ts_us, arrival_us);
+        if let Some(host_us) = f.host_latency_us {
+            self.latency.on_host(host_us);
+        }
         // A decoder-rejected frame breaks the chain even when delivery looked
         // clean, so it is handled exactly like a gap.
         if self
@@ -658,11 +682,13 @@ impl StreamSession {
             self.dejitter_skipped_backlog = self.dejitter_skipped_backlog.saturating_add(1);
         }
         if backlog || !self.dejitter.load(std::sync::atomic::Ordering::Relaxed) {
+            self.latency.on_hold(0);
             return;
         }
         self.dejitter_ran = self.dejitter_ran.saturating_add(1);
         let age = now.saturating_sub(self.first_gate_us.unwrap_or(now));
         if age < WARMUP_US {
+            self.latency.on_hold(0);
             return;
         }
         let high = if self.dejitter_active {
@@ -675,6 +701,7 @@ impl StreamSession {
             tracing::debug!(jitter_us = jitter, active = high, "dejitter mode");
         }
         if !high {
+            self.latency.on_hold(0);
             return;
         }
         // How far through its transit budget this frame already is. Measured
@@ -682,10 +709,15 @@ impl StreamSession {
         // the gate counts against the wait rather than being added to it.
         let drift_now = transit_drift_us(now, capture_ts_us);
         let target = p90.min(p10.saturating_add(dejitter_max_us));
+        if drift_now >= target {
+            self.latency.on_hold(0);
+        }
         if drift_now < target {
             let wait = u64::from((target - drift_now).min(dejitter_max_us));
             self.hold_total_us += wait;
             self.held_frames += 1;
+            #[allow(clippy::cast_possible_truncation)]
+            self.latency.on_hold(wait as u32);
             tokio::time::sleep(std::time::Duration::from_micros(wait)).await;
         }
     }
@@ -795,6 +827,7 @@ mod supersede_tests {
                 frame_id: i + 1,
                 keyframe: i == 0,
                 capture_ts_us: 1_000_000 + i * 16_667,
+                host_latency_us: Some(4_000),
                 arrival_us: u64::from(1_000_000 + i * 16_667),
             });
         }

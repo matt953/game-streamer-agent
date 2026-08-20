@@ -386,6 +386,10 @@ pub struct GsaSession {
     decode_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Adaptive de-jitter switch for [`gsa_set_dejitter`].
     dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Live latency-chain summary for [`gsa_session_latency`], republished
+    /// about once a second by the session loop. Behind a mutex because it is
+    /// a struct, read at UI rate, written at 1 Hz — contention is nil.
+    latency: std::sync::Arc<std::sync::Mutex<gsa_client_core::LatencySummary>>,
     /// Live pacing figures for [`gsa_session_pacing`]: the spread of transit
     /// drift the link delivered, and the spread after pacing. Shared rather
     /// than pushed, because they change every frame and an overlay wants
@@ -413,6 +417,8 @@ pub(crate) enum SessionReady {
         dejitter: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// Transit-drift spread as delivered, and as released after pacing.
         pacing: std::sync::Arc<(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU32)>,
+        /// Per-stage latency percentiles, republished by the session loop.
+        latency: std::sync::Arc<std::sync::Mutex<gsa_client_core::LatencySummary>>,
         codec: u32,
         pad_caps: u32,
     },
@@ -501,6 +507,7 @@ pub unsafe extern "C" fn gsa_session_start(
         Ok(SessionReady::Streaming {
             input,
             knobs,
+            latency,
             presented,
             decode_error,
             dejitter,
@@ -510,6 +517,7 @@ pub unsafe extern "C" fn gsa_session_start(
         }) => Box::into_raw(Box::new(GsaSession {
             stop,
             thread: Some(thread),
+            latency,
             input,
             knobs,
             presented,
@@ -679,6 +687,73 @@ pub unsafe extern "C" fn gsa_set_dejitter(session: *const GsaSession, enabled: b
     unsafe { &*session }
         .dejitter
         .store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One latency stage's percentiles, µs. `valid == 0` means the stage was
+/// never measured — show it as unknown, never as zero.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GsaLatencyStage {
+    pub valid: u32,
+    pub p50_us: u32,
+    pub p95_us: u32,
+    pub p99_us: u32,
+}
+
+/// The latency chain as the reference client's overlay composes it: the wire
+/// as a measured round trip, the host's own capture→encode duration, and the
+/// client-side stages — plus the composed total (half the round trip + every
+/// measured duration). Durations and round trips only, so no clock sync is
+/// involved anywhere.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GsaLatencyChain {
+    pub rtt: GsaLatencyStage,
+    pub host: GsaLatencyStage,
+    pub decode: GsaLatencyStage,
+    pub hold: GsaLatencyStage,
+    pub present: GsaLatencyStage,
+    pub total: GsaLatencyStage,
+}
+
+fn stage_out(stage: Option<gsa_client_core::StagePercentiles>) -> GsaLatencyStage {
+    stage.map_or_else(GsaLatencyStage::default, |s| GsaLatencyStage {
+        valid: 1,
+        p50_us: s.p50_us,
+        p95_us: s.p95_us,
+        p99_us: s.p99_us,
+    })
+}
+
+/// Read the session's live latency chain.
+///
+/// # Safety
+/// `session` must be a live handle; `out` must point to a writable
+/// [`GsaLatencyChain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_latency(
+    session: *const GsaSession,
+    out: *mut GsaLatencyChain,
+) {
+    if session.is_null() || out.is_null() {
+        return;
+    }
+    // SAFETY: caller contract — a live session handle.
+    let summary = *unsafe { &*session }
+        .latency
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // SAFETY: caller contract — `out` is writable.
+    unsafe {
+        *out = GsaLatencyChain {
+            rtt: stage_out(summary.rtt),
+            host: stage_out(summary.host),
+            decode: stage_out(summary.decode),
+            hold: stage_out(summary.hold),
+            present: stage_out(summary.present),
+            total: stage_out(summary.total),
+        };
+    }
 }
 
 /// The protocol's bitrate ceiling (bps) — the top of every bitrate control.
@@ -1195,6 +1270,11 @@ async fn session_loop(
         pacing: std::sync::Arc::new((
             std::sync::atomic::AtomicU32::new(0),
             std::sync::atomic::AtomicU32::new(0),
+        )),
+        // The gsa path does not compose the chain yet; its clock sync gives
+        // absolute latency instead. Empty means every stage reads unknown.
+        latency: std::sync::Arc::new(std::sync::Mutex::new(
+            gsa_client_core::LatencySummary::default(),
         )),
         codec,
         // The agent's own pad support, straight from the backend seam rather

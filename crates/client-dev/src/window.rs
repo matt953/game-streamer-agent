@@ -753,6 +753,14 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 // what arrives on it is the only record of what the host did
                 // with the pad we announced.
                 while let Ok(message) = stream.events.try_recv() {
+                    // The wire's measured round trip is telemetry for the
+                    // latency chain, not a host message worth a log line each.
+                    if let Some(gsa_client_core::BackendEvent::LinkRtt { rtt_us }) =
+                        message.neutral()
+                    {
+                        core.on_link_rtt(rtt_us);
+                        continue;
+                    }
                     tracing::info!(?message, "host control message");
                     // The pad is owned by the event-loop thread, so anything
                     // it has to play crosses over rather than being touched
@@ -853,6 +861,34 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                         recv_mbps = stats
                             .recv_mbps
                             .map_or_else(|| "—".to_owned(), |m| format!("{m:.1}")),
+                        // The latency chain, p50/p95/p99 per stage in ms, "—"
+                        // where a stage was never measured. `total` composes
+                        // half the round trip with every measured duration —
+                        // the reference overlay's own arithmetic.
+                        latency = {
+                            let chain = core.latency_chain();
+                            let stage = |s: Option<gsa_client_core::StagePercentiles>| {
+                                s.map_or_else(
+                                    || "—".to_owned(),
+                                    |p| {
+                                        format!(
+                                            "{:.1}/{:.1}/{:.1}",
+                                            f64::from(p.p50_us) / 1000.0,
+                                            f64::from(p.p95_us) / 1000.0,
+                                            f64::from(p.p99_us) / 1000.0
+                                        )
+                                    },
+                                )
+                            };
+                            format!(
+                                "rtt={} host={} decode={} hold={} total={}",
+                                stage(chain.rtt),
+                                stage(chain.host),
+                                stage(chain.decode),
+                                stage(chain.hold),
+                                stage(chain.total)
+                            )
+                        },
                         "moonlight stream stats"
                     );
                 }
@@ -1822,9 +1858,15 @@ struct Gpu {
     /// The same, for a stream that uses the full 0-1023 range.
     hdr_pipeline_full: wgpu::RenderPipeline,
     hdr_bind_layout: wgpu::BindGroupLayout,
-    /// Whether the surface takes PQ directly. When it does the stream reaches
-    /// the panel as HDR; when it does not the shader tone-maps instead.
+    /// Whether the surface is currently configured for PQ. Follows the
+    /// content: PQ while HDR frames are on screen, sRGB otherwise — a surface
+    /// interpreting one as the other shows every colour wrong.
     surface_is_pq: bool,
+    /// The two surface personalities this machine supports.
+    sdr_format: wgpu::TextureFormat,
+    pq_format: Option<wgpu::TextureFormat>,
+    /// The toast pipeline for the PQ surface, when there is one.
+    bar_pipeline_pq: Option<wgpu::RenderPipeline>,
     bar_pipeline: wgpu::RenderPipeline,
     bar_uniform: wgpu::Buffer,
     bar_bind: wgpu::BindGroup,
@@ -1879,26 +1921,32 @@ impl Gpu {
         // Ask for HDR10 before settling for SDR. `formats` deliberately lists
         // only what `Auto` can pick, which is never HDR, so the HDR-capable
         // formats have to be read from `format_capabilities` instead.
+        // The surface must speak the *content's* language: SDR frames carry
+        // sRGB values and HDR frames carry PQ, and a surface interpreting one
+        // as the other shows every colour wrong without erroring. So the
+        // surface starts sRGB, the PQ configuration is kept aside, and the
+        // render path swaps between them when the stream's format changes.
         let caps = surface.get_capabilities(&adapter);
-        let pq = caps.format_capabilities.iter().find(|f| {
-            f.color_spaces.contains(wgpu::SurfaceColorSpaces::BT2100_PQ)
-                && matches!(
-                    f.format,
-                    wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rgb10a2Unorm
-                )
-        });
-        let surface_is_pq = if let Some(f) = pq {
-            config.format = f.format;
-            config.color_space = wgpu::SurfaceColorSpace::Bt2100Pq;
-            tracing::info!(format = ?f.format, "HDR surface: BT.2100 PQ");
-            true
-        } else {
-            tracing::info!(
-                format = ?config.format,
+        let pq_format = caps
+            .format_capabilities
+            .iter()
+            .find(|f| {
+                f.color_spaces.contains(wgpu::SurfaceColorSpaces::BT2100_PQ)
+                    && matches!(
+                        f.format,
+                        wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rgb10a2Unorm
+                    )
+            })
+            .map(|f| f.format);
+        let sdr_format = config.format;
+        match pq_format {
+            Some(format) => tracing::info!(?format, "HDR surface available: BT.2100 PQ"),
+            None => tracing::info!(
+                format = ?sdr_format,
                 "no HDR surface available; HDR frames will be tone-mapped to SDR"
-            );
-            false
-        };
+            ),
+        }
+        let surface_is_pq = false;
         // Vsync is what a phone, a TV and a monitor all do, so it is the only
         // mode under which presentation timing means anything. The immediate
         // mode is kept for measuring delivery in isolation.
@@ -1964,6 +2012,11 @@ impl Gpu {
             bind_group_layouts: &[Some(&hdr_bind_layout)],
             ..Default::default()
         });
+        // HDR frames are drawn to the PQ surface when the display has one and
+        // tone-mapped onto the SDR surface when it does not, so the pipeline
+        // targets whichever of those this machine will actually use.
+        let hdr_target = pq_format.unwrap_or(sdr_format);
+        let surface_takes_pq = pq_format.is_some();
         // One pipeline per range, rather than a uniform read on every pixel of
         // every frame for a value that changes once a session.
         let hdr_pipeline_for = |full_range: bool| {
@@ -1973,7 +2026,10 @@ impl Gpu {
                 ("64.0", "876.0", "896.0")
             };
             let source = HDR_SHADER
-                .replace("__PQ_OUT__", if surface_is_pq { "true" } else { "false" })
+                .replace(
+                    "__PQ_OUT__",
+                    if surface_takes_pq { "true" } else { "false" },
+                )
                 .replace("__LUMA_OFFSET__", offset)
                 .replace("__LUMA_SPAN__", luma_span)
                 .replace("__CHROMA_SPAN__", chroma_span);
@@ -1993,7 +2049,7 @@ impl Gpu {
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
                     entry_point: Some("fs_main"),
-                    targets: &[Some(config.format.into())],
+                    targets: &[Some(hdr_target.into())],
                     compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState::default(),
@@ -2075,37 +2131,44 @@ impl Gpu {
             bind_group_layouts: &[Some(&bar_bind_layout)],
             ..Default::default()
         });
-        let bar_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("bar"),
-            layout: Some(&bar_layout),
-            vertex: wgpu::VertexState {
-                module: &bar_shader,
-                entry_point: Some("vs_bar"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &bar_shader,
-                entry_point: Some("fs_bar"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let bar_pipeline_for = |format: wgpu::TextureFormat| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("bar"),
+                layout: Some(&bar_layout),
+                vertex: wgpu::VertexState {
+                    module: &bar_shader,
+                    entry_point: Some("vs_bar"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &bar_shader,
+                    entry_point: Some("fs_bar"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let bar_pipeline = bar_pipeline_for(sdr_format);
+        let bar_pipeline_pq = pq_format.map(bar_pipeline_for);
 
         Ok(Self {
             hdr_pipeline,
             hdr_pipeline_full,
             hdr_bind_layout,
             surface_is_pq,
+            sdr_format,
+            pq_format,
+            bar_pipeline_pq,
             surface,
             device,
             queue,
@@ -2256,6 +2319,23 @@ impl Gpu {
     /// occluded or timed-out surface presents nothing, and reporting that as a
     /// present is how a hidden window comes to look like a 600 Hz display.
     fn render(&mut self, frame: &DecodedFrame, toast: Option<([f32; 4], f32)>) -> Result<bool> {
+        // The surface follows the content: PQ for HDR frames (when the
+        // display has a PQ mode), sRGB for everything else. Swapping is a
+        // reconfigure, which happens only when the stream's format actually
+        // changes — in practice once per session.
+        let want_pq = frame.order.is_hdr() && self.pq_format.is_some();
+        if want_pq != self.surface_is_pq {
+            if want_pq {
+                self.config.format = self.pq_format.expect("checked above");
+                self.config.color_space = wgpu::SurfaceColorSpace::Bt2100Pq;
+            } else {
+                self.config.format = self.sdr_format;
+                self.config.color_space = wgpu::SurfaceColorSpace::Auto;
+            }
+            self.surface.configure(&self.device, &self.config);
+            self.surface_is_pq = want_pq;
+            tracing::info!(pq = want_pq, format = ?self.config.format, "surface reconfigured");
+        }
         self.ensure_texture(frame.width, frame.height, frame.order);
 
         // A toast is showing: write its quad (full width, bottom, slid by `s`).
@@ -2378,7 +2458,11 @@ impl Gpu {
             // Toast overlay: full-surface viewport, alpha-blended quad on top.
             if toast.is_some() {
                 pass.set_viewport(0.0, 0.0, sw, sh, 0.0, 1.0);
-                pass.set_pipeline(&self.bar_pipeline);
+                pass.set_pipeline(if self.surface_is_pq {
+                    self.bar_pipeline_pq.as_ref().unwrap_or(&self.bar_pipeline)
+                } else {
+                    &self.bar_pipeline
+                });
                 pass.set_bind_group(0, &self.bar_bind, &[]);
                 pass.draw(0..6, 0..1);
             }

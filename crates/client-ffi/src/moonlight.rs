@@ -211,6 +211,11 @@ pub(crate) fn run_session(
             std::sync::atomic::AtomicU32::new(0),
         ));
         let publish = pacing.clone();
+        let latency = std::sync::Arc::new(std::sync::Mutex::new(
+            gsa_client_core::LatencySummary::default(),
+        ));
+        let latency_publish = latency.clone();
+        let mut last_latency_publish = std::time::Instant::now();
 
         let _ = ready_tx.send(crate::SessionReady::Streaming {
             input: Some(stream.input.clone()),
@@ -221,6 +226,7 @@ pub(crate) fn run_session(
             decode_error: core.decode_error_flag(),
             dejitter: core.dejitter_flag(),
             pacing: pacing.clone(),
+            latency: latency.clone(),
             codec: crate::codec_to_flag(stream.codec),
             pad_caps: u32::from(stream.pad_caps().bits()),
         });
@@ -265,6 +271,12 @@ pub(crate) fn run_session(
                         use std::sync::atomic::Ordering::Relaxed;
                         publish.0.store(core.jitter_us(), Relaxed);
                         publish.1.store(core.released_jitter_us(), Relaxed);
+                        if last_latency_publish.elapsed() >= std::time::Duration::from_secs(1) {
+                            last_latency_publish = std::time::Instant::now();
+                            if let Ok(mut slot) = latency_publish.lock() {
+                                *slot = core.latency_chain();
+                            }
+                        }
                         if let Some(cb) = cbs.on_video {
                             // SAFETY: pointer+len describe f.data for this call only.
                             unsafe {
@@ -291,6 +303,12 @@ pub(crate) fn run_session(
                 let Some(event) = message.neutral() else {
                     continue;
                 };
+                // The wire's measured round trip feeds the latency chain
+                // rather than the pad path.
+                if let gsa_client_core::BackendEvent::LinkRtt { rtt_us } = event {
+                    core.on_link_rtt(rtt_us);
+                    continue;
+                }
                 // The full effect, not just its existence: amplitudes, colours
                 // and motion requests all reach the embedder here.
                 crate::fire_pad_feedback(&cbs, &event);
