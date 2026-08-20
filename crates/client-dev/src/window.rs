@@ -243,6 +243,7 @@ pub fn run_moonlight(
     bitrate_mbps: u32,
     force_sw: bool,
     seconds: u64,
+    first_frame_s: u64,
     synthetic_pad: bool,
     pad_kind: Option<&str>,
     dump_frame: Option<std::path::PathBuf>,
@@ -297,6 +298,7 @@ pub fn run_moonlight(
                     bitrate_mbps,
                     force_sw,
                     seconds,
+                    first_frame_s,
                     synthetic_pad,
                     dump_frame,
                     offered,
@@ -501,6 +503,36 @@ fn run_script(
                 }]);
                 tracing::info!(step = index + 1, key = step.slug(), "script key");
             }
+            Step::Point { x, y } => {
+                let ts_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros() as u64);
+                input.send(vec![gsa_client_core::InputEvent::MouseMove(
+                    gsa_client_core::MouseMove::Absolute { x, y, ts_us },
+                )]);
+                // A menu that highlights on hover needs a moment to redraw
+                // before a click is worth sending.
+                std::thread::sleep(KEY_HELD);
+                tracing::info!(step = index + 1, x, y, "script pointer");
+            }
+            Step::Click => {
+                let now = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_micros() as u64)
+                };
+                for down in [true, false] {
+                    input.send(vec![gsa_client_core::InputEvent::MouseButton {
+                        button: gsa_client_core::MouseButton::Left,
+                        down,
+                        ts_us: now(),
+                    }]);
+                    if down {
+                        std::thread::sleep(KEY_HELD);
+                    }
+                }
+                tracing::info!(step = index + 1, "script click");
+            }
             Step::Shot => {}
         }
         if let Some(dir) = shots_dir {
@@ -523,6 +555,16 @@ struct MoonlightRun {
     bitrate_mbps: u32,
     force_sw: bool,
     seconds: u64,
+    /// Give up if the first frame has not decoded within this many seconds
+    /// (0 = wait forever).
+    ///
+    /// A host still holding an abandoned session accepts the connection,
+    /// negotiates, and then sends nothing. Every client-side signal looks
+    /// healthy, so an unattended run sits on a grey window for its whole
+    /// duration and reports a clean exit. Waiting on the first frame is what
+    /// tells the two apart, and it costs a session that was going to fail
+    /// anyway.
+    first_frame_s: u64,
     synthetic_pad: bool,
     dump_frame: Option<std::path::PathBuf>,
     offered: Vec<gsa_core::media::Codec>,
@@ -544,6 +586,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
         bitrate_mbps,
         force_sw,
         seconds,
+        first_frame_s,
         synthetic_pad,
         dump_frame,
         offered,
@@ -647,7 +690,27 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     break Ok(());
                 }
-                let Some(out) = core.recv_frame(decoder.as_mut()).await? else {
+                // Only the first frame is waited on with a limit. A stream
+                // that has started and then pauses is a legitimate idle
+                // screen; one that never starts is a host holding a session
+                // it will not give up.
+                let received = if frames == 0 && first_frame_s > 0 {
+                    let wait = std::time::Duration::from_secs(first_frame_s);
+                    match tokio::time::timeout(wait, core.recv_frame(decoder.as_mut())).await {
+                        Ok(received) => received,
+                        Err(_) => {
+                            break Err(anyhow::anyhow!(
+                                "no video {first_frame_s}s after the session started — the host \
+                                 is almost certainly still holding an earlier session. Clear it \
+                                 with:\n  cargo run -q --release -p gsa-backend-moonlight \
+                                 --example launch -- {addr} {app_id}"
+                            ));
+                        }
+                    }
+                } else {
+                    core.recv_frame(decoder.as_mut()).await
+                };
+                let Some(out) = received? else {
                     break Ok(());
                 };
                 frames += 1;

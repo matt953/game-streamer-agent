@@ -18,16 +18,34 @@
 //!
 //! Keys are HID usages, the same as a real keypress takes, so this exercises
 //! the input path rather than going around it.
+//!
+//! **Prefer clicking a position to counting keypresses.** A menu whose
+//! selection wraps has no edge to count from, and one whose starting selection
+//! follows the mouse has no fixed origin either — so a sequence of Downs is
+//! only ever right by luck, and lands somewhere else the run after. `at:x,y`
+//! puts the pointer at a fraction of the frame and `click` presses it, which
+//! depends on nothing but where the item is drawn:
+//!
+//! ```text
+//! --input-script "30s at:0.13,0.41 click 8s ..."
+//! ```
 
 use std::time::Duration;
 
 /// One thing to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Step {
     /// Wait before the next step.
     Wait(Duration),
     /// Press and release a key, by HID usage (page 0x07).
     Key(u16),
+    /// Put the pointer at a normalized position in the frame.
+    ///
+    /// Normalized rather than pixels so a script survives a change of stream
+    /// resolution, which would otherwise silently click somewhere else.
+    Point { x: f32, y: f32 },
+    /// Press and release the left mouse button where the pointer is.
+    Click,
     /// Write the next decoded frame out.
     Shot,
 }
@@ -42,6 +60,24 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
         .map(|token| {
             if token == "shot" {
                 return Ok(Step::Shot);
+            }
+            if token == "click" {
+                return Ok(Step::Click);
+            }
+            if let Some(rest) = token.strip_prefix("at:") {
+                let (x, y) = rest
+                    .split_once(',')
+                    .ok_or_else(|| format!("a position needs x,y: {token:?}"))?;
+                let parse = |v: &str| {
+                    v.parse::<f32>()
+                        .ok()
+                        .filter(|f| (0.0..=1.0).contains(f))
+                        .ok_or_else(|| format!("not a fraction of the frame: {token:?}"))
+                };
+                return Ok(Step::Point {
+                    x: parse(x)?,
+                    y: parse(y)?,
+                });
             }
             if let Some(rest) = token.strip_suffix("ms") {
                 let ms: u64 = rest
@@ -69,6 +105,8 @@ impl Step {
         match self {
             Self::Wait(d) => format!("wait-{}ms", d.as_millis()),
             Self::Key(usage) => format!("key-{}", key_name(usage)),
+            Self::Point { x, y } => format!("at-{:.0}-{:.0}", x * 100.0, y * 100.0),
+            Self::Click => "click".to_owned(),
             Self::Shot => "shot".to_owned(),
         }
     }
@@ -171,6 +209,25 @@ mod tests {
         assert!(parse("30s wiggle enter").is_err());
         assert!(parse("30x down").is_err());
         assert!(parse("12ss down").is_err());
+    }
+
+    /// Clicking a position is the only navigation that does not depend on
+    /// where the selection happened to start, so it has to parse exactly.
+    #[test]
+    fn a_position_is_a_fraction_of_the_frame() {
+        assert_eq!(
+            parse("at:0.13,0.41 click").expect("valid"),
+            vec![Step::Point { x: 0.13, y: 0.41 }, Step::Click]
+        );
+        // Both corners, since a fraction is only resolution-independent if the
+        // whole range is accepted.
+        assert!(parse("at:0,0").is_ok());
+        assert!(parse("at:1,1").is_ok());
+        // Anything outside the frame is a mistake, not a click off-screen.
+        assert!(parse("at:1.5,0.5").is_err());
+        assert!(parse("at:-0.1,0.5").is_err());
+        assert!(parse("at:0.5").is_err(), "a position needs both axes");
+        assert!(parse("at:left,0.5").is_err());
     }
 
     /// Fractional and millisecond waits, because menu animations are not

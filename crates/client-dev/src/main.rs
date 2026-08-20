@@ -87,6 +87,15 @@ struct Cli {
     /// start the next one.
     #[arg(long, default_value_t = 0)]
     moonlight_seconds: u64,
+    /// Give up if no frame has decoded this many seconds into the session
+    /// (0 = wait forever).
+    ///
+    /// A host holding an abandoned session still accepts the connection and
+    /// negotiates; it simply never sends a picture. Without this an unattended
+    /// run waits out its whole duration on a grey window and then reports
+    /// success, so the failure is only found by someone watching the screen.
+    #[arg(long, default_value_t = 15)]
+    moonlight_first_frame_s: u64,
     /// Drive a synthetic controller for the session: makes the host plug a
     /// virtual pad so its controller-related messages can be observed without
     /// physical hardware.
@@ -200,6 +209,7 @@ fn main() -> Result<()> {
             cli.moonlight_mbps,
             cli.sw_decode,
             cli.moonlight_seconds,
+            cli.moonlight_first_frame_s,
             cli.moonlight_synthetic_pad,
             cli.moonlight_pad_kind.as_deref(),
             cli.dump_frame.clone(),

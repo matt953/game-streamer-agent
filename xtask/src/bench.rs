@@ -17,19 +17,20 @@ use anyhow::{Context, Result, bail};
 /// Shadow of the Tomb Raider's benchmark, as published by the host.
 const SOTR_APP_ID: u32 = 1_825_961_046;
 
-/// Menu navigation, with an anchor rather than a count from wherever the
-/// cursor happens to sit.
+/// Menu navigation by pointer position, because no count of keypresses is
+/// reliable here.
 ///
-/// - **Six Ups first.** The main menu's selection follows the mouse, so the
-///   starting point is not fixed. That menu *clamps* at the top, so
-///   over-pressing Up always lands on New Game — a known place to count from.
-/// - **No anchor inside Options.** That submenu *wraps*, so the same trick
-///   cycles round it and lands three items further down than intended. It
-///   always opens on Audio and Languages, so counting down is safe there.
-/// - **Enter before R.** `[R] Run Benchmark` is an action of the Display and
-///   Graphics submenu; R does nothing while the item is merely highlighted.
-const NAVIGATION: &str = "30s up up up up up up 1s down down 1s enter \
-                          8s down down down 1s enter 10s r";
+/// Both menus *wrap*, so over-pressing Up reaches no edge to count from — six
+/// Ups over the five selectable main-menu entries is a net one Up, which is a
+/// different item every time. And the starting selection follows the mouse, so
+/// there is no fixed origin either. A keyboard sequence is right by luck and
+/// silently walks into Challenge Tombs the run after; two runs did exactly
+/// that and were reported as benchmark results.
+///
+/// Clicking where an item is drawn depends on neither. `[R] Run Benchmark` is
+/// still a footer action of the Display and Graphics page, so it is pressed
+/// only once that page is open.
+const NAVIGATION: &str = "30s at:0.13,0.41 click 8s at:0.13,0.357 click 10s r";
 
 /// The benchmark itself, then a frame of the results.
 const BENCHMARK: &str = "220s shot";
@@ -131,10 +132,23 @@ fn report(out: &Path, log: &Path) -> Result<()> {
     // The last stats line says whether the stream itself held up, which is
     // the half of the answer the game's own results panel cannot give.
     let text = std::fs::read_to_string(log).with_context(|| format!("read {}", log.display()))?;
-    if let Some(stats) = text.lines().rev().find(|l| l.contains("stream stats")) {
+    let stats = text.lines().rev().find(|l| l.contains("stream stats"));
+    if let Some(stats) = stats {
         println!("stream: {}", strip_ansi(stats));
     }
     println!("every step: {}", out.display());
+
+    // Deliberately not decided here. Two runs sat in the wrong submenu for
+    // five minutes and produced clean statistics and a plausible screenshot;
+    // nothing in the stream distinguished them from a benchmark, and every
+    // threshold that would have is guesswork until there is a known-good run
+    // to calibrate against. Naming the frame to check is honest; an
+    // unvalidated verdict would be the same mistake wearing a green tick.
+    println!(
+        "CHECK before trusting these numbers: the frame after the second click \
+         must be the Display and Graphics page, and the last frame must be the \
+         benchmark's results panel."
+    );
     Ok(())
 }
 
@@ -177,31 +191,44 @@ fn strip_ansi(line: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The navigation is the part that took three failed runs to get right,
-    /// and every element of it is load-bearing.
+    /// The navigation is the part that took five failed runs to get right, and
+    /// the rule it encodes is that arrow keys cannot be trusted in these menus
+    /// at all — both wrap, and the selection starts wherever the mouse left it.
     #[test]
-    fn the_navigation_anchors_before_it_counts() {
+    fn the_navigation_clicks_rather_than_counting_keypresses() {
         let script = format!("{NAVIGATION} {BENCHMARK}");
         let steps = script.split_whitespace().collect::<Vec<_>>();
 
-        // Six Ups, before any Down: the main menu's start is not fixed.
-        let first_down = steps.iter().position(|s| *s == "down").expect("a down");
-        assert_eq!(
-            steps[..first_down].iter().filter(|s| **s == "up").count(),
-            6,
-            "the anchor must come before any counting"
-        );
+        // No arrow keys anywhere. This is the whole fix: two runs walked into
+        // Challenge Tombs on a sequence that had worked before, because six
+        // Ups over five wrapping entries is a net one Up.
+        for arrow in ["up", "down", "left", "right"] {
+            assert!(
+                !steps.contains(&arrow),
+                "{arrow} cannot be relied on in a menu that wraps"
+            );
+        }
 
-        // Two Enters: one into Options, one into Display and Graphics. R is
-        // an action of that second submenu, not of the item in the list.
-        assert_eq!(steps.iter().filter(|s| **s == "enter").count(), 2);
-        let last_enter = steps.iter().rposition(|s| *s == "enter").expect("enter");
+        // Two clicks, each preceded by the position it is aimed at, so neither
+        // fires wherever the pointer happened to be left.
+        let clicks: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == "click")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(clicks.len(), 2, "Options, then Display and Graphics");
+        for click in clicks.iter().copied() {
+            assert!(
+                steps[click - 1].starts_with("at:"),
+                "every click must be aimed first"
+            );
+        }
+
+        // R is a footer action of the Display and Graphics page, so it comes
+        // after the click that opens it.
         let r = steps.iter().position(|s| *s == "r").expect("the r key");
-        assert!(r > last_enter, "R is pressed inside the submenu");
-
-        // Exactly one anchor: repeating it inside Options wraps that menu
-        // round and lands three items further down.
-        assert_eq!(steps.iter().filter(|s| **s == "up").count(), 6);
+        assert!(r > clicks[1], "R only works once that page is open");
 
         // And the benchmark's own running time is waited out before the shot.
         assert!(script.contains("220s shot"));
