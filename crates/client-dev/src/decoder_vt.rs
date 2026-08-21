@@ -115,6 +115,12 @@ pub struct VideoToolboxDecoder {
     /// static metadata rides keyframes and dynamic rides the rest, so no
     /// single frame shows the whole story.
     reported_attachments: Option<(bool, bool, bool)>,
+    /// The static HDR payloads last seen on the wire. Kept across access
+    /// units: they ride keyframes only, and every decoded frame between
+    /// keyframes still belongs to the same mastering description.
+    static_payloads: crate::hdr_probe::HdrPayloads,
+    /// The union of metadata kinds re-attached so far, for the one-line log.
+    reported_attach: Option<(bool, bool, bool)>,
     session: Option<CFRetained<VTDecompressionSession>>,
     format: Option<CFRetained<CMFormatDescription>>,
     /// Last seen parameter sets, in the order the format description wants
@@ -151,6 +157,8 @@ impl VideoToolboxDecoder {
             reported_luma: false,
             reported_metadata: None,
             reported_attachments: None,
+            static_payloads: crate::hdr_probe::HdrPayloads::default(),
+            reported_attach: None,
             session: None,
             format: None,
             param_sets: Vec::new(),
@@ -430,8 +438,14 @@ impl VideoDecoder for VideoToolboxDecoder {
                 }
             }
         }
-        let found = crate::hdr_probe::hevc_static_metadata(&nals);
-        self.report_static_metadata(found);
+        let payloads = crate::hdr_probe::hevc_hdr_payloads(&nals);
+        self.report_static_metadata(crate::hdr_probe::StaticMetadata::from_payloads(&payloads));
+        if payloads.mastering_display.is_some() {
+            self.static_payloads.mastering_display = payloads.mastering_display.clone();
+        }
+        if payloads.content_light_level.is_some() {
+            self.static_payloads.content_light_level = payloads.content_light_level.clone();
+        }
         let wanted = if self.codec == Codec::Hevc { 3 } else { 2 };
         let found: Vec<&[u8]> = sets.iter().skip(3 - wanted).flatten().copied().collect();
         if found.len() == wanted {
@@ -443,11 +457,116 @@ impl VideoDecoder for VideoToolboxDecoder {
         if avcc.is_empty() {
             return Ok(None);
         }
-        self.decode_sample(&avcc)
+        let decoded = self.decode_sample(&avcc)?;
+        if let Some(frame) = &decoded {
+            self.attach_hdr_payloads(frame, payloads.hdr10_plus.as_deref());
+        }
+        Ok(decoded)
     }
 }
 
 impl VideoToolboxDecoder {
+    /// Hand the display path what the decoder dropped: the bitstream's HDR
+    /// payloads, re-attached to the decoded buffer. VideoToolbox carries the
+    /// colour description across but not these — measured, not assumed
+    /// (`reported_attachments`) — so without this the metadata dies here.
+    ///
+    /// Static payloads only when they carry real values: a zeroed mastering
+    /// description means "unknown", and handing a display "unknown" as fact
+    /// can only mislead its tone mapping. The HDR10+ payload is this frame's
+    /// own — per-scene guidance is wrong on any other frame.
+    fn attach_hdr_payloads(&mut self, frame: &DecodedFrame, hdr10_plus: Option<&[u8]>) {
+        let Some(surface) = frame
+            .platform
+            .as_ref()
+            .and_then(|p| (**p).downcast_ref::<VtSurface>())
+        else {
+            return;
+        };
+        let pb: &CVPixelBuffer = surface.pixel_buffer();
+        let as_cf_data = |bytes: &[u8]| {
+            // SAFETY: a valid pointer + length pair from a live slice.
+            unsafe {
+                objc2_core_foundation::CFData::new(
+                    None,
+                    bytes.as_ptr(),
+                    bytes.len() as objc2_core_foundation::CFIndex,
+                )
+            }
+        };
+        let mut attached = (false, false, false);
+        {
+            // SAFETY: framework-provided static keys, valid for the process.
+            let (mastering_key, cll_key) = unsafe {
+                (
+                    objc2_core_video::kCVImageBufferMasteringDisplayColorVolumeKey,
+                    objc2_core_video::kCVImageBufferContentLightLevelInfoKey,
+                )
+            };
+            if let Some(data) = self
+                .static_payloads
+                .mastering_is_valued()
+                .then_some(self.static_payloads.mastering_display.as_deref())
+                .flatten()
+                .and_then(&as_cf_data)
+            {
+                // SAFETY: CFData is a valid CF object for this key.
+                unsafe {
+                    pb.set_attachment(
+                        mastering_key,
+                        data.as_ref(),
+                        objc2_core_video::CVAttachmentMode::ShouldPropagate,
+                    );
+                }
+                attached.0 = true;
+            }
+            if let Some(data) = self
+                .static_payloads
+                .light_level_is_valued()
+                .then_some(self.static_payloads.content_light_level.as_deref())
+                .flatten()
+                .and_then(&as_cf_data)
+            {
+                // SAFETY: CFData is a valid CF object for this key.
+                unsafe {
+                    pb.set_attachment(
+                        cll_key,
+                        data.as_ref(),
+                        objc2_core_video::CVAttachmentMode::ShouldPropagate,
+                    );
+                }
+                attached.1 = true;
+            }
+        }
+        if let Some(data) = hdr10_plus.and_then(&as_cf_data) {
+            let key = objc2_core_foundation::CFString::from_static_str("HDR10PlusPerFrameData");
+            // SAFETY: CFData is a valid CF object for this key.
+            unsafe {
+                pb.set_attachment(
+                    &key,
+                    data.as_ref(),
+                    objc2_core_video::CVAttachmentMode::ShouldPropagate,
+                );
+            }
+            attached.2 = true;
+        }
+        if !(attached.0 || attached.1 || attached.2) {
+            return;
+        }
+        let union = self.reported_attach.map_or(attached, |(m, c, h)| {
+            (m || attached.0, c || attached.1, h || attached.2)
+        });
+        if self.reported_attach != Some(union) {
+            self.reported_attach = Some(union);
+            tracing::info!(
+                mastering_display = union.0,
+                content_light_level = union.1,
+                hdr10_plus = union.2,
+                "re-attached the bitstream's HDR metadata to decoded frames"
+            );
+        }
+    }
+
     /// Say whether the wire carries HDR static metadata.
     ///
     /// Read from the access units, not from the format description: these are

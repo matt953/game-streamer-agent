@@ -222,33 +222,86 @@ impl StaticMetadata {
         self.max_mastering.map(|v| v / 10_000)
     }
 
+    /// Read the facts out of the raw payloads.
+    #[must_use]
+    pub fn from_payloads(payloads: &HdrPayloads) -> Self {
+        let mut found = Self {
+            mastering_display: payloads.mastering_display.is_some(),
+            content_light_level: payloads.content_light_level.is_some(),
+            hdr10_plus: payloads.hdr10_plus.is_some(),
+            ..Self::default()
+        };
+        // ST 2086: three primaries and a white point (16 bytes), then max
+        // and min mastering luminance as big-endian u32s.
+        if let Some(payload) = payloads.mastering_display.as_deref()
+            && payload.len() >= 24
+        {
+            found.max_mastering = Some(u32::from_be_bytes([
+                payload[16],
+                payload[17],
+                payload[18],
+                payload[19],
+            ]));
+            found.min_mastering = Some(u32::from_be_bytes([
+                payload[20],
+                payload[21],
+                payload[22],
+                payload[23],
+            ]));
+        }
+        if let Some(payload) = payloads.content_light_level.as_deref()
+            && payload.len() >= 4
+        {
+            found.max_cll = Some(u16::from_be_bytes([payload[0], payload[1]]));
+            found.max_fall = Some(u16::from_be_bytes([payload[2], payload[3]]));
+        }
+        found
+    }
+}
+
+/// The HDR SEI payloads themselves, kept whole.
+///
+/// Needed beyond the parsed facts because VideoToolbox does not carry these
+/// from the bitstream to its decoded buffers — a client that wants the
+/// display to see them must re-attach the exact payload bytes itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HdrPayloads {
+    /// ST 2086 mastering display colour volume, as coded.
+    pub mastering_display: Option<Vec<u8>>,
+    /// MaxCLL/MaxFALL content light level, as coded.
+    pub content_light_level: Option<Vec<u8>>,
+    /// ST 2094-40 (HDR10+) dynamic metadata: the whole ITU-T T.35 payload,
+    /// country code first — the layout display pipelines take it in.
+    pub hdr10_plus: Option<Vec<u8>>,
+}
+
+impl HdrPayloads {
+    /// Whether the mastering payload carries real luminance values: a
+    /// present-but-zeroed static description means "unknown", and handing a
+    /// display "unknown" as if it were fact can only mislead its mapping.
+    #[must_use]
+    pub fn mastering_is_valued(&self) -> bool {
+        self.mastering_display
+            .as_deref()
+            .is_some_and(|p| p.len() >= 24 && p[16..24].iter().any(|&b| b != 0))
+    }
+
+    /// Whether the light-level payload carries real values — judged on its
+    /// own: MaxCLL/MaxFALL of zero is "unknown" per CTA-861.3.
+    #[must_use]
+    pub fn light_level_is_valued(&self) -> bool {
+        self.content_light_level
+            .as_deref()
+            .is_some_and(|p| p.len() >= 4 && p[..4].iter().any(|&b| b != 0))
+    }
+
     fn note_payload(&mut self, payload_type: u32, payload: &[u8]) {
         match payload_type {
-            // ST 2086: three primaries and a white point (16 bytes), then
-            // max and min mastering luminance as big-endian u32s.
             MASTERING_DISPLAY_COLOUR_VOLUME => {
-                self.mastering_display = true;
-                if payload.len() >= 24 {
-                    self.max_mastering = Some(u32::from_be_bytes([
-                        payload[16],
-                        payload[17],
-                        payload[18],
-                        payload[19],
-                    ]));
-                    self.min_mastering = Some(u32::from_be_bytes([
-                        payload[20],
-                        payload[21],
-                        payload[22],
-                        payload[23],
-                    ]));
-                }
+                self.mastering_display = Some(payload.to_vec());
             }
             CONTENT_LIGHT_LEVEL_INFO => {
-                self.content_light_level = true;
-                if payload.len() >= 4 {
-                    self.max_cll = Some(u16::from_be_bytes([payload[0], payload[1]]));
-                    self.max_fall = Some(u16::from_be_bytes([payload[2], payload[3]]));
-                }
+                self.content_light_level = Some(payload.to_vec());
             }
             // Registered ITU-T T.35 user data. Only the SMPTE-registered
             // ST 2094-40 stream counts as HDR10+; T.35 also carries closed
@@ -258,7 +311,7 @@ impl StaticMetadata {
                     && payload[0] == T35_COUNTRY_US
                     && u16::from_be_bytes([payload[1], payload[2]]) == T35_PROVIDER_SMPTE
                 {
-                    self.hdr10_plus = true;
+                    self.hdr10_plus = Some(payload.to_vec());
                 }
             }
             _ => {}
@@ -284,8 +337,15 @@ const AV1_METADATA_ITUT_T35: u64 = 4;
 /// `nals` are payloads with start codes already stripped. Prefix SEI is NAL
 /// type 39 and suffix SEI is 40; both can carry these.
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn hevc_static_metadata(nals: &[&[u8]]) -> StaticMetadata {
-    let mut found = StaticMetadata::default();
+    StaticMetadata::from_payloads(&hevc_hdr_payloads(nals))
+}
+
+/// The HDR SEI payloads an HEVC access unit carries, whole.
+#[must_use]
+pub fn hevc_hdr_payloads(nals: &[&[u8]]) -> HdrPayloads {
+    let mut found = HdrPayloads::default();
     for nal in nals {
         let Some(first) = nal.first() else { continue };
         if !matches!((first >> 1) & 0x3f, 39 | 40) {
@@ -320,7 +380,7 @@ pub fn av1_static_metadata(metadata_types: &[u64]) -> StaticMetadata {
 ///
 /// Both the type and the size are coded as a run of 0xFF bytes plus a final
 /// byte, so a message can be skipped without understanding it.
-fn scan_sei_payloads(data: &[u8], found: &mut StaticMetadata) {
+fn scan_sei_payloads(data: &[u8], found: &mut HdrPayloads) {
     let mut at = 0;
     let read_extended = |at: &mut usize| -> Option<u32> {
         let mut value: u32 = 0;
