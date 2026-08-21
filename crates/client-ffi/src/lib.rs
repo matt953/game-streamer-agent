@@ -655,6 +655,96 @@ pub unsafe extern "C" fn gsa_session_stop(session: *mut GsaSession) {
     }
 }
 
+/// `gsa_hevc_hdr_payloads` result flags: which payloads were present, and
+/// whether the static ones carry real (non-zero) values.
+pub const GSA_HDR_MASTERING: u32 = 1;
+pub const GSA_HDR_LIGHT_LEVEL: u32 = 2;
+pub const GSA_HDR_10_PLUS: u32 = 4;
+pub const GSA_HDR_MASTERING_VALUED: u32 = 8;
+pub const GSA_HDR_LIGHT_LEVEL_VALUED: u32 = 16;
+
+/// Extract the HDR payloads from an HEVC access unit (Annex-B, as delivered
+/// to `on_video`): ST 2086 mastering display, CTA-861.3 content light level,
+/// and the ST 2094-40 (HDR10+) ITU-T T.35 payload, country code first.
+///
+/// For platforms whose decoder drops in-band SEI (VideoToolbox — measured):
+/// the embedder re-attaches these to its decoded buffers, so the display
+/// sees what the host sent. One parser, here, so every client reads the
+/// same bytes the same way. Each payload is copied into its buffer when
+/// present and it fits; `*_len` is set to the payload's true length (0 when
+/// absent), so a result longer than its `cap` is detectable. NULL buffers
+/// with 0 caps just report presence. Returns `GSA_HDR_*` flags.
+///
+/// # Safety
+/// `au` must point to `au_len` readable bytes. Each non-NULL out pointer
+/// must have its stated capacity, and each `*_len` must be writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
+pub unsafe extern "C" fn gsa_hevc_hdr_payloads(
+    au: *const u8,
+    au_len: usize,
+    mdcv: *mut u8,
+    mdcv_cap: usize,
+    mdcv_len: *mut usize,
+    cll: *mut u8,
+    cll_cap: usize,
+    cll_len: *mut usize,
+    t35: *mut u8,
+    t35_cap: usize,
+    t35_len: *mut usize,
+) -> u32 {
+    if au.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract — `au_len` readable bytes.
+    let unit = unsafe { std::slice::from_raw_parts(au, au_len) };
+    let payloads = gsa_client_core::hdr::hevc_annex_b_hdr_payloads(unit);
+    let copy_out = |bytes: Option<&[u8]>, out: *mut u8, cap: usize, len: *mut usize| {
+        let n = bytes.map_or(0, <[u8]>::len);
+        if !len.is_null() {
+            // SAFETY: caller contract — writable length pointer.
+            unsafe { *len = n };
+        }
+        if let Some(bytes) = bytes
+            && !out.is_null()
+            && n <= cap
+        {
+            // SAFETY: caller contract — `cap` writable bytes at `out`.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n) };
+        }
+    };
+    copy_out(
+        payloads.mastering_display.as_deref(),
+        mdcv,
+        mdcv_cap,
+        mdcv_len,
+    );
+    copy_out(
+        payloads.content_light_level.as_deref(),
+        cll,
+        cll_cap,
+        cll_len,
+    );
+    copy_out(payloads.hdr10_plus.as_deref(), t35, t35_cap, t35_len);
+    let mut flags = 0;
+    if payloads.mastering_display.is_some() {
+        flags |= GSA_HDR_MASTERING;
+    }
+    if payloads.content_light_level.is_some() {
+        flags |= GSA_HDR_LIGHT_LEVEL;
+    }
+    if payloads.hdr10_plus.is_some() {
+        flags |= GSA_HDR_10_PLUS;
+    }
+    if payloads.mastering_is_valued() {
+        flags |= GSA_HDR_MASTERING_VALUED;
+    }
+    if payloads.light_level_is_valued() {
+        flags |= GSA_HDR_LIGHT_LEVEL_VALUED;
+    }
+    flags
+}
+
 /// Stop a session like [`gsa_session_stop`], but leave the host running what
 /// it runs: the app stays up, and starting it again rejoins it mid-game.
 ///

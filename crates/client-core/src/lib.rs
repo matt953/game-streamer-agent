@@ -6,6 +6,7 @@
 
 mod audio;
 mod decode;
+pub mod hdr;
 pub mod pacing;
 mod reassembly;
 mod session;
