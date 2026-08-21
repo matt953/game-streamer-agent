@@ -997,30 +997,21 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                             f64::from(core.mean_hold_us()) / 1000.0
                         ),
                         {
-                            // The HDR story in the core's vocabulary: what
-                            // the wire carried, and what reached decoded
-                            // frames after this client's re-attachment.
+                            // What the user sees; the full story (zeroed vs
+                            // absent, forwarding, re-attachment) is in the
+                            // logs where a person debugging looks for it.
                             match decoder.hdr_status() {
                                 None => "hdr -".to_owned(),
                                 Some(h) => {
-                                    let and = h.delivered.map_or_else(
-                                        || "  out -".to_owned(),
-                                        |(m, c, d)| {
-                                            let yn = |v: bool| if v { "y" } else { "-" };
-                                            format!(
-                                                "  out mast {} cll {} 10+ {}",
-                                                yn(m),
-                                                yn(c),
-                                                yn(d)
-                                            )
-                                        },
-                                    );
+                                    use gsa_client_core::HdrPayloadState as State;
+                                    let present = |p: State| {
+                                        if p == State::Valued { "yes" } else { "-" }
+                                    };
                                     format!(
-                                        "hdr mast {} cll {} 10+ {}{}",
-                                        h.mastering.label(),
-                                        h.light_level.label(),
-                                        if h.hdr10_plus { "y" } else { "-" },
-                                        and
+                                        "hdr mast {} cll {} 10+ {}",
+                                        present(h.mastering),
+                                        present(h.light_level),
+                                        if h.hdr10_plus { "yes" } else { "no" }
                                     )
                                 }
                             }
