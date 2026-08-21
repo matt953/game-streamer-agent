@@ -412,6 +412,28 @@ impl VideoDecoder for VideoToolboxDecoder {
         })
     }
 
+    fn hdr_status(&self) -> Option<gsa_client_core::HdrStatus> {
+        use gsa_client_core::HdrPayloadState as State;
+        let found = self.reported_metadata?;
+        let tri = |present: bool, valued: bool| match (present, valued) {
+            (false, _) => State::Absent,
+            (true, false) => State::Zeroed,
+            (true, true) => State::Valued,
+        };
+        Some(gsa_client_core::HdrStatus {
+            mastering: tri(
+                found.mastering_display,
+                self.static_payloads.mastering_is_valued(),
+            ),
+            light_level: tri(
+                found.content_light_level,
+                self.static_payloads.light_level_is_valued(),
+            ),
+            hdr10_plus: found.hdr10_plus,
+            delivered: self.reported_attach,
+        })
+    }
+
     fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>> {
         // AV1 is not Annex-B: no start codes, no parameter-set NALs, and the
         // sample is the temporal unit exactly as it arrived.
@@ -439,6 +461,19 @@ impl VideoDecoder for VideoToolboxDecoder {
             }
         }
         let payloads = crate::hdr_probe::hevc_hdr_payloads(&nals);
+        // Debug-level: which access units carry which HDR SEI, for verifying
+        // a host's emission cadence (statics on every keyframe? once? on
+        // change?) without guessing from the session-level union.
+        if payloads.mastering_display.is_some() || payloads.hdr10_plus.is_some() {
+            tracing::debug!(
+                mastering = payloads.mastering_display.is_some(),
+                mastering_valued = payloads.mastering_is_valued(),
+                cll = payloads.content_light_level.is_some(),
+                cll_valued = payloads.light_level_is_valued(),
+                hdr10_plus = payloads.hdr10_plus.is_some(),
+                "HDR SEI in this access unit"
+            );
+        }
         self.report_static_metadata(crate::hdr_probe::StaticMetadata::from_payloads(&payloads));
         if payloads.mastering_display.is_some() {
             self.static_payloads.mastering_display = payloads.mastering_display.clone();

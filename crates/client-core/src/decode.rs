@@ -138,6 +138,45 @@ impl VideoFormat {
     }
 }
 
+/// One HDR-metadata payload's state on the wire: three-valued because
+/// "present but zeroed" is a real signal (the host says *unknown*) and
+/// collapsing it into either neighbour misreports the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdrPayloadState {
+    Absent,
+    Zeroed,
+    Valued,
+}
+
+impl HdrPayloadState {
+    /// Overlay spelling, sized for a stats column.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "—",
+            Self::Zeroed => "zeroed",
+            Self::Valued => "valued",
+        }
+    }
+}
+
+/// The HDR-metadata story of a stream, in the one vocabulary every client's
+/// overlay uses: what the wire carried, and what this platform's display
+/// path actually received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HdrStatus {
+    /// ST 2086 mastering display metadata on the wire.
+    pub mastering: HdrPayloadState,
+    /// MaxCLL/MaxFALL content light level on the wire.
+    pub light_level: HdrPayloadState,
+    /// ST 2094-40 (HDR10+) per-frame dynamic metadata seen on the wire.
+    pub hdr10_plus: bool,
+    /// What reached decoded frames as (mastering, light level, HDR10+) —
+    /// re-attached by the client where the decoder drops them, forwarded by
+    /// the decoder where it does not. `None` where nothing can measure it.
+    pub delivered: Option<(bool, bool, bool)>,
+}
+
 /// An H.264 (M0) access-unit decoder.
 pub trait VideoDecoder: Send {
     /// Feed one complete access unit. `Ok(None)` = decoder buffering
@@ -147,6 +186,12 @@ pub trait VideoDecoder: Send {
     /// What this decoder is producing, once it has configured itself from a
     /// keyframe. `None` before then, and for decoders that cannot say.
     fn video_format(&self) -> Option<VideoFormat> {
+        None
+    }
+
+    /// The stream's HDR-metadata story, where this decoder can tell it.
+    /// `None` before any metadata question has an answer.
+    fn hdr_status(&self) -> Option<HdrStatus> {
         None
     }
 }
