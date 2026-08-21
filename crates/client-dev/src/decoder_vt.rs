@@ -110,6 +110,11 @@ pub struct VideoToolboxDecoder {
     reported_luma: bool,
     /// Whether the wire has been checked for HDR static metadata.
     reported_metadata: Option<crate::hdr_probe::StaticMetadata>,
+    /// Attachment state of decoded buffers already reported, as a union of
+    /// (mastering display, content light level, HDR10+) across frames —
+    /// static metadata rides keyframes and dynamic rides the rest, so no
+    /// single frame shows the whole story.
+    reported_attachments: Option<(bool, bool, bool)>,
     session: Option<CFRetained<VTDecompressionSession>>,
     format: Option<CFRetained<CMFormatDescription>>,
     /// Last seen parameter sets, in the order the format description wants
@@ -145,6 +150,7 @@ impl VideoToolboxDecoder {
             reported_output: false,
             reported_luma: false,
             reported_metadata: None,
+            reported_attachments: None,
             session: None,
             format: None,
             param_sets: Vec::new(),
@@ -612,6 +618,24 @@ impl VideoToolboxDecoder {
         // Synchronous decode (no async flag requested): handler already ran.
         let decoded = rx.try_recv().unwrap_or(None);
         if let Some(decoded) = decoded {
+            let union = self
+                .reported_attachments
+                .map_or(decoded.attachments, |(m, c, h)| {
+                    (
+                        m || decoded.attachments.0,
+                        c || decoded.attachments.1,
+                        h || decoded.attachments.2,
+                    )
+                });
+            if self.reported_attachments != Some(union) {
+                self.reported_attachments = Some(union);
+                tracing::info!(
+                    mastering_display = union.0,
+                    content_light_level = union.1,
+                    hdr10_plus = union.2,
+                    "decoder attachments on decoded frames"
+                );
+            }
             if !self.reported_output {
                 self.reported_output = true;
                 self.report_output();
@@ -630,6 +654,9 @@ impl VideoToolboxDecoder {
 struct Decoded {
     frame: DecodedFrame,
     luma: crate::hdr_probe::LumaStats,
+    /// Which HDR metadata VideoToolbox attached to this decoded buffer:
+    /// (mastering display, content light level, HDR10+).
+    attachments: (bool, bool, bool),
     /// Pixels that reached display white. A large count means the host encoded
     /// its content above where `DisplayMapping` puts white, and detail is
     /// being lost at the top rather than shown.
@@ -691,7 +718,30 @@ impl VtSurface {
     }
 }
 
+/// Which HDR metadata the decoder attached to a decoded buffer.
+///
+/// The attachments are what a display path consumes, so this is the proof
+/// the bitstream's metadata survived the decoder — the wire probe alone
+/// cannot say whether VideoToolbox read what arrived or dropped it.
+fn hdr_attachments(image: &CVImageBuffer) -> (bool, bool, bool) {
+    #[allow(deprecated)]
+    let has = |key: &objc2_core_foundation::CFString| -> bool {
+        // SAFETY: live buffer, static key, null mode-out pointer is allowed.
+        unsafe { image.get_attachment(key, std::ptr::null_mut()) }.is_some()
+    };
+    let hdr10_plus_key = objc2_core_foundation::CFString::from_static_str("HDR10PlusPerFrameData");
+    // SAFETY: framework-provided static keys, valid for the process lifetime.
+    let (mastering_key, cll_key) = unsafe {
+        (
+            objc2_core_video::kCVImageBufferMasteringDisplayColorVolumeKey,
+            objc2_core_video::kCVImageBufferContentLightLevelInfoKey,
+        )
+    };
+    (has(mastering_key), has(cll_key), has(&hdr10_plus_key))
+}
+
 unsafe fn copy_frame(image: &CVImageBuffer, colour: Option<StreamColour>) -> Option<Decoded> {
+    let attachments = hdr_attachments(image);
     let pb: &CVPixelBuffer = image;
     let format = CVPixelBufferGetPixelFormatType(pb);
     if format == crate::hdr_probe::PIXEL_FORMAT_420_10_VIDEO
@@ -701,7 +751,7 @@ unsafe fn copy_frame(image: &CVImageBuffer, colour: Option<StreamColour>) -> Opt
         // refusing beats showing a wrong picture.
         // SAFETY: caller contract — a valid decoded buffer of the checked
         // biplanar layout.
-        return unsafe { wrap_planar(pb, colour?) };
+        return unsafe { wrap_planar(pb, colour?, attachments) };
     }
     if format == crate::hdr_probe::PIXEL_FORMAT_NV12_VIDEO
         || format == crate::hdr_probe::PIXEL_FORMAT_NV12_FULL
@@ -715,6 +765,7 @@ unsafe fn copy_frame(image: &CVImageBuffer, colour: Option<StreamColour>) -> Opt
         // SAFETY: `pb` is a live CF object; retaining is thread-safe.
         let retained = unsafe { CFRetained::retain(std::ptr::NonNull::from(pb)) };
         return Some(Decoded {
+            attachments,
             frame: DecodedFrame {
                 #[allow(clippy::cast_possible_truncation)]
                 width: width as u32,
@@ -742,6 +793,7 @@ unsafe fn copy_frame(image: &CVImageBuffer, colour: Option<StreamColour>) -> Opt
     // SAFETY: `pb` is a live CF object; retaining is thread-safe.
     let retained = unsafe { CFRetained::retain(std::ptr::NonNull::from(pb)) };
     Some(Decoded {
+        attachments,
         frame: DecodedFrame {
             #[allow(clippy::cast_possible_truncation)]
             width: width as u32,
@@ -763,7 +815,11 @@ unsafe fn copy_frame(image: &CVImageBuffer, colour: Option<StreamColour>) -> Opt
 ///
 /// # Safety
 /// `pb` must be a valid, decoded 10-bit biplanar CVPixelBuffer.
-unsafe fn wrap_planar(pb: &CVPixelBuffer, colour: StreamColour) -> Option<Decoded> {
+unsafe fn wrap_planar(
+    pb: &CVPixelBuffer,
+    colour: StreamColour,
+    attachments: (bool, bool, bool),
+) -> Option<Decoded> {
     // SAFETY: valid pixel buffer; lock for the probe's CPU read.
     let lock = unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
     if lock != 0 {
@@ -821,6 +877,7 @@ unsafe fn wrap_planar(pb: &CVPixelBuffer, colour: StreamColour) -> Option<Decode
         // SAFETY: `pb` is a live CF object; retaining is thread-safe.
         let retained = unsafe { CFRetained::retain(std::ptr::NonNull::from(pb)) };
         Some(Decoded {
+            attachments,
             frame: DecodedFrame {
                 #[allow(clippy::cast_possible_truncation)]
                 width: width as u32,
