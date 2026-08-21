@@ -109,7 +109,7 @@ pub struct VideoToolboxDecoder {
     /// Whether a frame carrying actual variation has been measured.
     reported_luma: bool,
     /// Whether the wire has been checked for HDR static metadata.
-    reported_metadata: bool,
+    reported_metadata: Option<crate::hdr_probe::StaticMetadata>,
     session: Option<CFRetained<VTDecompressionSession>>,
     format: Option<CFRetained<CMFormatDescription>>,
     /// Last seen parameter sets, in the order the format description wants
@@ -144,7 +144,7 @@ impl VideoToolboxDecoder {
             stream_colour: None,
             reported_output: false,
             reported_luma: false,
-            reported_metadata: false,
+            reported_metadata: None,
             session: None,
             format: None,
             param_sets: Vec::new(),
@@ -403,11 +403,9 @@ impl VideoDecoder for VideoToolboxDecoder {
         // sample is the temporal unit exactly as it arrived.
         if self.codec == Codec::Av1 {
             self.ensure_av1_session(access_unit)?;
-            if !self.reported_metadata {
-                let found =
-                    crate::hdr_probe::av1_static_metadata(&crate::av1::metadata_types(access_unit));
-                self.report_static_metadata(found);
-            }
+            let found =
+                crate::hdr_probe::av1_static_metadata(&crate::av1::metadata_types(access_unit));
+            self.report_static_metadata(found);
             return self.decode_sample(access_unit);
         }
 
@@ -426,10 +424,8 @@ impl VideoDecoder for VideoToolboxDecoder {
                 }
             }
         }
-        if !self.reported_metadata {
-            let found = crate::hdr_probe::hevc_static_metadata(&nals);
-            self.report_static_metadata(found);
-        }
+        let found = crate::hdr_probe::hevc_static_metadata(&nals);
+        self.report_static_metadata(found);
         let wanted = if self.codec == Codec::Hevc { 3 } else { 2 };
         let found: Vec<&[u8]> = sets.iter().skip(3 - wanted).flatten().copied().collect();
         if found.len() == wanted {
@@ -455,14 +451,35 @@ impl VideoToolboxDecoder {
     fn report_static_metadata(&mut self, found: crate::hdr_probe::StaticMetadata) {
         // Keep looking until a keyframe actually carries some, or until the
         // session ends having carried none — a P-frame saying nothing is not
-        // an answer.
+        // an answer. Re-reported whenever the metadata itself changes:
+        // scene-adaptive hosts start emitting (or revalue) mid-session, and a
+        // first-keyframe snapshot would call that "none" forever.
         if !found.any() && self.session.is_none() {
             return;
         }
-        self.reported_metadata = true;
+        // Accumulated across the session: static SEI rides keyframes and the
+        // dynamic SEI rides the frames between, so no single access unit
+        // shows the whole story.
+        let mut union = self.reported_metadata.unwrap_or_default();
+        union.mastering_display |= found.mastering_display;
+        union.content_light_level |= found.content_light_level;
+        union.hdr10_plus |= found.hdr10_plus;
+        union.max_mastering = found.max_mastering.or(union.max_mastering);
+        union.min_mastering = found.min_mastering.or(union.min_mastering);
+        union.max_cll = found.max_cll.or(union.max_cll);
+        union.max_fall = found.max_fall.or(union.max_fall);
+        if self.reported_metadata == Some(union) {
+            return;
+        }
+        self.reported_metadata = Some(union);
+        let found = union;
         tracing::info!(
             mastering_display = found.mastering_display,
             content_light_level = found.content_light_level,
+            hdr10_plus = found.hdr10_plus,
+            mastering_peak_nits = found.max_mastering_nits(),
+            max_cll_nits = found.max_cll,
+            max_fall_nits = found.max_fall,
             "HDR static metadata on the wire"
         );
     }

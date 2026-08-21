@@ -197,18 +197,70 @@ pub struct StaticMetadata {
     pub mastering_display: bool,
     /// MaxCLL / MaxFALL content light level.
     pub content_light_level: bool,
+    /// SMPTE ST 2094-40 (HDR10+) dynamic metadata rode this access unit —
+    /// per-scene tone-mapping guidance, not a static description.
+    pub hdr10_plus: bool,
+    /// Mastering display peak, in 0.0001 cd/m² as the SEI codes it.
+    pub max_mastering: Option<u32>,
+    /// Mastering display black level, same 0.0001 cd/m² units.
+    pub min_mastering: Option<u32>,
+    /// Brightest coded pixel anywhere in the content (MaxCLL), in nits.
+    pub max_cll: Option<u16>,
+    /// Brightest frame-average light level (MaxFALL), in nits.
+    pub max_fall: Option<u16>,
 }
 
 impl StaticMetadata {
     #[must_use]
     pub fn any(self) -> bool {
-        self.mastering_display || self.content_light_level
+        self.mastering_display || self.content_light_level || self.hdr10_plus
     }
 
-    fn note_payload_type(&mut self, payload_type: u32) {
+    /// Peak mastering luminance in nits, when the SEI carried one.
+    #[must_use]
+    pub fn max_mastering_nits(self) -> Option<u32> {
+        self.max_mastering.map(|v| v / 10_000)
+    }
+
+    fn note_payload(&mut self, payload_type: u32, payload: &[u8]) {
         match payload_type {
-            MASTERING_DISPLAY_COLOUR_VOLUME => self.mastering_display = true,
-            CONTENT_LIGHT_LEVEL_INFO => self.content_light_level = true,
+            // ST 2086: three primaries and a white point (16 bytes), then
+            // max and min mastering luminance as big-endian u32s.
+            MASTERING_DISPLAY_COLOUR_VOLUME => {
+                self.mastering_display = true;
+                if payload.len() >= 24 {
+                    self.max_mastering = Some(u32::from_be_bytes([
+                        payload[16],
+                        payload[17],
+                        payload[18],
+                        payload[19],
+                    ]));
+                    self.min_mastering = Some(u32::from_be_bytes([
+                        payload[20],
+                        payload[21],
+                        payload[22],
+                        payload[23],
+                    ]));
+                }
+            }
+            CONTENT_LIGHT_LEVEL_INFO => {
+                self.content_light_level = true;
+                if payload.len() >= 4 {
+                    self.max_cll = Some(u16::from_be_bytes([payload[0], payload[1]]));
+                    self.max_fall = Some(u16::from_be_bytes([payload[2], payload[3]]));
+                }
+            }
+            // Registered ITU-T T.35 user data. Only the SMPTE-registered
+            // ST 2094-40 stream counts as HDR10+; T.35 also carries closed
+            // captions and other vendors' data.
+            USER_DATA_REGISTERED_ITU_T_T35 => {
+                if payload.len() >= 3
+                    && payload[0] == T35_COUNTRY_US
+                    && u16::from_be_bytes([payload[1], payload[2]]) == T35_PROVIDER_SMPTE
+                {
+                    self.hdr10_plus = true;
+                }
+            }
             _ => {}
         }
     }
@@ -217,10 +269,15 @@ impl StaticMetadata {
 /// SEI payload types (H.265 Table D.1), shared with H.264.
 const MASTERING_DISPLAY_COLOUR_VOLUME: u32 = 137;
 const CONTENT_LIGHT_LEVEL_INFO: u32 = 144;
+const USER_DATA_REGISTERED_ITU_T_T35: u32 = 4;
+/// T.35 addressing for ST 2094-40: United States, SMPTE.
+const T35_COUNTRY_US: u8 = 0xB5;
+const T35_PROVIDER_SMPTE: u16 = 0x003C;
 
 /// AV1 metadata OBU types (spec 6.7.1).
 const AV1_METADATA_HDR_CLL: u64 = 1;
 const AV1_METADATA_HDR_MDCV: u64 = 2;
+const AV1_METADATA_ITUT_T35: u64 = 4;
 
 /// Which HDR static-metadata messages an HEVC access unit carries.
 ///
@@ -250,6 +307,9 @@ pub fn av1_static_metadata(metadata_types: &[u64]) -> StaticMetadata {
         match *kind {
             AV1_METADATA_HDR_MDCV => found.mastering_display = true,
             AV1_METADATA_HDR_CLL => found.content_light_level = true,
+            // Only the type is visible here, so any T.35 reads as dynamic
+            // metadata; on AV1 nothing else commonly rides it in a stream.
+            AV1_METADATA_ITUT_T35 => found.hdr10_plus = true,
             _ => {}
         }
     }
@@ -280,7 +340,8 @@ fn scan_sei_payloads(data: &[u8], found: &mut StaticMetadata) {
         let Some(payload_size) = read_extended(&mut at) else {
             return;
         };
-        found.note_payload_type(payload_type);
+        let end = (at + payload_size as usize).min(data.len());
+        found.note_payload(payload_type, &data[at..end]);
         at += payload_size as usize;
         // A trailing 0x80 marks the end of the list, and anything past the
         // buffer means the unit was cut short.
@@ -667,12 +728,14 @@ mod tests {
         assert!(!hevc_static_metadata(&[&nal[..]]).any());
     }
 
-    /// AV1 puts the same two facts in metadata OBUs rather than SEI.
+    /// AV1 puts the same facts in metadata OBUs rather than SEI: MDCV,
+    /// CLL, and T.35 as the dynamic-metadata carrier.
     #[test]
-    fn av1_metadata_types_map_to_the_same_two_facts() {
+    fn av1_metadata_types_map_to_the_same_facts() {
         assert!(av1_static_metadata(&[2]).mastering_display);
         assert!(av1_static_metadata(&[1]).content_light_level);
-        assert!(!av1_static_metadata(&[3, 4]).any());
+        assert!(av1_static_metadata(&[4]).hdr10_plus);
+        assert!(!av1_static_metadata(&[3, 5]).any());
         assert!(!av1_static_metadata(&[]).any());
     }
 
