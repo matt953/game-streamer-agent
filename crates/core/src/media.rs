@@ -10,6 +10,19 @@ pub enum Codec {
     Av1,
 }
 
+impl Codec {
+    /// The default preference order every client advertises, best first.
+    ///
+    /// One list, owned here, so the dev harness and the apps negotiate the
+    /// same codec against the same host. HEVC leads: it saves bitrate over
+    /// H.264 and is the most widely accelerated; AV1 saves more but is
+    /// decoded by fewer devices — and, where it is, often with more latency.
+    #[must_use]
+    pub fn preference_order() -> [Self; 3] {
+        [Self::Hevc, Self::Av1, Self::H264]
+    }
+}
+
 /// H.264 profile, ordered by capability so the session negotiates with a `min`
 /// (encoder ceiling vs client decode cap, spec 03).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

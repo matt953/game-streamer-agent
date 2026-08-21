@@ -35,7 +35,14 @@ pub fn decode_codecs(force_sw: bool) -> Vec<Codec> {
 pub fn offered_codecs(names: &[String], force_sw: bool) -> Vec<Codec> {
     let available = decode_codecs(force_sw);
     if names.is_empty() {
-        return available;
+        // The core's one preference order, not the platform's richest-first
+        // capability list: the harness must negotiate the same codec the
+        // apps would against the same host, or their sessions are not
+        // comparable.
+        return Codec::preference_order()
+            .into_iter()
+            .filter(|codec| available.contains(codec))
+            .collect();
     }
     let mut offered: Vec<Codec> = names
         .iter()
