@@ -86,6 +86,9 @@ Reported as **p50 / p95 / p99** per stage, in ms, on the stream overlays
 | **repeats / unshown** | refreshes that showed nothing new, and decoded frames never shown — the two halves of a rate mismatch. |
 | **grid (pinned / adapting)** | whether present intervals sit on a fixed refresh grid (residual → 0) or scatter off it (→ 0.25): the only figure that can tell a VRR display adapting from one holding frames for whole refreshes. Only meaningful for content whose rate doesn't divide the refresh rate. |
 | **hdr_out** | whether PQ is actually reaching the panel, as opposed to being requested and tone-mapped away. |
+| **hdr: mastering / MaxCLL (wire)** | the stream's HDR static metadata, three-valued on purpose: `—` (absent), `zeroed` (present but the host says *unknown*), `valued` (real numbers). Collapsing "zeroed" into either neighbour misreports the stream. |
+| **hdr: HDR10+ (wire)** | whether ST 2094-40 per-frame dynamic metadata rode the stream. |
+| **hdr: delivered / re-attached / forwards** | what actually reached decoded frames on this device: Android's decoder forwards the payloads itself (read from its output format, not assumed); Apple's drops them (measured), so the client re-attaches — these rows are the proof. Zero-valued statics are deliberately not re-attached. |
 
 ## Benchmarks
 
