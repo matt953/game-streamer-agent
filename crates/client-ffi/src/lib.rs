@@ -13,7 +13,10 @@ mod moonlight;
 // The C entry points are exported by the linker regardless, but Rust callers
 // (the app's `shared` crate re-exports them so they survive stripping) need a
 // path to them.
-pub use host::{GSA_BACKEND_GSA, GSA_BACKEND_MOONLIGHT, gsa_catalog, gsa_host_session_start};
+pub use host::{
+    GSA_BACKEND_GSA, GSA_BACKEND_MOONLIGHT, GSA_LIFECYCLE_LEAVE_RUNNING, GSA_LIFECYCLE_QUIT_REMOTE,
+    gsa_catalog, gsa_host_lifecycle, gsa_host_quit, gsa_host_session_start,
+};
 pub use moonlight::{gsa_moonlight_identity, gsa_moonlight_pair};
 
 use std::ffi::{CStr, c_char, c_void};
