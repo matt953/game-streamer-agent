@@ -391,6 +391,11 @@ pub struct GsaSession {
     /// about once a second by the session loop. Behind a mutex because it is
     /// a struct, read at UI rate, written at 1 Hz — contention is nil.
     latency: std::sync::Arc<std::sync::Mutex<gsa_client_core::LatencySummary>>,
+    /// Live flow counters for [`gsa_session_flow`], same cadence.
+    flow: std::sync::Arc<std::sync::Mutex<GsaFlowStats>>,
+    /// Platform-measured decode times (µs), drained into the latency chain by
+    /// the session loop. The platform decodes where this crate cannot see.
+    decode_feed: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
     /// Live pacing figures for [`gsa_session_pacing`]: the spread of transit
     /// drift the link delivered, and the spread after pacing. Shared rather
     /// than pushed, because they change every frame and an overlay wants
@@ -420,6 +425,10 @@ pub(crate) enum SessionReady {
         pacing: std::sync::Arc<(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU32)>,
         /// Per-stage latency percentiles, republished by the session loop.
         latency: std::sync::Arc<std::sync::Mutex<gsa_client_core::LatencySummary>>,
+        /// Flow counters, same cadence.
+        flow: std::sync::Arc<std::sync::Mutex<GsaFlowStats>>,
+        /// Platform-measured decode times, drained by the session loop.
+        decode_feed: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
         codec: u32,
         pad_caps: u32,
     },
@@ -509,6 +518,8 @@ pub unsafe extern "C" fn gsa_session_start(
             input,
             knobs,
             latency,
+            flow,
+            decode_feed,
             presented,
             decode_error,
             dejitter,
@@ -519,6 +530,8 @@ pub unsafe extern "C" fn gsa_session_start(
             stop,
             thread: Some(thread),
             latency,
+            flow,
+            decode_feed,
             input,
             knobs,
             presented,
@@ -755,6 +768,60 @@ pub unsafe extern "C" fn gsa_session_latency(
             total: stage_out(summary.total),
         };
     }
+}
+
+/// Session flow counters that behave like evidence: each one names a code
+/// path that ran, so a field log can prove behaviour rather than infer it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GsaFlowStats {
+    /// Frames decoded and discarded unseen under the drop policy.
+    pub superseded: u64,
+    /// Frames released immediately because their capture gap was the host's
+    /// own idle time — proof the content-pause exclusion fired.
+    pub content_pauses: u64,
+}
+
+/// Report one platform-decoded frame's decode time (µs).
+///
+/// Feeds the latency chain's decode stage on paths where the platform owns
+/// the decoder. Cheap and thread-safe; call per decoded frame.
+///
+/// # Safety
+/// `session` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_note_decode(session: *const GsaSession, decode_us: u32) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract — a live session handle.
+    let feed = &unsafe { &*session }.decode_feed;
+    if let Ok(mut feed) = feed.lock() {
+        // Bounded: an embedder that reports faster than the loop drains must
+        // not grow this without limit.
+        if feed.len() < 1024 {
+            feed.push(decode_us);
+        }
+    }
+}
+
+/// Read the session's flow counters.
+///
+/// # Safety
+/// `session` must be a live handle; `out` must point to a writable
+/// [`GsaFlowStats`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_flow(session: *const GsaSession, out: *mut GsaFlowStats) {
+    if session.is_null() || out.is_null() {
+        return;
+    }
+    // SAFETY: caller contract — a live session handle.
+    let flow = *unsafe { &*session }
+        .flow
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // SAFETY: caller contract — `out` is writable.
+    unsafe { *out = flow };
 }
 
 /// The protocol's bitrate ceiling (bps) — the top of every bitrate control.
@@ -1281,6 +1348,10 @@ async fn session_loop(
             std::sync::atomic::AtomicU32::new(0),
         )),
         latency: latency.clone(),
+        // The gsa Client does not expose flow counters yet; zeros mean the
+        // paths never provably ran, which is the honest reading.
+        flow: std::sync::Arc::new(std::sync::Mutex::new(GsaFlowStats::default())),
+        decode_feed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         codec,
         // The agent's own pad support, straight from the backend seam rather
         // than restated here, so the two cannot drift.

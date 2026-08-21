@@ -215,6 +215,10 @@ pub(crate) fn run_session(
             gsa_client_core::LatencySummary::default(),
         ));
         let latency_publish = latency.clone();
+        let flow = std::sync::Arc::new(std::sync::Mutex::new(crate::GsaFlowStats::default()));
+        let flow_publish = flow.clone();
+        let decode_feed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let decode_drain = decode_feed.clone();
         let mut last_latency_publish = std::time::Instant::now();
 
         let _ = ready_tx.send(crate::SessionReady::Streaming {
@@ -227,6 +231,8 @@ pub(crate) fn run_session(
             dejitter: core.dejitter_flag(),
             pacing: pacing.clone(),
             latency: latency.clone(),
+            flow: flow.clone(),
+            decode_feed,
             codec: crate::codec_to_flag(stream.codec),
             pad_caps: u32::from(stream.pad_caps().bits()),
         });
@@ -271,10 +277,23 @@ pub(crate) fn run_session(
                         use std::sync::atomic::Ordering::Relaxed;
                         publish.0.store(core.jitter_us(), Relaxed);
                         publish.1.store(core.released_jitter_us(), Relaxed);
+                        // Platform decode samples, measured where the decoder
+                        // actually lives.
+                        if let Ok(mut samples) = decode_drain.lock() {
+                            for us in samples.drain(..) {
+                                core.on_app_decode(us);
+                            }
+                        }
                         if last_latency_publish.elapsed() >= std::time::Duration::from_secs(1) {
                             last_latency_publish = std::time::Instant::now();
                             if let Ok(mut slot) = latency_publish.lock() {
                                 *slot = core.latency_chain();
+                            }
+                            if let Ok(mut slot) = flow_publish.lock() {
+                                *slot = crate::GsaFlowStats {
+                                    superseded: core.superseded(),
+                                    content_pauses: core.content_pauses(),
+                                };
                             }
                         }
                         if let Some(cb) = cbs.on_video {

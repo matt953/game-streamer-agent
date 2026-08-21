@@ -425,6 +425,14 @@ impl StreamSession {
         self.latency.on_rtt(rtt_us);
     }
 
+    /// The embedder measured its platform decoder; add it to the chain.
+    ///
+    /// Decode happens outside this crate on the app paths, so the figure has
+    /// to arrive from the platform or stay "—" forever.
+    pub fn on_app_decode(&mut self, decode_us: u32) {
+        self.latency.on_decode(decode_us);
+    }
+
     /// A presenter measured how long a decoded frame waited to be shown.
     pub fn on_present_wait(&mut self, wait_us: u32) {
         self.latency.on_present_wait(wait_us);
