@@ -207,6 +207,92 @@ pub unsafe extern "C" fn gsa_catalog(
     })
 }
 
+/// Lifecycle capability: ending a stream can leave the host's app running.
+pub const GSA_LIFECYCLE_LEAVE_RUNNING: u32 = 1;
+/// Lifecycle capability: the client can quit the host's running app.
+pub const GSA_LIFECYCLE_QUIT_REMOTE: u32 = 2;
+
+/// Which session-lifetime verbs this host's backend really has, as
+/// `GSA_LIFECYCLE_*` flags. A UI draws only the verbs returned: offering
+/// "disconnect" to a backend whose host times the session out anyway, or
+/// "quit" where nothing can be quit, promises what the backend cannot do.
+///
+/// Read from the blob alone — no network. 0 for an unreadable blob or a
+/// backend whose one exit carries no choice.
+///
+/// # Safety
+/// `host` must be a valid NUL-terminated string for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_host_lifecycle(host: *const c_char) -> u32 {
+    // SAFETY: caller contract.
+    let Some(host) = (unsafe { read_str(host) }) else {
+        return 0;
+    };
+    let Some(host) = HostRef::decode(host) else {
+        return 0;
+    };
+    match host.backend {
+        GSA_BACKEND_MOONLIGHT => GSA_LIFECYCLE_LEAVE_RUNNING | GSA_LIFECYCLE_QUIT_REMOTE,
+        // The gsa agent streams a desktop that exists whether or not anyone
+        // is connected: every stop leaves it "running", nothing can be quit.
+        GSA_BACKEND_GSA => GSA_LIFECYCLE_LEAVE_RUNNING,
+        _ => 0,
+    }
+}
+
+/// Quit whatever app the host is running, without streaming it.
+///
+/// The catalog half of the lifecycle verbs: a running entry can be resumed by
+/// starting it, or ended here. Returns 0 on success, `-1` bad arguments, `-2`
+/// runtime, `-3` the host refused. Succeeds trivially when nothing runs.
+///
+/// # Safety
+/// `host` must be a valid NUL-terminated string for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_host_quit(host: *const c_char) -> i32 {
+    // SAFETY: caller contract.
+    let Some(host) = (unsafe { read_str(host) }) else {
+        return -1;
+    };
+    let Some(host) = HostRef::decode(host) else {
+        return -1;
+    };
+    if host.backend != GSA_BACKEND_MOONLIGHT {
+        return -1;
+    }
+    let (Some(key), Some(cert), Some(client_id)) = (
+        host.field("key"),
+        host.field("cert"),
+        host.field("client_id"),
+    ) else {
+        return -1;
+    };
+    let Ok(identity) = gsa_backend_moonlight::ClientIdentity::from_key_pem(key) else {
+        return -1;
+    };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return -2;
+    };
+    rt.block_on(async move {
+        let Ok(info) = gsa_backend_moonlight::probe(host.addr, client_id).await else {
+            return -3;
+        };
+        let session = gsa_backend_moonlight::PairedSession::new(
+            std::net::SocketAddr::new(host.addr.ip(), info.https_port),
+            cert.to_owned(),
+            identity,
+            client_id.to_owned(),
+        );
+        if session.cancel().await.is_err() {
+            return -3;
+        }
+        0
+    })
+}
+
 /// Start streaming from an enrolled host.
 ///
 /// The one entry point for every backend: `host` is the blob enrolment
@@ -294,13 +380,15 @@ pub unsafe extern "C" fn gsa_host_session_start(
     };
 
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let stop_mode = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let thread_stop = stop.clone();
+    let thread_stop_mode = stop_mode.clone();
     let cbs = crate::SendCallbacks(callbacks);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<crate::SessionReady>();
     let thread = std::thread::spawn(move || {
         let cbs = cbs;
         crate::boost_thread_qos();
-        crate::moonlight::run_session(opts, cbs, thread_stop, ready_tx);
+        crate::moonlight::run_session(opts, cbs, thread_stop, thread_stop_mode, ready_tx);
     });
 
     match ready_rx.recv() {
@@ -319,6 +407,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
             pad_caps,
         }) => Box::into_raw(Box::new(crate::GsaSession {
             stop,
+            stop_mode,
             thread: Some(thread),
             input,
             knobs,

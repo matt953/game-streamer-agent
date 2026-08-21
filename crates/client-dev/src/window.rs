@@ -267,6 +267,7 @@ pub fn run_moonlight(
     float_window: bool,
     chase_refresh: bool,
     fullscreen: bool,
+    disconnect_on_exit: bool,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let mut mode = parse_mode(mode, host_mode_change)?;
@@ -315,6 +316,7 @@ pub fn run_moonlight(
                     pacing,
                     input_script,
                     dejitter,
+                    disconnect_on_exit,
                 },
                 &proxy,
             )
@@ -603,6 +605,9 @@ struct MoonlightRun {
     input_script: Option<Vec<crate::script::Step>>,
     /// Whether to smooth the imposed jitter — the control half of the A/B.
     dejitter: bool,
+    /// Leave the host's app running on exit instead of quitting it; the next
+    /// run of the same app rejoins it mid-session.
+    disconnect_on_exit: bool,
 }
 
 fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLoopProxy<AppEvent>) {
@@ -621,6 +626,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
         pacing,
         input_script,
         dejitter,
+        disconnect_on_exit,
     } = run;
     let outcome = (|| -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1006,11 +1012,17 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                     break Ok(()); // window closed
                 }
             };
-            // Always tear the host session down, however this ended: leaving
-            // one behind is what makes the next attempt fail with no picture.
             drop(core);
             drop(stream);
-            let _ = session.cancel().await;
+            // Quit ends the host's app; disconnect leaves it running so the
+            // next run of the same app rejoins it mid-session. The launch
+            // path cancels anything else the host still holds, so nothing
+            // left behind can block a later start.
+            if disconnect_on_exit {
+                tracing::info!("disconnected; the host keeps the app running");
+            } else {
+                let _ = session.cancel().await;
+            }
             result
         })
     })();

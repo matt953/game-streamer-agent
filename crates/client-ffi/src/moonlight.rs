@@ -159,6 +159,7 @@ pub(crate) fn run_session(
     opts: MoonlightOpts,
     cbs: crate::SendCallbacks,
     stop: std::sync::Arc<tokio::sync::Notify>,
+    stop_mode: std::sync::Arc<std::sync::atomic::AtomicU32>,
     ready_tx: std::sync::mpsc::Sender<crate::SessionReady>,
 ) {
     let cbs = cbs.0;
@@ -342,11 +343,15 @@ pub(crate) fn run_session(
             }
         }
 
-        // Tear the host session down explicitly: a session left behind stops
-        // the next one from starting.
         drop(core);
         drop(stream);
-        let _ = session.cancel().await;
+        // Quit ends the host's app explicitly; disconnect leaves it running,
+        // and the next start of the same app rejoins it mid-game. Anything
+        // else the host still runs is handled at the next launch, which
+        // cancels it before starting ours.
+        if stop_mode.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            let _ = session.cancel().await;
+        }
         let _ = audio_thread.join();
     });
 }

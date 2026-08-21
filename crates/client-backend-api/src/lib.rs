@@ -247,6 +247,38 @@ pub struct SessionRequest {
     pub abr: bool,
 }
 
+/// How a session should end.
+///
+/// The counterpart of [`SessionOrigin`]: a protocol that can rejoin a running
+/// app can also walk away from one. Which verbs are real on a given backend is
+/// declared by [`LifecycleCaps`]; where the distinction does not exist, both
+/// spell the backend's one exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopMode {
+    /// Stop the streams and leave the host running what it runs; a later
+    /// session picks it back up as [`SessionOrigin::Rejoined`].
+    Disconnect,
+    /// Take the app down with the stream. The default, because it is the
+    /// only exit that leaves nothing behind on hosts shared with other
+    /// clients.
+    #[default]
+    Quit,
+}
+
+/// Which session-lifetime verbs a backend's protocol actually has.
+///
+/// Read by the UI to draw only real options: offering "disconnect" where the
+/// host will time the session out anyway (a cloud instance), or "quit" where
+/// nothing can be quit (a desktop), promises what the backend cannot do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleCaps {
+    /// Ending the stream can leave the host's app running for a rejoin.
+    pub can_leave_running: bool,
+    /// The client can terminate the host's running app — with the stream, or
+    /// from the catalog without streaming at all.
+    pub can_quit_remote: bool,
+}
+
 /// How a session came to be.
 ///
 /// Every protocol distinguishes starting something new from rejoining what the

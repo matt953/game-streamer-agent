@@ -404,6 +404,11 @@ pub struct GsaSession {
     /// than pushed, because they change every frame and an overlay wants
     /// whatever is current, not every value that ever was.
     pacing: std::sync::Arc<(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU32)>,
+    /// How the session loop should leave the host when it ends: 0 quits the
+    /// host's app with the stream, 1 disconnects and leaves it running for a
+    /// rejoin. Written by [`gsa_session_disconnect`] before the stop fires;
+    /// backends without the distinction ignore it.
+    stop_mode: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// The negotiated codec (a `GSA_CODEC_*` flag), for `gsa_session_codec`.
     codec: u32,
     /// What of a controller this session carries (`GSA_PAD_*` flags), for
@@ -534,6 +539,9 @@ pub unsafe extern "C" fn gsa_session_start(
             pad_caps,
         }) => Box::into_raw(Box::new(GsaSession {
             stop,
+            // The agent path has no host app to quit; the mode is carried for
+            // interface symmetry and ignored by its loop.
+            stop_mode: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             thread: Some(thread),
             latency,
             flow,
@@ -642,6 +650,28 @@ pub unsafe extern "C" fn gsa_session_stop(session: *mut GsaSession) {
     if let Some(t) = session.thread.take() {
         let _ = t.join();
     }
+}
+
+/// Stop a session like [`gsa_session_stop`], but leave the host running what
+/// it runs: the app stays up, and starting it again rejoins it mid-game.
+///
+/// Only meaningful where the host's lifecycle capabilities include leaving a
+/// session running ([`gsa_host_lifecycle`]); elsewhere it is exactly
+/// `gsa_session_stop`. NULL is a no-op.
+///
+/// # Safety
+/// `session` must be a handle from a session-start call, not already stopped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_disconnect(session: *mut GsaSession) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract — the handle is live until the Box below.
+    unsafe { &*session }
+        .stop_mode
+        .store(1, std::sync::atomic::Ordering::Release);
+    // SAFETY: caller contract guarantees a live, once-only handle.
+    unsafe { gsa_session_stop(session) };
 }
 
 /// Set the encode target bitrate (bps). With ABR on this is the ceiling ABR

@@ -186,6 +186,11 @@ struct Cli {
     /// support for one codec can be exercised without changing hardware.
     #[arg(long, value_delimiter = ',', value_parser = ["av1", "hevc", "h264"])]
     codecs: Vec<String>,
+    /// What ending the session does to the host: `quit` takes the app down
+    /// with the stream; `disconnect` leaves it running, and the next run of
+    /// the same app rejoins it mid-session.
+    #[arg(long, default_value = "quit", value_parser = ["quit", "disconnect"])]
+    moonlight_exit: String,
 }
 
 fn main() -> Result<()> {
@@ -232,6 +237,7 @@ fn main() -> Result<()> {
             !cli.no_float,
             cli.chase_refresh,
             cli.fullscreen,
+            cli.moonlight_exit == "disconnect",
         );
     }
 
