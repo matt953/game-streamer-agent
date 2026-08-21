@@ -58,7 +58,7 @@ Reported as **p50 / p95 / p99** per stage, in ms, on the stream overlays
 
 | figure | what it measures |
 |---|---|
-| **jitter in → out** | spread of frame transit drift as the link delivered it, and the same spread after pacing (p90 − p10 over a rolling window). A pair on purpose: the paced figure alone can't tell good pacing from a link that was never troubled. `in` is only measured when the pacing path runs. |
+| **jitter in → out** | spread of frame transit drift as the link delivered it, and the same spread after pacing (p90 − p10 over a rolling window). A pair on purpose: the paced figure alone can't tell good pacing from a link that was never troubled. Both sides use the same window length and the same population of frames (pacing path only, content pauses excluded) — measured asymmetrically, a drifting baseline reads as spread and indicts the smoother for latency it never touched. |
 | **mean_hold** | average pacing delay across held frames — the latency half of the smoothness trade. |
 | **dejitter_duty** | frames paced vs skipped-for-backlog: whether the smoother actually ran. |
 | **latency_growth** | change in transit drift since the session's first frame, in real ms. The one figure a *steady* backlog shows up in: a queue that fills once and never drains has no spread at all. Small and stable (either sign) is healthy; large and climbing is a filling queue. |

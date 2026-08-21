@@ -75,6 +75,9 @@ pub struct StreamSession {
     /// that shows nothing however well it works. This is the same quantity
     /// taken after the hold, and it is the one that should shrink.
     released_jitter_us: u32,
+    /// Whether the frame being released fed the arrival window — pauses and
+    /// non-pacing modes feed neither side, keeping in/out one population.
+    release_in_signal: bool,
     /// Drift at the first release, and how far it has moved since — real
     /// milliseconds of latency gained, the one figure a steady backlog shows
     /// up in.
@@ -182,6 +185,7 @@ impl StreamSession {
             jitter_win: std::collections::VecDeque::new(),
             last_jitter_us: 0,
             released_jitter_us: 0,
+            release_in_signal: false,
             first_release_drift_us: None,
             latency_growth_us: 0,
             released_win: std::collections::VecDeque::new(),
@@ -279,7 +283,11 @@ impl StreamSession {
 
     /// Fold a released frame into the output measure.
     fn note_release(&mut self, capture_ts_us: u32) {
-        const WIN: usize = 64;
+        // Same length as the arrival window: in and out are a comparison, and
+        // a longer window over a drifting baseline (host encode load trending)
+        // reads the trend as spread, indicting the smoother for latency it
+        // never touched.
+        const WIN: usize = 32;
         let drift = transit_drift_us(self.clock.now_us(), capture_ts_us);
         // How much further behind the stream we are than when it started.
         //
@@ -296,6 +304,12 @@ impl StreamSession {
             Some(first) => {
                 self.latency_growth_us = i64::from(drift) - i64::from(first);
             }
+        }
+        // Only frames the arrival window also saw: a pause or a non-pacing
+        // mode feeds neither side, so the pair always describes the same
+        // population of frames.
+        if !self.release_in_signal {
+            return;
         }
         if self.released_win.len() == WIN {
             self.released_win.pop_front();
@@ -687,6 +701,7 @@ impl StreamSession {
         // is two frames at 60 fps and eight at 240 — the same number meaning a
         // different policy on every display.
         let dejitter_max_us = self.pacing.hold_cap_us(self.frame_interval_us);
+        self.release_in_signal = false;
         if !self.pacing.paces() {
             return;
         }
@@ -722,6 +737,7 @@ impl StreamSession {
             self.jitter_win.pop_front();
         }
         self.jitter_win.push_back(drift);
+        self.release_in_signal = true;
         if self.jitter_win.len() < WIN / 2 {
             return;
         }
