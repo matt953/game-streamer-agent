@@ -33,6 +33,9 @@ enum AppEvent {
         std::sync::Arc<dyn gsa_client_core::InputSink>,
         Option<std::sync::Arc<dyn gsa_client_core::SessionKnobs>>,
         u32,
+        /// Where the presenter reports ready→shown waits; the session loop
+        /// drains them into the shared latency chain.
+        Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
     ),
     Frame(Box<DecodedFrame>),
     /// Rolling received video goodput (Mb/s), for the title HUD.
@@ -674,10 +677,16 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
             // Input goes over the same control channel; the host exposes no
             // live quality knobs, so none are offered rather than shown and
             // silently ignored.
+            // Present waits measured by the presenter, drained into the
+            // shared chain here — the sensor lives at the display, the
+            // arithmetic in core, same as the apps.
+            let present_feed: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let _ = proxy.send_event(AppEvent::Ready(
                 stream.input.clone(),
                 None,
                 bitrate_mbps.saturating_mul(1_000_000),
+                Some(present_feed.clone()),
             ));
 
             // Drive the session from a script when one was given, and save a
@@ -923,17 +932,23 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                                 )
                             };
                             format!(
-                                "rtt={} host={} decode={} hold={} total={}",
+                                "rtt={} host={} decode={} hold={} total={}{}",
                                 stage(chain.rtt),
                                 stage(chain.host),
                                 stage(chain.decode),
                                 stage(chain.hold),
+                                if chain.total_is_lower_bound { ">=" } else { "" },
                                 stage(chain.total)
                             )
                         },
                         "moonlight stream stats"
                     );
 
+                    if let Ok(mut samples) = present_feed.lock() {
+                        for us in samples.drain(..) {
+                            core.on_present_wait(us);
+                        }
+                    }
                     // The same figures, for eyes: the presenter composites
                     // these over the stream, appending its own half.
                     let chain = core.latency_chain();
@@ -1049,6 +1064,9 @@ fn network_loop(
                     sender.clone(),
                     Some(sender),
                     params.bitrate_bps,
+                    // The gsa chain measures its total outright; the present
+                    // stage is not composed into it.
+                    None,
                 ));
             }
 
@@ -1164,6 +1182,8 @@ struct App {
     overlay_stream_lines: Vec<String>,
     /// The last rumble the host asked for, for the pad line.
     last_rumble: Option<(u16, u16)>,
+    /// Where measured present waits go, when a session wants them.
+    present_feed: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
     /// Redraws that reached no display, because the window is hidden.
     occluded: u64,
     /// The trade in force, which decides whether an unshown frame may be
@@ -1592,10 +1612,11 @@ impl ApplicationHandler<AppEvent> for App {
                 tracing::info!(rate_hz, "host asked for motion");
                 self.motion_hz = rate_hz;
             }
-            AppEvent::Ready(input, knobs, bitrate) => {
+            AppEvent::Ready(input, knobs, bitrate, present_feed) => {
                 self.input = Some(input);
                 self.knobs = knobs;
                 self.bitrate_bps = bitrate;
+                self.present_feed = present_feed;
                 self.update_title();
             }
             AppEvent::Frame(frame) => {
@@ -1743,6 +1764,13 @@ impl ApplicationHandler<AppEvent> for App {
                                     .latest_ready_at
                                     .map_or_else(Default::default, |ready| now - ready);
                                 self.presentation.on_present(waited, now);
+                                if let Some(feed) = &self.present_feed
+                                    && let Ok(mut feed) = feed.lock()
+                                    && feed.len() < 1024
+                                {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    feed.push(waited.as_micros().min(u128::from(u32::MAX)) as u32);
+                                }
                                 self.latest_shown = true;
                             }
                         }

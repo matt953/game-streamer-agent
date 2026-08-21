@@ -219,6 +219,8 @@ pub(crate) fn run_session(
         let flow_publish = flow.clone();
         let decode_feed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let decode_drain = decode_feed.clone();
+        let present_feed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let present_drain = present_feed.clone();
         let mut last_latency_publish = std::time::Instant::now();
 
         let _ = ready_tx.send(crate::SessionReady::Streaming {
@@ -233,6 +235,7 @@ pub(crate) fn run_session(
             latency: latency.clone(),
             flow: flow.clone(),
             decode_feed,
+            present_feed,
             codec: crate::codec_to_flag(stream.codec),
             pad_caps: u32::from(stream.pad_caps().bits()),
         });
@@ -282,6 +285,11 @@ pub(crate) fn run_session(
                         if let Ok(mut samples) = decode_drain.lock() {
                             for us in samples.drain(..) {
                                 core.on_app_decode(us);
+                            }
+                        }
+                        if let Ok(mut samples) = present_drain.lock() {
+                            for us in samples.drain(..) {
+                                core.on_present_wait(us);
                             }
                         }
                         if last_latency_publish.elapsed() >= std::time::Duration::from_secs(1) {

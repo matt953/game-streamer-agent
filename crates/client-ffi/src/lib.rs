@@ -396,6 +396,9 @@ pub struct GsaSession {
     /// Platform-measured decode times (µs), drained into the latency chain by
     /// the session loop. The platform decodes where this crate cannot see.
     decode_feed: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    /// Platform-measured ready→shown waits (µs), same arrangement — only the
+    /// code touching the display can know which refresh a frame landed on.
+    present_feed: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
     /// Live pacing figures for [`gsa_session_pacing`]: the spread of transit
     /// drift the link delivered, and the spread after pacing. Shared rather
     /// than pushed, because they change every frame and an overlay wants
@@ -429,6 +432,8 @@ pub(crate) enum SessionReady {
         flow: std::sync::Arc<std::sync::Mutex<GsaFlowStats>>,
         /// Platform-measured decode times, drained by the session loop.
         decode_feed: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+        /// Platform-measured present waits, drained by the session loop.
+        present_feed: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
         codec: u32,
         pad_caps: u32,
     },
@@ -520,6 +525,7 @@ pub unsafe extern "C" fn gsa_session_start(
             latency,
             flow,
             decode_feed,
+            present_feed,
             presented,
             decode_error,
             dejitter,
@@ -532,6 +538,7 @@ pub unsafe extern "C" fn gsa_session_start(
             latency,
             flow,
             decode_feed,
+            present_feed,
             input,
             knobs,
             presented,
@@ -728,6 +735,10 @@ pub struct GsaLatencyChain {
     pub hold: GsaLatencyStage,
     pub present: GsaLatencyStage,
     pub total: GsaLatencyStage,
+    /// Non-zero when `total` was composed while decode or present was
+    /// unmeasured: the real figure is *at least* `total`. Display it as a
+    /// lower bound ("≥"), never as the total it is not.
+    pub total_is_lower_bound: u32,
 }
 
 fn stage_out(stage: Option<gsa_client_core::StagePercentiles>) -> GsaLatencyStage {
@@ -766,6 +777,7 @@ pub unsafe extern "C" fn gsa_session_latency(
             hold: stage_out(summary.hold),
             present: stage_out(summary.present),
             total: stage_out(summary.total),
+            total_is_lower_bound: u32::from(summary.total_is_lower_bound),
         };
     }
 }
@@ -801,6 +813,28 @@ pub unsafe extern "C" fn gsa_session_note_decode(session: *const GsaSession, dec
         // not grow this without limit.
         if feed.len() < 1024 {
             feed.push(decode_us);
+        }
+    }
+}
+
+/// Report one presented frame's ready→shown wait (µs).
+///
+/// Feeds the latency chain's present stage from the code that touches the
+/// display — the only place that knows which refresh a frame landed on.
+///
+/// # Safety
+/// `session` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gsa_session_note_present(session: *const GsaSession, wait_us: u32) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: caller contract — a live session handle.
+    let feed = &unsafe { &*session }.present_feed;
+    if let Ok(mut feed) = feed.lock() {
+        // Bounded, as the decode feed is.
+        if feed.len() < 1024 {
+            feed.push(wait_us);
         }
     }
 }
@@ -1352,6 +1386,7 @@ async fn session_loop(
         // paths never provably ran, which is the honest reading.
         flow: std::sync::Arc::new(std::sync::Mutex::new(GsaFlowStats::default())),
         decode_feed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        present_feed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         codec,
         // The agent's own pad support, straight from the backend seam rather
         // than restated here, so the two cannot drift.

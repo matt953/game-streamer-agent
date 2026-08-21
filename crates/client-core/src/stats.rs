@@ -732,6 +732,11 @@ pub struct LatencySummary {
     /// dominate honesty (wire and host) both exist, because a "total" made
     /// only of client-side figures would masquerade as end-to-end.
     pub total: Option<StagePercentiles>,
+    /// True when `total` was composed while a client stage (decode, present)
+    /// was unmeasured: the real figure is *at least* this. A total that
+    /// silently omits real stages is the plausible-wrong-number this whole
+    /// module refuses to show, so the omission travels with the value.
+    pub total_is_lower_bound: bool,
 }
 
 impl LatencyChain {
@@ -763,10 +768,12 @@ impl LatencyChain {
         let present = stage(&self.present_us);
         // A synced backend measures the total outright; every other one
         // composes it from the stages. Measured wins when both exist.
+        let mut total_is_lower_bound = false;
         let total = match stage(&self.total_us) {
             Some(measured) => Some(measured),
             None => match (rtt, host) {
                 (Some(rtt), Some(host)) => {
+                    total_is_lower_bound = decode.is_none() || present.is_none();
                     // Half a round trip stands in for the one-way wire; the
                     // remaining stages add if they were measured at all. Percentile
                     // sums overstate tails slightly (stages do not peak together),
@@ -794,6 +801,7 @@ impl LatencyChain {
             hold,
             present,
             total,
+            total_is_lower_bound,
         }
     }
 }
