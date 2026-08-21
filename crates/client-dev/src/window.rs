@@ -932,11 +932,12 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                                 )
                             };
                             format!(
-                                "rtt={} host={} decode={} hold={} total={}{}",
+                                "rtt={} host={} decode={} hold={} present={} total={}{}",
                                 stage(chain.rtt),
                                 stage(chain.host),
                                 stage(chain.decode),
                                 stage(chain.hold),
+                                stage(chain.present),
                                 if chain.total_is_lower_bound { ">=" } else { "" },
                                 stage(chain.total)
                             )
