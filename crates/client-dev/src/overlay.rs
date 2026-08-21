@@ -46,6 +46,14 @@ pub fn rasterise(lines: &[String]) -> OverlayImage {
 
     for (row, line) in lines.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
+            // The font is ASCII-only; substitute the non-ASCII characters the
+            // stats actually use rather than rendering them as '?'.
+            let ch = match ch {
+                '\u{b7}' => '.',   // the video label's separator dot
+                '\u{2265}' => '>', // "Total >=" lower-bound marker
+                '\u{2014}' | '\u{2013}' => '-',
+                other => other,
+            };
             let glyph = BASIC_LEGACY
                 .get(ch as usize)
                 .unwrap_or(&BASIC_LEGACY[b'?' as usize]);
