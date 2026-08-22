@@ -98,6 +98,23 @@ pub enum HostMessage {
 }
 
 impl HostMessage {
+    /// A key identifying which feedback slot this message overwrites, or
+    /// `None` for everything that is not repeated-state feedback.
+    ///
+    /// Some hosts mirror the virtual pad's whole output state continuously —
+    /// measured at ~90 messages/second of identical rumble and LED values —
+    /// and every one forwarded is a callback crossing on the embedder, which
+    /// has been seen to knock a controller's haptics engine offline. Only a
+    /// *change* is information; a repeat of the current state is not.
+    fn feedback_slot(&self) -> Option<(u8, u16)> {
+        match self {
+            Self::Rumble { controller, .. } => Some((0, *controller)),
+            Self::RumbleTriggers { controller, .. } => Some((1, *controller)),
+            Self::SetLed { controller, .. } => Some((2, *controller)),
+            Self::AdaptiveTriggers { controller, .. } => Some((3, *controller)),
+            _ => None,
+        }
+    }
     /// The backend-neutral form, for embedders that do not know which protocol
     /// produced it. `None` for messages with no meaning outside this backend
     /// (connection lifecycle, unimplemented features).
@@ -266,6 +283,9 @@ pub fn run(
     // Kinds already reported, so an unparsed message is logged once loudly
     // rather than every time it arrives.
     let mut seen_kinds = std::collections::HashSet::new();
+    // The current value of each feedback slot, for dropping repeats.
+    let mut last_feedback: std::collections::HashMap<(u8, u16), HostMessage> =
+        std::collections::HashMap::new();
     let mut last_ping = std::time::Instant::now();
     let mut last_rtt = std::time::Instant::now();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -306,6 +326,15 @@ pub fn run(
                                             "host message not parsed yet"
                                         );
                                     }
+                                }
+                                // Feedback is state, not an event stream:
+                                // drop a message that repeats what the same
+                                // slot already holds.
+                                if let Some(slot) = m.feedback_slot() {
+                                    if last_feedback.get(&slot) == Some(&m) {
+                                        continue;
+                                    }
+                                    last_feedback.insert(slot, m.clone());
                                 }
                                 let terminated = matches!(m, HostMessage::Terminated { .. });
                                 let _ = events.send(m);
