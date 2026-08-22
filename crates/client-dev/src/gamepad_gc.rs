@@ -534,6 +534,14 @@ unsafe fn buttons(pad: &GCExtendedGamepad) -> u32 {
                 bits |= mask;
             }
         }
+        // The touchpad click is not on the generic profile at all — only the
+        // DualSense subclass carries it, which is why it was silently absent
+        // from sessions until a game bound its map key to it.
+        if let Some(dual_sense) = pad.downcast_ref::<objc2_game_controller::GCDualSenseGamepad>()
+            && dual_sense.touchpadButton().isPressed()
+        {
+            bits |= gamepad::TOUCHPAD;
+        }
         bits
     }
 }

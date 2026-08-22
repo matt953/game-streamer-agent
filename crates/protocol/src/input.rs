@@ -138,10 +138,16 @@ pub struct GamepadInput {
 /// rather than a translation table; every other backend gets one unambiguous
 /// definition to match instead of inventing its own.
 pub mod gamepad {
-    /// Bits of `GamepadInput::buttons` that XInput defines. The high 16 are
-    /// reserved (0) — a place for pads XInput can't describe (paddles,
-    /// touchpad click) without a protocol rev.
+    /// Bits of `GamepadInput::buttons` that XInput defines. The high 16
+    /// carry buttons XInput can't describe (touchpad click, paddles); a
+    /// backend without an extended-button field on its wire truncates to
+    /// the low word.
     pub const XINPUT_MASK: u32 = 0xFFFF;
+
+    /// A touch surface's click (the DualSense touchpad press). The first
+    /// extended bit, matching where the Moonlight wire's extended-button
+    /// word begins.
+    pub const TOUCHPAD: u32 = 0x1_0000;
 
     pub const DPAD_UP: u32 = 0x0001;
     pub const DPAD_DOWN: u32 = 0x0002;
