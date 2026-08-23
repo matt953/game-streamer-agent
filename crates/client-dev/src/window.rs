@@ -58,6 +58,11 @@ enum AppEvent {
         low: u16,
         high: u16,
     },
+    /// The host reprogrammed the pad's adaptive triggers.
+    AdaptiveTriggers {
+        left: gsa_client_core::TriggerEffect,
+        right: gsa_client_core::TriggerEffect,
+    },
     StreamEnded(String),
 }
 
@@ -860,6 +865,14 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                     )) = message.neutral()
                     {
                         let _ = proxy.send_event(AppEvent::Rumble { low, high });
+                    }
+                    if let Some(gsa_client_core::BackendEvent::Feedback(
+                        gsa_client_core::GamepadFeedback::AdaptiveTriggers {
+                            left, right, ..
+                        },
+                    )) = message.neutral()
+                    {
+                        let _ = proxy.send_event(AppEvent::AdaptiveTriggers { left, right });
                     }
                     // Motion is opt-in: sampling starts here and not before.
                     if let Some(gsa_client_core::BackendEvent::MotionRequested {
@@ -1672,6 +1685,14 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 #[cfg(not(target_os = "macos"))]
                 let _ = (low, high);
+            }
+            AppEvent::AdaptiveTriggers { left, right } => {
+                #[cfg(target_os = "macos")]
+                if let Some(pad) = &mut self.platform_pad {
+                    pad.set_triggers(left, right);
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = (left, right);
             }
             AppEvent::Overlay(lines) => {
                 self.overlay_stream_lines = lines;

@@ -254,6 +254,137 @@ pub enum TriggerEffect {
     },
 }
 
+/// A trigger effect decoded to the shape trigger hardware takes: ten
+/// discrete positions along the pull, each with its own strength.
+///
+/// The DualSense's own effect parameters are zone tables over ten positions,
+/// and Apple's GameController API takes exactly ten positional values — so
+/// this loses nothing on the only path that renders it today. Values are
+/// normalized 0.0..=1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum DecodedTriggerEffect {
+    Off,
+    /// Leave whatever the trigger is already doing.
+    Unchanged,
+    /// Resistance per position.
+    Feedback {
+        strengths: [f32; 10],
+    },
+    /// Vibration amplitude per position, at a normalized frequency.
+    Vibration {
+        amplitudes: [f32; 10],
+        frequency: f32,
+    },
+    /// Resistance from `start` to `end`, then release — a trigger break.
+    Weapon {
+        start: f32,
+        end: f32,
+        strength: f32,
+    },
+    /// An opcode this decoder does not know. Render nothing: a wrong
+    /// reading produces a trigger that fights the user.
+    Unknown {
+        effect: u8,
+    },
+}
+
+impl TriggerEffect {
+    /// Decode to positional form, including the raw DualSense opcodes.
+    ///
+    /// The raw formats are zone tables: a 10-bit active-zone mask in the
+    /// first two bytes, then ten 3-bit values packed LSB-first from the
+    /// third byte. Verified against live captures — uniform-force blobs
+    /// unpack to the same value in every zone, which a wrong bit layout
+    /// cannot produce.
+    #[must_use]
+    pub fn decoded(self) -> DecodedTriggerEffect {
+        /// DualSense trigger effect opcodes, as they arrive on the wire.
+        const OFF: u8 = 0x00;
+        const RELEASE: u8 = 0x05;
+        const FEEDBACK: u8 = 0x21;
+        const WEAPON: u8 = 0x25;
+        const VIBRATION: u8 = 0x26;
+
+        let zones = |params: [u8; 10]| -> [f32; 10] {
+            let mask = u16::from_le_bytes([params[0], params[1]]);
+            let packed = u32::from_le_bytes([params[2], params[3], params[4], params[5]]);
+            let mut out = [0.0f32; 10];
+            for (i, slot) in out.iter_mut().enumerate() {
+                if mask & (1 << i) != 0 {
+                    let force = (packed >> (3 * i)) & 0x7;
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        *slot = force as f32 / 7.0;
+                    }
+                }
+            }
+            out
+        };
+
+        match self {
+            Self::Off => DecodedTriggerEffect::Off,
+            Self::Unchanged => DecodedTriggerEffect::Unchanged,
+            Self::Feedback { start, strength } => {
+                let mut strengths = [0.0f32; 10];
+                let first = usize::from(start) * 10 / 256;
+                for slot in strengths.iter_mut().skip(first) {
+                    *slot = f32::from(strength) / 255.0;
+                }
+                DecodedTriggerEffect::Feedback { strengths }
+            }
+            Self::Weapon {
+                start,
+                end,
+                strength,
+            } => DecodedTriggerEffect::Weapon {
+                start: f32::from(start) / 255.0,
+                end: f32::from(end) / 255.0,
+                strength: f32::from(strength) / 255.0,
+            },
+            Self::Vibration {
+                start,
+                strength,
+                frequency,
+            } => {
+                let mut amplitudes = [0.0f32; 10];
+                let first = usize::from(start) * 10 / 256;
+                for slot in amplitudes.iter_mut().skip(first) {
+                    *slot = f32::from(strength) / 255.0;
+                }
+                DecodedTriggerEffect::Vibration {
+                    amplitudes,
+                    frequency: f32::from(frequency) / 255.0,
+                }
+            }
+            Self::Raw { effect, params } => match effect {
+                OFF => DecodedTriggerEffect::Off,
+                // Observed only with empty parameters, as a release.
+                RELEASE if params == [0; 10] => DecodedTriggerEffect::Off,
+                FEEDBACK => DecodedTriggerEffect::Feedback {
+                    strengths: zones(params),
+                },
+                VIBRATION => DecodedTriggerEffect::Vibration {
+                    amplitudes: zones(params),
+                    frequency: f32::from(params[8]) / 255.0,
+                },
+                WEAPON => {
+                    let mask = u16::from_le_bytes([params[0], params[1]]);
+                    let first = (0..10).find(|i| mask & (1 << i) != 0).unwrap_or(0);
+                    let last = (0..10).rfind(|i| mask & (1 << i) != 0).unwrap_or(9);
+                    #[allow(clippy::cast_precision_loss)]
+                    DecodedTriggerEffect::Weapon {
+                        start: first as f32 / 9.0,
+                        end: last as f32 / 9.0,
+                        strength: f32::from(params[2] & 0x7) / 7.0,
+                    }
+                }
+                other => DecodedTriggerEffect::Unknown { effect: other },
+            },
+        }
+    }
+}
+
 /// Something the host asks a pad to do. Backend-neutral: a variant here means
 /// the same on every wire, and a backend emits only what its
 /// [`crate::SessionCaps::pads`] claims.
@@ -301,7 +432,66 @@ impl GamepadFeedback {
 
 #[cfg(test)]
 mod tests {
-    use super::{GamepadFeedback, PadCaps, PadKind, TriggerEffect};
+    use super::{DecodedTriggerEffect, GamepadFeedback, PadCaps, PadKind, TriggerEffect};
+
+    /// The zone unpack against live captures: a host sending uniform force
+    /// produces the same 3-bit value in every zone, which a wrong bit layout
+    /// cannot fake across four different blobs.
+    #[test]
+    fn captured_dualsense_blobs_decode_to_uniform_zones() {
+        // HZD bow draw, two strengths (captured live).
+        let strong = TriggerEffect::Raw {
+            effect: 0x21,
+            params: [255, 3, 219, 182, 109, 27, 0, 0, 0, 0],
+        };
+        let DecodedTriggerEffect::Feedback { strengths } = strong.decoded() else {
+            panic!("feedback opcode must decode to feedback");
+        };
+        for s in strengths {
+            assert!(
+                (s - 3.0 / 7.0).abs() < 1e-6,
+                "expected uniform 3/7, got {s}"
+            );
+        }
+
+        let vibration = TriggerEffect::Raw {
+            effect: 0x26,
+            params: [255, 3, 73, 146, 36, 9, 0, 0, 50, 0],
+        };
+        let DecodedTriggerEffect::Vibration {
+            amplitudes,
+            frequency,
+        } = vibration.decoded()
+        else {
+            panic!("vibration opcode must decode to vibration");
+        };
+        for a in amplitudes {
+            assert!(
+                (a - 1.0 / 7.0).abs() < 1e-6,
+                "expected uniform 1/7, got {a}"
+            );
+        }
+        assert!((frequency - 50.0 / 255.0).abs() < 1e-6);
+    }
+
+    /// The observed release (opcode 5, empty params) means off; the same
+    /// opcode with content is unknown, and unknown renders nothing.
+    #[test]
+    fn release_is_off_and_unknown_stays_unknown() {
+        let release = TriggerEffect::Raw {
+            effect: 0x05,
+            params: [0; 10],
+        };
+        assert_eq!(release.decoded(), DecodedTriggerEffect::Off);
+        let mystery = TriggerEffect::Raw {
+            effect: 0x33,
+            params: [1; 10],
+        };
+        assert_eq!(
+            mystery.decoded(),
+            DecodedTriggerEffect::Unknown { effect: 0x33 }
+        );
+    }
 
     /// The trap that produced a real bug: an Xbox pad announced as a
     /// PlayStation one because its name contains the other's alias, so the

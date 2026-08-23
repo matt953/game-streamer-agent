@@ -201,6 +201,31 @@ impl GcCapture {
         }
     }
 
+    /// Program the pad's adaptive triggers with the host's effects.
+    ///
+    /// DualSense only — the one pad with the hardware — through the
+    /// platform's ten-position API, which matches the effect format's ten
+    /// zones exactly, so nothing is approximated. An unknown effect renders
+    /// nothing rather than a guess: a wrong reading produces a trigger that
+    /// fights the user.
+    pub fn set_triggers(
+        &mut self,
+        left: gsa_client_core::TriggerEffect,
+        right: gsa_client_core::TriggerEffect,
+    ) {
+        use objc2_game_controller::GCDualSenseGamepad;
+        // SAFETY: property reads on framework objects held alive by `self`.
+        let Some(dual_sense) = (unsafe {
+            self.pad
+                .downcast_ref::<GCDualSenseGamepad>()
+                .map(|ds| (ds.leftTrigger(), ds.rightTrigger()))
+        }) else {
+            return;
+        };
+        apply_trigger(&dual_sense.0, left);
+        apply_trigger(&dual_sense.1, right);
+    }
+
     /// How many controllers the framework can see, for reporting the ones
     /// this harness ignores. They can arrive at any time, so this is checked
     /// while running rather than once at startup.
@@ -576,6 +601,63 @@ unsafe fn axes(pad: &GCExtendedGamepad) -> [i16; 8] {
         axes[gamepad::Axis::LeftTrigger.index()] = trigger(pad.leftTrigger().value());
         axes[gamepad::Axis::RightTrigger.index()] = trigger(pad.rightTrigger().value());
         axes
+    }
+}
+
+/// One decoded effect onto one physical trigger.
+fn apply_trigger(
+    trigger: &objc2_game_controller::GCDualSenseAdaptiveTrigger,
+    effect: gsa_client_core::TriggerEffect,
+) {
+    use gsa_client_core::DecodedTriggerEffect as Decoded;
+    use objc2_game_controller::{
+        GCDualSenseAdaptiveTriggerPositionalAmplitudes,
+        GCDualSenseAdaptiveTriggerPositionalResistiveStrengths,
+    };
+    match effect.decoded() {
+        Decoded::Unchanged => {}
+        Decoded::Off => {
+            // SAFETY: call on a live framework object.
+            unsafe { trigger.setModeOff() }
+        }
+        Decoded::Feedback { strengths } => {
+            // SAFETY: live framework object; strengths normalized 0..=1.
+            unsafe {
+                trigger.setModeFeedbackWithResistiveStrengths(
+                    GCDualSenseAdaptiveTriggerPositionalResistiveStrengths { values: strengths },
+                );
+            }
+        }
+        Decoded::Vibration {
+            amplitudes,
+            frequency,
+        } => {
+            // SAFETY: live framework object; amplitudes and frequency normalized.
+            unsafe {
+                trigger.setModeVibrationWithAmplitudes_frequency(
+                    GCDualSenseAdaptiveTriggerPositionalAmplitudes { values: amplitudes },
+                    frequency,
+                );
+            }
+        }
+        Decoded::Weapon {
+            start,
+            end,
+            strength,
+        } => {
+            // SAFETY: live framework object; positions and strength normalized.
+            unsafe {
+                trigger.setModeWeaponWithStartPosition_endPosition_resistiveStrength(
+                    start, end, strength,
+                );
+            }
+        }
+        Decoded::Unknown { effect } => {
+            tracing::debug!(effect, "unknown trigger effect left unrendered");
+        }
+        // The enum is non-exhaustive: a variant this build does not know
+        // renders nothing, same as an unknown opcode.
+        _ => {}
     }
 }
 

@@ -15,8 +15,8 @@ pub mod stats;
 pub use decode::{DecodedFrame, HdrPayloadState, HdrStatus, PixelOrder, VideoDecoder, VideoFormat};
 pub use gsa_client_backend_api::{
     ActiveSession, BackendEvent, BackendFrame, CaptureClock, CatalogEntry, CatalogKind,
-    GamepadFeedback, GamepadProfile, InputSink, MotionSensor, PadCaps, PadKind, RecoverySink,
-    SessionCaps, SessionKnobs, SessionOrigin, StreamBackend, TriggerEffect,
+    DecodedTriggerEffect, GamepadFeedback, GamepadProfile, InputSink, MotionSensor, PadCaps,
+    PadKind, RecoverySink, SessionCaps, SessionKnobs, SessionOrigin, StreamBackend, TriggerEffect,
 };
 pub use gsa_protocol::control::{SourceInfo, SourceKind};
 pub use gsa_protocol::input::{GamepadInput, InputEvent, MouseButton, MouseMove};
