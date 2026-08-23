@@ -316,6 +316,23 @@ pub struct GsaCallbacks {
             abr_enabled: bool,
         ),
     >,
+    /// A decoded adaptive-trigger effect for one physical trigger. `side` is
+    /// 0 left, 1 right. `mode` is a `GSA_TRIGGER_*` value; `values` points at
+    /// ten floats whose meaning the mode decides (resistance or amplitude per
+    /// trigger position for feedback/vibration; start/end/strength in the
+    /// first three for weapon), all normalized 0..=1, as is `frequency`.
+    /// Decoded on this side of the FFI so every platform renders one
+    /// interpretation. NULL to ignore trigger effects.
+    pub on_trigger_effect: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            seat: u32,
+            side: u32,
+            mode: u32,
+            values: *const f32,
+            frequency: f32,
+        ),
+    >,
 }
 
 /// `on_notification` kinds.
@@ -337,6 +354,12 @@ pub const GSA_PAD_FEEDBACK_LED: u32 = 3;
 /// arrives** — motion is opt-in on every protocol that carries it, and an
 /// unread stream is battery spent for nothing.
 pub const GSA_PAD_FEEDBACK_MOTION_REQUEST: u32 = 4;
+
+/// `on_trigger_effect` modes.
+pub const GSA_TRIGGER_OFF: u32 = 0;
+pub const GSA_TRIGGER_FEEDBACK: u32 = 1;
+pub const GSA_TRIGGER_VIBRATION: u32 = 2;
+pub const GSA_TRIGGER_WEAPON: u32 = 3;
 
 /// Pad families for [`gsa_announce_gamepad`]. Announce what the user actually
 /// holds: hosts build a matching virtual device, and the choice decides which
@@ -1681,13 +1704,61 @@ pub(crate) fn fire_pad_feedback(cbs: &GsaCallbacks, event: &gsa_client_core::Bac
             u32::from(sensor == MotionSensor::Accel),
             0,
         ),
-        // Trigger effects are an opaque vendor blob and do not fit this
-        // shape; they need their own entry point rather than a lossy
-        // encoding here, and no host we support emits them yet.
+        // Trigger effects carry ten positional values and cross through
+        // `on_trigger_effect` instead of this lossy shape.
         _ => return,
     };
     // SAFETY: `ctx` valid for the session per the embedder contract.
     unsafe { cb(cbs.ctx, kind, u32::from(seat), a, b, c) };
+}
+
+/// Deliver decoded adaptive-trigger effects, one call per changed trigger.
+pub(crate) fn fire_trigger_effects(cbs: &GsaCallbacks, event: &gsa_client_core::BackendEvent) {
+    let Some(cb) = cbs.on_trigger_effect else {
+        return;
+    };
+    use gsa_client_core::{BackendEvent, DecodedTriggerEffect, GamepadFeedback};
+    let BackendEvent::Feedback(GamepadFeedback::AdaptiveTriggers { seat, left, right }) = *event
+    else {
+        return;
+    };
+    for (side, effect) in [(0u32, left), (1u32, right)] {
+        let (mode, values, frequency): (u32, [f32; 10], f32) = match effect.decoded() {
+            DecodedTriggerEffect::Unchanged | DecodedTriggerEffect::Unknown { .. } => continue,
+            DecodedTriggerEffect::Off => (GSA_TRIGGER_OFF, [0.0; 10], 0.0),
+            DecodedTriggerEffect::Feedback { strengths } => (GSA_TRIGGER_FEEDBACK, strengths, 0.0),
+            DecodedTriggerEffect::Vibration {
+                amplitudes,
+                frequency,
+            } => (GSA_TRIGGER_VIBRATION, amplitudes, frequency),
+            DecodedTriggerEffect::Weapon {
+                start,
+                end,
+                strength,
+            } => {
+                let mut values = [0.0; 10];
+                values[0] = start;
+                values[1] = end;
+                values[2] = strength;
+                (GSA_TRIGGER_WEAPON, values, 0.0)
+            }
+            // The enum is non-exhaustive; a variant this build does not know
+            // renders nothing, same as an unknown opcode.
+            _ => continue,
+        };
+        // SAFETY: `ctx` valid for the session per the embedder contract;
+        // `values` outlives the call.
+        unsafe {
+            cb(
+                cbs.ctx,
+                u32::from(seat),
+                side,
+                mode,
+                values.as_ptr(),
+                frequency,
+            );
+        }
+    }
 }
 
 /// Carries a raw `ctx` onto the audio thread. Same embedder contract as

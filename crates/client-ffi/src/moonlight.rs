@@ -340,6 +340,7 @@ pub(crate) fn run_session(
                 // The full effect, not just its existence: amplitudes, colours
                 // and motion requests all reach the embedder here.
                 crate::fire_pad_feedback(&cbs, &event);
+                crate::fire_trigger_effects(&cbs, &event);
             }
         }
 
