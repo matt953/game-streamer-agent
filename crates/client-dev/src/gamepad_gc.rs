@@ -162,6 +162,10 @@ impl GcCapture {
                 ?kind,
                 motion = motion.is_some(),
                 touchpads = touchpads.len(),
+                profile_class = pad.class().name().to_str().unwrap_or("?"),
+                dual_sense_profile = pad
+                    .downcast_ref::<objc2_game_controller::GCDualSenseGamepad>()
+                    .is_some(),
                 "controller opened through the platform framework"
             );
             let motors = crate::haptics::Rumble::new(&controller);
@@ -228,6 +232,15 @@ impl GcCapture {
         unsafe {
             let buttons = buttons(&self.pad);
             let axes = axes(&self.pad);
+            // Logs the extended word actually being sent — read from the
+            // same value that goes on the wire, so the log cannot disagree
+            // with the transmission.
+            if buttons >> 16 != 0 && self.last.is_none_or(|(b, _)| b >> 16 != buttons >> 16) {
+                tracing::info!(
+                    extended = format!("{:#06x}", buttons >> 16),
+                    "extended buttons sent"
+                );
+            }
             if self.last != Some((buttons, axes)) {
                 self.last = Some((buttons, axes));
                 events.push(InputEvent::Gamepad(GamepadInput {

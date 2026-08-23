@@ -144,10 +144,13 @@ pub mod gamepad {
     /// the low word.
     pub const XINPUT_MASK: u32 = 0xFFFF;
 
-    /// A touch surface's click (the DualSense touchpad press). The first
-    /// extended bit, matching where the Moonlight wire's extended-button
-    /// word begins.
-    pub const TOUCHPAD: u32 = 0x1_0000;
+    /// A touch surface's click (the DualSense touchpad press).
+    ///
+    /// Position verified against a live host: with every extended bit set,
+    /// the host's virtual DualSense registered exactly one button, and
+    /// isolating bits found it here. The four bits below this are paddles,
+    /// which a DualSense does not have.
+    pub const TOUCHPAD: u32 = 0x10_0000;
 
     pub const DPAD_UP: u32 = 0x0001;
     pub const DPAD_DOWN: u32 = 0x0002;
