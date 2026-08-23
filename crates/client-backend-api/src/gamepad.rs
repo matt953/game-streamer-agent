@@ -205,6 +205,23 @@ impl GamepadProfile {
     pub const fn new(kind: PadKind, caps: PadCaps) -> Self {
         Self { kind, caps }
     }
+
+    /// The colour to give this pad's light the moment a client claims it, or
+    /// `None` for a pad with no light.
+    ///
+    /// A lit pad nobody has programmed runs its own connection animation —
+    /// a DualSense pulses blue forever — which a user reads as the session
+    /// having failed. Claiming the light is what stops it, so every client
+    /// does it at announce time and the host's own colours take over from
+    /// there. The value matches what other streaming clients write at init.
+    #[must_use]
+    pub const fn claim_led(&self) -> Option<[u8; 3]> {
+        if self.caps.contains(PadCaps::LED) {
+            Some([120, 120, 239])
+        } else {
+            None
+        }
+    }
 }
 
 /// Which sensor a motion sample or request refers to. They are separate
@@ -568,6 +585,16 @@ mod tests {
         assert!(!pad.contains(PadCaps::ADAPTIVE_TRIGGERS));
         assert!(!pad.contains(PadCaps::RUMBLE | PadCaps::LED));
         assert!(PadCaps::NONE.is_empty());
+    }
+
+    #[test]
+    fn only_a_pad_with_a_light_is_given_a_claim_colour() {
+        use super::GamepadProfile;
+
+        let lit = GamepadProfile::new(PadKind::DualSense, PadKind::DualSense.implied_caps());
+        assert!(lit.claim_led().is_some());
+        let dark = GamepadProfile::new(PadKind::Xbox, PadKind::Xbox.implied_caps());
+        assert_eq!(dark.claim_led(), None);
     }
 
     #[test]

@@ -440,6 +440,10 @@ pub struct GsaSession {
     /// What of a controller this session carries (`GSA_PAD_*` flags), for
     /// `gsa_session_pad_caps`.
     pad_caps: u32,
+    /// The embedder's callbacks, kept so calls made *into* the session can
+    /// answer through the same path the session loop uses — pad feedback
+    /// raised by [`gsa_announce_gamepad`] is the case that needs it.
+    callbacks: GsaCallbacks,
 }
 
 /// Handed back from `session_loop` once it knows the outcome: whether the
@@ -581,6 +585,7 @@ pub unsafe extern "C" fn gsa_session_start(
             pacing,
             codec,
             pad_caps,
+            callbacks,
         })),
         _ => {
             let _ = thread.join();
@@ -1152,7 +1157,20 @@ pub unsafe extern "C" fn gsa_announce_gamepad(
     if let Some(input) = &session.input {
         let kind = pad_kind_from_flag(kind);
         let caps = gsa_client_core::PadCaps::from_bits(caps as u16);
-        input.announce_pad(seat, gsa_client_core::GamepadProfile::new(kind, caps));
+        let profile = gsa_client_core::GamepadProfile::new(kind, caps);
+        input.announce_pad(seat, profile);
+        // Settle the pad's own light here rather than leaving it to the host:
+        // the embedder renders this through the same LED path a host colour
+        // arrives on, so no platform needs its own rule for it.
+        if let Some(rgb) = profile.claim_led() {
+            fire_pad_feedback(
+                &session.callbacks,
+                &gsa_client_core::BackendEvent::Feedback(gsa_client_core::GamepadFeedback::Led {
+                    seat,
+                    rgb,
+                }),
+            );
+        }
     }
 }
 

@@ -421,6 +421,7 @@ pub unsafe extern "C" fn gsa_host_session_start(
             pacing,
             codec,
             pad_caps,
+            callbacks,
         })),
         // Either the session failed or the thread died; join so its failure is
         // not left running behind a NULL return.

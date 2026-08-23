@@ -1631,6 +1631,12 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
                 input.announce_pad(0, profile);
+                // Same claim-time light the apps get through the FFI, from the
+                // same core rule — a pad left unprogrammed keeps running its
+                // own connection animation.
+                if let Some(rgb) = profile.claim_led() {
+                    pad.set_led(rgb);
+                }
                 self.pad_announced = true;
             }
             let events = pad.poll(self.motion_hz > 0);
