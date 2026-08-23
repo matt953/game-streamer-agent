@@ -306,16 +306,20 @@ impl TriggerEffect {
         const WEAPON: u8 = 0x25;
         const VIBRATION: u8 = 0x26;
 
+        // Zone fields store strength − 1 (the sender never emits strength
+        // 0 — that would be Off), so a field of 3 means 4 of 8. Rendering
+        // field/7 instead is a full step weak on every zone, which is
+        // exactly what "works but does not feel like local" reports.
         let zones = |params: [u8; 10]| -> [f32; 10] {
             let mask = u16::from_le_bytes([params[0], params[1]]);
             let packed = u32::from_le_bytes([params[2], params[3], params[4], params[5]]);
             let mut out = [0.0f32; 10];
             for (i, slot) in out.iter_mut().enumerate() {
                 if mask & (1 << i) != 0 {
-                    let force = (packed >> (3 * i)) & 0x7;
+                    let field = (packed >> (3 * i)) & 0x7;
                     #[allow(clippy::cast_precision_loss)]
                     {
-                        *slot = force as f32 / 7.0;
+                        *slot = (field + 1) as f32 / 8.0;
                     }
                 }
             }
@@ -358,9 +362,8 @@ impl TriggerEffect {
                 }
             }
             Self::Raw { effect, params } => match effect {
-                OFF => DecodedTriggerEffect::Off,
-                // Observed only with empty parameters, as a release.
-                RELEASE if params == [0; 10] => DecodedTriggerEffect::Off,
+                // 0x05 is the official Off — neutral position, no params.
+                OFF | RELEASE => DecodedTriggerEffect::Off,
                 FEEDBACK => DecodedTriggerEffect::Feedback {
                     strengths: zones(params),
                 },
@@ -376,7 +379,7 @@ impl TriggerEffect {
                     DecodedTriggerEffect::Weapon {
                         start: first as f32 / 9.0,
                         end: last as f32 / 9.0,
-                        strength: f32::from(params[2] & 0x7) / 7.0,
+                        strength: f32::from((params[2] & 0x7) + 1) / 8.0,
                     }
                 }
                 other => DecodedTriggerEffect::Unknown { effect: other },
@@ -448,10 +451,8 @@ mod tests {
             panic!("feedback opcode must decode to feedback");
         };
         for s in strengths {
-            assert!(
-                (s - 3.0 / 7.0).abs() < 1e-6,
-                "expected uniform 3/7, got {s}"
-            );
+            // Field 3 means strength 4 of 8: the fields store strength − 1.
+            assert!((s - 0.5).abs() < 1e-6, "expected uniform 4/8, got {s}");
         }
 
         let vibration = TriggerEffect::Raw {
@@ -466,16 +467,13 @@ mod tests {
             panic!("vibration opcode must decode to vibration");
         };
         for a in amplitudes {
-            assert!(
-                (a - 1.0 / 7.0).abs() < 1e-6,
-                "expected uniform 1/7, got {a}"
-            );
+            assert!((a - 0.25).abs() < 1e-6, "expected uniform 2/8, got {a}");
         }
         assert!((frequency - 50.0 / 255.0).abs() < 1e-6);
     }
 
-    /// The observed release (opcode 5, empty params) means off; the same
-    /// opcode with content is unknown, and unknown renders nothing.
+    /// Opcode 5 is the official Off; a genuinely unknown opcode renders
+    /// nothing rather than a guess.
     #[test]
     fn release_is_off_and_unknown_stays_unknown() {
         let release = TriggerEffect::Raw {
