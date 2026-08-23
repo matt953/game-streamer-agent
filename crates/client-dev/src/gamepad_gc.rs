@@ -201,6 +201,23 @@ impl GcCapture {
         }
     }
 
+    /// Show the host's colour on the pad's light, where it has one.
+    pub fn set_led(&mut self, rgb: [u8; 3]) {
+        // SAFETY: property reads and a setter on live framework objects.
+        unsafe {
+            if let Some(light) = self.controller.light() {
+                use objc2::AllocAnyThread;
+                let colour = objc2_game_controller::GCColor::initWithRed_green_blue(
+                    objc2_game_controller::GCColor::alloc(),
+                    f32::from(rgb[0]) / 255.0,
+                    f32::from(rgb[1]) / 255.0,
+                    f32::from(rgb[2]) / 255.0,
+                );
+                light.setColor(&colour);
+            }
+        }
+    }
+
     /// Program the pad's adaptive triggers with the host's effects.
     ///
     /// DualSense only — the one pad with the hardware — through the

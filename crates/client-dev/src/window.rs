@@ -63,6 +63,10 @@ enum AppEvent {
         left: gsa_client_core::TriggerEffect,
         right: gsa_client_core::TriggerEffect,
     },
+    /// The host set the pad's light colour.
+    Led {
+        rgb: [u8; 3],
+    },
     StreamEnded(String),
 }
 
@@ -873,6 +877,12 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                     )) = message.neutral()
                     {
                         let _ = proxy.send_event(AppEvent::AdaptiveTriggers { left, right });
+                    }
+                    if let Some(gsa_client_core::BackendEvent::Feedback(
+                        gsa_client_core::GamepadFeedback::Led { rgb, .. },
+                    )) = message.neutral()
+                    {
+                        let _ = proxy.send_event(AppEvent::Led { rgb });
                     }
                     // Motion is opt-in: sampling starts here and not before.
                     if let Some(gsa_client_core::BackendEvent::MotionRequested {
@@ -1693,6 +1703,14 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 #[cfg(not(target_os = "macos"))]
                 let _ = (left, right);
+            }
+            AppEvent::Led { rgb } => {
+                #[cfg(target_os = "macos")]
+                if let Some(pad) = &mut self.platform_pad {
+                    pad.set_led(rgb);
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = rgb;
             }
             AppEvent::Overlay(lines) => {
                 self.overlay_stream_lines = lines;
