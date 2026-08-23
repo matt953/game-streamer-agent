@@ -362,8 +362,14 @@ impl TriggerEffect {
                 }
             }
             Self::Raw { effect, params } => match effect {
+                // 0x00 is an idle trigger section in a mirrored output
+                // report — "this update does not address the trigger" — not
+                // a release. Treating it as Off flaps the effect: hosts
+                // interleave idle reports with the active effect
+                // continuously, and the pad ends up caught released.
+                OFF => DecodedTriggerEffect::Unchanged,
                 // 0x05 is the official Off — neutral position, no params.
-                OFF | RELEASE => DecodedTriggerEffect::Off,
+                RELEASE => DecodedTriggerEffect::Off,
                 FEEDBACK => DecodedTriggerEffect::Feedback {
                     strengths: zones(params),
                 },
@@ -472,7 +478,8 @@ mod tests {
         assert!((frequency - 50.0 / 255.0).abs() < 1e-6);
     }
 
-    /// Opcode 5 is the official Off; a genuinely unknown opcode renders
+    /// Opcode 5 is the official Off; opcode 0 is an idle report section and
+    /// must leave the trigger alone; a genuinely unknown opcode renders
     /// nothing rather than a guess.
     #[test]
     fn release_is_off_and_unknown_stays_unknown() {
@@ -481,6 +488,11 @@ mod tests {
             params: [0; 10],
         };
         assert_eq!(release.decoded(), DecodedTriggerEffect::Off);
+        let idle = TriggerEffect::Raw {
+            effect: 0x00,
+            params: [0; 10],
+        };
+        assert_eq!(idle.decoded(), DecodedTriggerEffect::Unchanged);
         let mystery = TriggerEffect::Raw {
             effect: 0x33,
             params: [1; 10],
