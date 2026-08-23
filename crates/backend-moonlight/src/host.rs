@@ -181,11 +181,13 @@ pub struct StreamMode {
     pub hdr: bool,
     /// Speaker count we can render. 2 is stereo.
     pub channels: u8,
-    /// Leave the host's own speakers working while we stream.
+    /// Play audio on the host instead of streaming it to this client.
     ///
-    /// Hosts mute themselves by default so a stream does not play twice in one
-    /// room. On by default here: muting a machine someone else is using takes
-    /// their audio away without asking.
+    /// The wire flag's real meaning, learned the hard way: one host treated
+    /// it leniently and streamed audio anyway, which made "keep the host's
+    /// speakers too" look like what it did — until a strict host honoured it
+    /// and the client went silent. Off by default: a streaming client wants
+    /// the audio.
     pub keep_host_audio: bool,
 }
 
@@ -198,7 +200,7 @@ impl Default for StreamMode {
             allow_host_mode_change: false,
             hdr: false,
             channels: 2,
-            keep_host_audio: true,
+            keep_host_audio: false,
         }
     }
 }
