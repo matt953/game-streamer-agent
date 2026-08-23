@@ -105,7 +105,7 @@ async fn main() {
     let mut on_second = 0usize;
     // Feed what arrives through the real decode path and measure the result:
     // decoding without checking the samples would pass on silence.
-    let (mut audio_rx, pcm_out) = gsa_backend_moonlight::AudioReceive::new().expect("audio");
+    let (mut audio_rx, pcm_out) = gsa_backend_moonlight::AudioReceive::new(None).expect("audio");
     let mut pcm_frames = 0usize;
     let mut samples = 0usize;
     let mut peak = 0i32;

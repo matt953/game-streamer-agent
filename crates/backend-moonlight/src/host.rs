@@ -210,6 +210,8 @@ impl StreamMode {
         let mask: u32 = match self.channels {
             6 => 0x3f,
             8 => 0x63f,
+            // 7.1.4: the 7.1 positions plus four height speakers.
+            12 => 0x2d63f,
             _ => 0x3,
         };
         (mask << 16) | u32::from(self.channels.max(2))

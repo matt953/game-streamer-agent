@@ -57,6 +57,10 @@ pub struct Negotiated {
     pub encryption_requested: u32,
     /// The host can repair a broken reference chain without a full keyframe.
     pub reference_invalidation: bool,
+    /// The multistream layout the host will encode audio with, when more
+    /// than stereo was requested. Parsed from the host's own `surround-params`
+    /// lines — the encoder's declaration, not a table of assumptions.
+    pub surround: Option<gsa_audio::SurroundLayout>,
 }
 
 impl Negotiated {
@@ -184,6 +188,15 @@ impl Rtsp {
             )
             .await?;
         let host_sdp = describe.body;
+        // The host's own description of what it can encode — the only
+        // legitimate specification for its audio layouts. Kept at debug:
+        // it is a page of text, wanted exactly when studying a host.
+        tracing::debug!(sdp = %host_sdp, "host DESCRIBE sdp");
+        for line in host_sdp.lines() {
+            if line.to_ascii_lowercase().contains("audio") {
+                tracing::info!(line, "host audio capability");
+            }
+        }
 
         // Hosts assign the ports and ignore this proposal, but reference
         // clients send it, so it stays.
@@ -247,8 +260,59 @@ impl Rtsp {
                 .unwrap_or(0),
             reference_invalidation: sdp_int(&host_sdp, "x-nv-video[0].refPicInvalidation")
                 .is_some_and(|v| v != 0),
+            surround: (want.channels > 2)
+                .then(|| surround_layout(&host_sdp, want.channels))
+                .flatten(),
         })
     }
+}
+
+/// The host's stated Opus multistream layout for `channels`, from its
+/// `a=fmtp:97 surround-params=` lines.
+///
+/// Two spellings exist. The digit string packs single digits:
+/// `85301245673` reads channels 8, streams 5, coupled 3, mapping 01245673 —
+/// which cannot express a channel index past 9, hence the newer
+/// comma-separated form `12,8,4,0,1,…`. Hosts list a coupled and an
+/// uncoupled variant per count; the first matches AudioQuality 0, which is
+/// what this client requests.
+fn surround_layout(host_sdp: &str, channels: u8) -> Option<gsa_audio::SurroundLayout> {
+    for line in host_sdp.lines() {
+        let Some(params) = line.trim().strip_prefix("a=fmtp:97 surround-params=") else {
+            continue;
+        };
+        let layout = if params.contains(',') {
+            let mut fields = params.split(',').map(|f| f.trim().parse::<u8>().ok());
+            let ch = fields.next().flatten()?;
+            let streams = fields.next().flatten()?;
+            let coupled = fields.next().flatten()?;
+            let mapping: Option<Vec<u8>> = fields.collect();
+            gsa_audio::SurroundLayout {
+                channels: ch,
+                streams,
+                coupled,
+                mapping: mapping?,
+            }
+        } else {
+            let digits: Vec<u8> = params
+                .chars()
+                .map(|c| c.to_digit(10).map(|d| d as u8))
+                .collect::<Option<_>>()?;
+            if digits.len() < 3 {
+                continue;
+            }
+            gsa_audio::SurroundLayout {
+                channels: digits[0],
+                streams: digits[1],
+                coupled: digits[2],
+                mapping: digits[3..].to_vec(),
+            }
+        };
+        if layout.channels == channels && layout.mapping.len() == usize::from(channels) {
+            return Some(layout);
+        }
+    }
+    None
 }
 
 fn server_port(response: &Response) -> Result<u16> {
@@ -282,6 +346,8 @@ fn announce_sdp(host: &str, want: StreamRequest, host_sdp: &str) -> String {
     let mask: u32 = match want.channels {
         6 => 0x3f,
         8 => 0x63f,
+        // 7.1.4: the 7.1 positions plus four height speakers.
+        12 => 0x2d63f,
         _ => 0x3,
     };
     format!(

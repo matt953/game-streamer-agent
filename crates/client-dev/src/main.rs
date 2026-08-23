@@ -2,6 +2,7 @@
 //! `--headless` decodes N frames and emits a stats JSON blob (the CI/e2e
 //! mode); the default mode opens a window and presents the stream.
 
+mod audio_dump;
 mod audio_playback;
 mod av1;
 mod decoder;
@@ -186,6 +187,19 @@ struct Cli {
     /// support for one codec can be exercised without changing hardware.
     #[arg(long, value_delimiter = ',', value_parser = ["av1", "hevc", "h264"])]
     codecs: Vec<String>,
+    /// Write each decoded audio channel to its own WAV under this directory.
+    /// With more than 2 channels this is the only output: playback stays
+    /// muted, because a wrongly decoded experimental layout is violent noise.
+    #[arg(long)]
+    dump_audio: Option<std::path::PathBuf>,
+    /// Speaker channels to request: 2 (stereo), 6 (5.1), 8 (7.1) or 12
+    /// (7.1.4, where a host that forwards controller-haptic audio would put
+    /// it). More
+    /// than the machine can play is a probe, not a listening mode: the
+    /// stereo decoder cannot open surround packets yet, so audio goes
+    /// silent while the negotiation and the wire are studied.
+    #[arg(long, default_value_t = 2)]
+    moonlight_channels: u8,
     /// What ending the session does to the host: `quit` takes the app down
     /// with the stream; `disconnect` leaves it running, and the next run of
     /// the same app rejoins it mid-session.
@@ -211,6 +225,9 @@ fn main() -> Result<()> {
     }
 
     if let Some(host) = cli.moonlight {
+        if ![2, 6, 8, 12].contains(&cli.moonlight_channels) {
+            anyhow::bail!("--moonlight-channels must be 2, 6, 8 or 12");
+        }
         return window::run_moonlight(
             host,
             cli.moonlight_app,
@@ -238,6 +255,8 @@ fn main() -> Result<()> {
             cli.chase_refresh,
             cli.fullscreen,
             cli.moonlight_exit == "disconnect",
+            cli.moonlight_channels,
+            cli.dump_audio.clone(),
         );
     }
 

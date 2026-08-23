@@ -10,7 +10,7 @@
 //! packets at all; silence here can be a host condition rather than a client
 //! fault.
 
-use gsa_audio::OpusDecoder;
+use gsa_audio::{OpusDecoder, SurroundDecoder, SurroundLayout};
 use gsa_core::Result;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -28,9 +28,31 @@ pub const AUDIO_PARITY: u8 = 127;
 /// never sent.
 const MAX_CONCEAL: u16 = 5;
 
+/// Stereo or a host-declared surround layout — one decode path either way.
+enum Decode {
+    Stereo(OpusDecoder),
+    Surround(SurroundDecoder),
+}
+
+impl Decode {
+    fn decode(&mut self, opus: &[u8]) -> gsa_core::Result<Vec<i16>> {
+        match self {
+            Self::Stereo(d) => d.decode(opus),
+            Self::Surround(d) => d.decode(opus),
+        }
+    }
+
+    fn conceal(&mut self) -> gsa_core::Result<Vec<i16>> {
+        match self {
+            Self::Stereo(d) => d.conceal(),
+            Self::Surround(d) => d.conceal(),
+        }
+    }
+}
+
 /// Decodes the audio stream into interleaved PCM for the embedder to play.
 pub struct AudioReceive {
-    decoder: OpusDecoder,
+    decoder: Decode,
     last_seq: Option<u16>,
     out: Sender<Vec<i16>>,
 }
@@ -45,11 +67,17 @@ impl std::fmt::Debug for AudioReceive {
 
 impl AudioReceive {
     /// Create the receiver and the PCM channel the embedder plays from.
-    pub fn new() -> Result<(Self, Receiver<Vec<i16>>)> {
+    /// `surround` is the host's declared multistream layout, or `None` for
+    /// stereo; the PCM comes out interleaved at that channel count.
+    pub fn new(surround: Option<&SurroundLayout>) -> Result<(Self, Receiver<Vec<i16>>)> {
         let (out, rx) = channel();
+        let decoder = match surround {
+            Some(layout) => Decode::Surround(SurroundDecoder::new(layout)?),
+            None => Decode::Stereo(OpusDecoder::new()?),
+        };
         Ok((
             Self {
-                decoder: OpusDecoder::new()?,
+                decoder,
                 last_seq: None,
                 out,
             },
@@ -121,7 +149,7 @@ mod tests {
 
     #[test]
     fn decodes_a_real_opus_packet() {
-        let (mut rx, pcm) = AudioReceive::new().unwrap();
+        let (mut rx, pcm) = AudioReceive::new(None).unwrap();
         rx.handle(&packet(1, &opus_frame(), AUDIO_DATA));
         let decoded = pcm.try_recv().expect("audio decoded");
         assert!(!decoded.is_empty(), "a decoded frame must carry samples");
@@ -129,7 +157,7 @@ mod tests {
 
     #[test]
     fn conceals_a_small_gap() {
-        let (mut rx, pcm) = AudioReceive::new().unwrap();
+        let (mut rx, pcm) = AudioReceive::new(None).unwrap();
         let frame = opus_frame();
         rx.handle(&packet(1, &frame, AUDIO_DATA));
         let _ = pcm.try_recv();
@@ -141,7 +169,7 @@ mod tests {
 
     #[test]
     fn a_long_gap_resumes_rather_than_inventing_sound() {
-        let (mut rx, pcm) = AudioReceive::new().unwrap();
+        let (mut rx, pcm) = AudioReceive::new(None).unwrap();
         let frame = opus_frame();
         rx.handle(&packet(1, &frame, AUDIO_DATA));
         let _ = pcm.try_recv();
@@ -153,7 +181,7 @@ mod tests {
 
     #[test]
     fn duplicates_and_late_packets_are_dropped() {
-        let (mut rx, pcm) = AudioReceive::new().unwrap();
+        let (mut rx, pcm) = AudioReceive::new(None).unwrap();
         let frame = opus_frame();
         rx.handle(&packet(10, &frame, AUDIO_DATA));
         let _ = pcm.try_recv();
@@ -167,7 +195,7 @@ mod tests {
 
     #[test]
     fn parity_packets_are_not_fed_to_the_decoder() {
-        let (mut rx, pcm) = AudioReceive::new().unwrap();
+        let (mut rx, pcm) = AudioReceive::new(None).unwrap();
         rx.handle(&packet(1, &opus_frame(), AUDIO_PARITY));
         assert!(pcm.try_recv().is_err(), "parity is not an Opus frame");
     }

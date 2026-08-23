@@ -14,5 +14,12 @@ opusic-c = "1.6"
 bytemuck = "1"
 tracing = { workspace = true }
 
-[lints]
-workspace = true
+# Not the workspace set: one `unsafe impl Send` is needed for the libopus
+# multistream decoder, whose binding omits the declaration its stereo
+# sibling has. Everything else the workspace denies stays denied.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

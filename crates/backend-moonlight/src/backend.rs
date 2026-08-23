@@ -419,7 +419,10 @@ async fn connect(
         .map_err(|e| Error::Transport(format!("spawn control thread: {e}")))?;
 
     let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (audio_rx, audio_pcm) = crate::AudioReceive::new()?;
+    if let Some(layout) = &negotiated.surround {
+        tracing::info!(?layout, "surround audio negotiated");
+    }
+    let (audio_rx, audio_pcm) = crate::AudioReceive::new(negotiated.surround.as_ref())?;
     let recovery = std::sync::Arc::new(MoonlightRecovery {
         commands: std::sync::Mutex::new(command_tx.clone()),
         // Off unless explicitly requested: it makes recovery from loss worse

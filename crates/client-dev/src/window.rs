@@ -268,12 +268,15 @@ pub fn run_moonlight(
     chase_refresh: bool,
     fullscreen: bool,
     disconnect_on_exit: bool,
+    channels: u8,
+    dump_audio: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let offered = crate::decoder::offered_codecs(codecs, force_sw);
     let mut mode = parse_mode(mode, host_mode_change)?;
     // A request, not a guarantee: what actually arrives is reported per
     // session, since a host may answer in SDR without saying so.
     mode.hdr = hdr;
+    mode.channels = channels;
     tracing::info!(hdr, "HDR requested");
     let vsync = present_mode != "nosync";
     tracing::info!(vsync, "presentation mode");
@@ -317,6 +320,7 @@ pub fn run_moonlight(
                     input_script,
                     dejitter,
                     disconnect_on_exit,
+                    dump_audio,
                 },
                 &proxy,
             )
@@ -608,6 +612,8 @@ struct MoonlightRun {
     /// Leave the host's app running on exit instead of quitting it; the next
     /// run of the same app rejoins it mid-session.
     disconnect_on_exit: bool,
+    /// Write each decoded audio channel to its own WAV here.
+    dump_audio: Option<std::path::PathBuf>,
 }
 
 fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLoopProxy<AppEvent>) {
@@ -627,6 +633,7 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
         input_script,
         dejitter,
         disconnect_on_exit,
+        dump_audio,
     } = run;
     let outcome = (|| -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -673,12 +680,41 @@ fn moonlight_loop(addr: std::net::SocketAddr, run: MoonlightRun, proxy: &EventLo
                 .store(dejitter, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(dejitter, "de-jitter");
 
-            // Play whatever audio arrives. The host may send none — that is a
-            // host-side condition, not a client failure — so video continues
-            // regardless.
-            let _audio = crate::audio_playback::start(stream.audio_channel())
-                .inspect_err(|e| tracing::warn!(error = %e, "audio playback unavailable"))
-                .ok();
+            // Play whatever audio arrives — stereo only. A surround probe
+            // never reaches the speakers: the playback path assumes two
+            // channels, and an experimental layout put through it is violent
+            // noise. More than stereo goes to the WAV dump or nowhere.
+            let audio_rx = stream.audio_channel();
+            let _audio = if mode.channels > 2 {
+                tracing::info!(channels = mode.channels, "surround probe: playback muted");
+                let dump_dir = dump_audio.clone();
+                let channel_count = usize::from(mode.channels);
+                std::thread::Builder::new()
+                    .name("gsa-audio-dump".into())
+                    .spawn(move || {
+                        let mut dump = dump_dir.and_then(|dir| {
+                            crate::audio_dump::WavDump::new(&dir, channel_count)
+                                .inspect_err(
+                                    |e| tracing::warn!(error = %e, "audio dump unavailable"),
+                                )
+                                .ok()
+                        });
+                        while let Ok(pcm) = audio_rx.recv() {
+                            if let Some(dump) = &mut dump
+                                && let Err(e) = dump.push(&pcm)
+                            {
+                                tracing::warn!(error = %e, "audio dump write failed");
+                                return;
+                            }
+                        }
+                    })
+                    .ok();
+                None
+            } else {
+                crate::audio_playback::start(audio_rx)
+                    .inspect_err(|e| tracing::warn!(error = %e, "audio playback unavailable"))
+                    .ok()
+            };
 
             // Input goes over the same control channel; the host exposes no
             // live quality knobs, so none are offered rather than shown and
