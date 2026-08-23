@@ -169,6 +169,20 @@ impl GcCapture {
                 "controller opened through the platform framework"
             );
             let motors = crate::haptics::Rumble::new(&controller);
+            // A DualSense nobody has programmed pulses its connection blue
+            // forever; a claimed pad has to be given a colour to settle it.
+            // (120, 120, 239) is the value moonlight-vplus's DualSense driver
+            // writes at init, and host colours overwrite it as they arrive.
+            if let Some(light) = controller.light() {
+                use objc2::AllocAnyThread;
+                let colour = objc2_game_controller::GCColor::initWithRed_green_blue(
+                    objc2_game_controller::GCColor::alloc(),
+                    120.0 / 255.0,
+                    120.0 / 255.0,
+                    239.0 / 255.0,
+                );
+                light.setColor(&colour);
+            }
             Some(Self {
                 controller,
                 pad,
