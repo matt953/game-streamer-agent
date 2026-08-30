@@ -63,16 +63,19 @@ async fn main() {
 
     let mut rtsp = gsa_backend_moonlight::Rtsp::new(&launched.rtsp_url).expect("rtsp");
     let negotiated = rtsp
-        .negotiate(gsa_backend_moonlight::StreamRequest {
-            hdr: false,
-            width: mode.width,
-            height: mode.height,
-            fps: mode.fps,
-            bitstream_format: 0,
-            bitrate_kbps: 10_000,
-            packet_size: 1392,
-            channels: 2,
-        })
+        .negotiate(
+            gsa_backend_moonlight::StreamRequest {
+                hdr: false,
+                width: mode.width,
+                height: mode.height,
+                fps: mode.fps,
+                bitstream_format: 0,
+                bitrate_kbps: 10_000,
+                packet_size: 1392,
+                channels: 2,
+            },
+            true,
+        )
         .await
         .expect("negotiate");
     println!(
@@ -86,8 +89,14 @@ async fn main() {
     let control_addr = std::net::SocketAddr::new(addr.ip(), negotiated.control_port);
     let connect_data = negotiated.connect_data.unwrap_or(0);
     let control = std::thread::spawn(move || {
-        let _ =
-            gsa_backend_moonlight::run_control(control_addr, connect_data, crypto, cmd_rx, evt_tx);
+        let _ = gsa_backend_moonlight::run_control(
+            control_addr,
+            connect_data,
+            true,
+            crypto,
+            cmd_rx,
+            evt_tx,
+        );
     });
 
     let mut media = gsa_backend_moonlight::MediaSocket::bind(

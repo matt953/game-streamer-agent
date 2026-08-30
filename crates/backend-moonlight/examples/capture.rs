@@ -77,16 +77,19 @@ async fn capture(
 ) -> gsa_core::Result<()> {
     let mut rtsp = gsa_backend_moonlight::Rtsp::new(&launched.rtsp_url)?;
     let negotiated = rtsp
-        .negotiate(gsa_backend_moonlight::StreamRequest {
-            hdr: false,
-            width: mode.width,
-            height: mode.height,
-            fps: mode.fps,
-            bitstream_format: 0,
-            bitrate_kbps: 10_000,
-            packet_size: 1392,
-            channels: 2,
-        })
+        .negotiate(
+            gsa_backend_moonlight::StreamRequest {
+                hdr: false,
+                width: mode.width,
+                height: mode.height,
+                fps: mode.fps,
+                bitstream_format: 0,
+                bitrate_kbps: 10_000,
+                packet_size: 1392,
+                channels: 2,
+            },
+            true,
+        )
         .await?;
     println!("negotiated video port {}", negotiated.video_port);
     println!(
@@ -102,7 +105,7 @@ async fn capture(
     let crypto = gsa_backend_moonlight::Crypto::new(launched.riaes_key, negotiated.control_v2());
     let connect_data = negotiated.connect_data.unwrap_or(0);
     let control = std::thread::spawn(move || {
-        gsa_backend_moonlight::run_control(control_addr, connect_data, crypto, cmd_rx, evt_tx)
+        gsa_backend_moonlight::run_control(control_addr, connect_data, true, crypto, cmd_rx, evt_tx)
     });
 
     let video_addr = std::net::SocketAddr::new(addr.ip(), negotiated.video_port);

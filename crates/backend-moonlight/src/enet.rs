@@ -339,6 +339,9 @@ pub enum Delivery {
 pub fn run(
     addr: std::net::SocketAddr,
     connect_data: u32,
+    // True for hosts on the encrypted-control generation (app version 7.1.431
+    // or newer), which open a session differently; see the start pair below.
+    modern_start: bool,
     mut crypto: Crypto,
     commands: std::sync::mpsc::Receiver<Command>,
     events: std::sync::mpsc::Sender<HostMessage>,
@@ -396,7 +399,16 @@ pub fn run(
         {
             match event {
                 enet::Event::Connect { .. } => {
-                    tracing::info!("control channel connected");
+                    // ENet grants the lesser of what we ask for and what the
+                    // host allows, and a send above that count fails locally
+                    // rather than on the wire — so the granted count decides
+                    // whether input can leave at all.
+                    let granted = host
+                        .connected_peers()
+                        .map(rusty_enet::Peer::channel_count)
+                        .max()
+                        .unwrap_or(0);
+                    tracing::info!(requested = CHANNELS, granted, "control channel connected");
                     connected = true;
                     let _ = events.send(HostMessage::Connected);
                 }
@@ -453,17 +465,31 @@ pub fn run(
         if connected && !started {
             // Media does not start until both of these are sent; pinging the
             // media ports alone leaves some hosts silent.
+            //
+            // The pair is generation-specific. On the encrypted-control
+            // generation the first message is a keyframe request (0x0302 with
+            // a two-byte body) — that generation has no Start A at all — and
+            // Start B carries a single zero. Older hosts take Start A (0x0305)
+            // with an empty body and a three-byte Start B. A host built to the
+            // current reference has no reason to recognise the older pair, and
+            // rejecting it costs the whole session's input while video still
+            // flows.
+            let (first, first_body, start_b_body): (u16, &[u8], &[u8]) = if modern_start {
+                (msg::IDR_FRAME, &[0, 0], &[0])
+            } else {
+                (msg::START_A, &[], &[1, 0, 0])
+            };
             send(
                 &mut host,
                 &mut crypto,
-                &message(msg::START_A, &[]),
+                &message(first, first_body),
                 Delivery::Reliable,
                 channel::GENERIC,
             )?;
             send(
                 &mut host,
                 &mut crypto,
-                &message(msg::START_B, &[1, 0, 0]),
+                &message(msg::START_B, start_b_body),
                 Delivery::Reliable,
                 channel::GENERIC,
             )?;
@@ -592,6 +618,26 @@ fn send<S: enet::Socket>(
         Delivery::Reliable => enet::Packet::reliable(frame.as_slice()),
         Delivery::Unreliable => enet::Packet::unreliable(frame.as_slice()),
     };
+    // Say what actually leaves, once per message type. Without it a session
+    // where the host ignores us is indistinguishable from one where the client
+    // never sent anything — the question that costs the most time to answer.
+    {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
+        if let Ok(mut seen) = SEEN.lock() {
+            let seen = seen.get_or_insert_with(std::collections::HashSet::new);
+            if let Some(kind) = message_type(plaintext)
+                && seen.insert(kind)
+            {
+                tracing::info!(
+                    kind = format!("{kind:#06x}"),
+                    channel,
+                    bytes = plaintext.len(),
+                    "control message sent for the first time"
+                );
+            }
+        }
+    }
     let mut sent = false;
     for peer in host.connected_peers_mut() {
         match peer.send(channel, &packet) {

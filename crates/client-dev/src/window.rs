@@ -1328,6 +1328,10 @@ struct App {
     emitted_mbps: Option<f64>,
     /// Whether server-side ABR is on (toggled with `\`).
     abr_on: bool,
+    /// One line each the first time a pointer path produces anything, so a
+    /// dead mouse can be told apart from a mouse we never captured.
+    reported_raw_mouse: bool,
+    reported_cursor: bool,
     /// Depth and range as the decoder reports them, for the title HUD.
     video_format: Option<gsa_client_core::VideoFormat>,
 }
@@ -1820,6 +1824,31 @@ impl ApplicationHandler<AppEvent> for App {
         }
     }
 
+    /// Raw pointer motion, straight from the device.
+    ///
+    /// Separate from `CursorMoved`, which reports where the system cursor
+    /// landed inside this window: a full-screen game reads the device and
+    /// never sees an absolute reposition, so without this the mouse looks dead
+    /// in every game while working on a desktop.
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if !self.reported_raw_mouse {
+                self.reported_raw_mouse = true;
+                tracing::info!(dx, dy, "raw mouse motion reaching the client");
+            }
+            if let Some(input) = &self.input {
+                input.send(vec![crate::input_capture::mouse_move_rel(
+                    dx as f32, dy as f32,
+                )]);
+            }
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -1982,6 +2011,10 @@ impl ApplicationHandler<AppEvent> for App {
                     let nx = (position.x as f32 - rx) / rw;
                     let ny = (position.y as f32 - ry) / rh;
                     if (0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny) {
+                        if !self.reported_cursor {
+                            self.reported_cursor = true;
+                            tracing::info!(nx, ny, "cursor motion over the video");
+                        }
                         input.send(vec![crate::input_capture::mouse_move_abs(nx, ny)]);
                     }
                 }

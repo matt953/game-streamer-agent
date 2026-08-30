@@ -170,7 +170,21 @@ impl Rtsp {
     }
 
     /// Run the whole handshake and start the streams.
-    pub async fn negotiate(&mut self, want: StreamRequest) -> Result<Negotiated> {
+    pub async fn negotiate(
+        &mut self,
+        want: StreamRequest,
+        modern_control: bool,
+    ) -> Result<Negotiated> {
+        // The control stream's id is generation-specific, and both SETUP and
+        // ANNOUNCE must name the same one. A host that binds its control
+        // session to the id it was set up under will not find a session
+        // announced against a different one — and says nothing about it, so
+        // media flows while every control message lands nowhere.
+        let control_stream = if modern_control {
+            "streamid=control/13/0"
+        } else {
+            "streamid=control/1/0"
+        };
         self.request(
             "OPTIONS",
             &format!("rtsp://{}", self.host_header),
@@ -230,16 +244,11 @@ impl Rtsp {
             )
             .await?;
         let control = self
-            .request(
-                "SETUP",
-                "streamid=control/0/0",
-                &[("Transport", transport)],
-                None,
-            )
+            .request("SETUP", control_stream, &[("Transport", transport)], None)
             .await?;
 
         let sdp = announce_sdp(&self.host_header, want, &host_sdp);
-        self.request("ANNOUNCE", "streamid=control/13/0", &[], Some(&sdp))
+        self.request("ANNOUNCE", control_stream, &[], Some(&sdp))
             .await?;
         self.request("PLAY", "/", &[], None).await?;
 
@@ -339,10 +348,23 @@ fn sdp_int(sdp: &str, name: &str) -> Option<u32> {
 /// Build the SDP that tells the host what to encode.
 fn announce_sdp(host: &str, want: StreamRequest, host_sdp: &str) -> String {
     let ip = host.split(':').next().unwrap_or("0.0.0.0");
-    // Enable only the intersection of supported and requested: a mode the host
-    // does not implement kills the session at the first packet.
-    let encryption = sdp_int(host_sdp, "x-ss-general.encryptionSupported").unwrap_or(0)
-        & sdp_int(host_sdp, "x-ss-general.encryptionRequested").unwrap_or(0);
+    // What we announce here is a promise about how we will then behave, and
+    // the control channel reads the *same* attribute to decide whether to
+    // encrypt. Deriving the two from different inputs is how a client ends up
+    // announcing a plaintext session and then sending ciphertext: the host
+    // believes the announcement, reads garbage, and drops every control
+    // message without a word while video and audio carry on.
+    //
+    // So: everything the host says it supports is enabled. A host that also
+    // asks for a subset via `encryptionRequested` gets that honoured, but its
+    // absence means "no preference", not "none" — the reading that caused
+    // exactly the failure above against a host that supports encryption and
+    // never mentions requesting it.
+    let supported = sdp_int(host_sdp, "x-ss-general.encryptionSupported").unwrap_or(0);
+    let encryption = match sdp_int(host_sdp, "x-ss-general.encryptionRequested") {
+        Some(requested) => supported & requested,
+        None => supported,
+    };
     let mask: u32 = match want.channels {
         6 => 0x3f,
         8 => 0x63f,

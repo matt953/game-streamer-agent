@@ -276,19 +276,22 @@ pub async fn start(
     // Read over mutual TLS: the cleartext probe understates what a host can
     // encode, so negotiating from it would settle for H.264 against a host
     // that offers better.
-    let (host_codecs, running) = match session.server_info().await {
+    let (host_codecs, running, app_version) = match session.server_info().await {
         Ok(info) => (
             codec::HostCodecs {
                 modes: info.codec_mode_support,
                 max_luma_hevc: info.max_luma_pixels_hevc,
             },
             info.current_game,
+            info.app_version,
         ),
         Err(e) => {
             tracing::debug!(error = %e, "could not read host capabilities; assuming H.264 and idle");
-            (codec::HostCodecs::default(), 0)
+            (codec::HostCodecs::default(), 0, String::new())
         }
     };
+    // Which generation's session-start pair this host expects.
+    let modern_start = app_version_at_least(&app_version, 7, 1, 431);
     let chosen = codec::choose(host_codecs, decode_codecs);
 
     for (attempt, settle) in SETTLE.iter().enumerate() {
@@ -304,8 +307,16 @@ pub async fn start(
             let _ = session.cancel().await;
             (session.launch(app_id, mode).await?, SessionOrigin::Launched)
         };
-        let mut stream =
-            connect(&launched, host_ip, mode, bitrate_kbps, chosen, host_codecs).await?;
+        let mut stream = connect(
+            &launched,
+            host_ip,
+            mode,
+            bitrate_kbps,
+            chosen,
+            host_codecs,
+            modern_start,
+        )
+        .await?;
         stream.origin = origin;
         if stream.wait_for_media(FIRST_MEDIA_TIMEOUT).await {
             if attempt > 0 {
@@ -350,6 +361,7 @@ async fn connect(
     bitrate_kbps: u32,
     codec: Codec,
     host_codecs: codec::HostCodecs,
+    modern_start: bool,
 ) -> Result<MoonlightStream> {
     // An HDR session is a request for a 10-bit profile, which is advertised
     // separately from the codec itself. The request still goes out — hosts
@@ -381,16 +393,19 @@ async fn connect(
 
     let mut rtsp = Rtsp::new(&launched.rtsp_url)?;
     let negotiated = rtsp
-        .negotiate(StreamRequest {
-            width,
-            height,
-            fps: mode.fps,
-            bitstream_format: codec::bitstream_format(codec),
-            hdr: mode.hdr,
-            bitrate_kbps,
-            packet_size: 1392,
-            channels: mode.channels,
-        })
+        .negotiate(
+            StreamRequest {
+                width,
+                height,
+                fps: mode.fps,
+                bitstream_format: codec::bitstream_format(codec),
+                hdr: mode.hdr,
+                bitrate_kbps,
+                packet_size: 1392,
+                channels: mode.channels,
+            },
+            modern_start,
+        )
         .await?;
 
     tracing::info!(
@@ -403,6 +418,20 @@ async fn connect(
     );
     let (command_tx, command_rx) = std::sync::mpsc::channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
+    // Say which scheme this session sealed with, and on whose word. Picking
+    // wrong is invisible from here — the host drops what it cannot verify
+    // without answering — so a session where nothing we send has any effect
+    // looks identical to a host ignoring us. A host that supports the modern
+    // scheme but does not advertise it reads here as an ancient one.
+    tracing::info!(
+        scheme = if negotiated.control_v2() {
+            "v2"
+        } else {
+            "legacy"
+        },
+        encryption_supported = format!("{:#x}", negotiated.encryption_supported),
+        "control encryption chosen from the host's advertisement"
+    );
     let crypto = Crypto::new(launched.riaes_key, negotiated.control_v2());
     let control_addr = std::net::SocketAddr::new(host_ip, negotiated.control_port);
     let connect_data = negotiated.connect_data.unwrap_or(0);
@@ -413,6 +442,7 @@ async fn connect(
             if let Err(e) = crate::run_control(
                 control_addr,
                 connect_data,
+                modern_start,
                 crypto,
                 control_commands,
                 event_tx,
@@ -656,5 +686,37 @@ fn receive_media(
                 Received::Nothing => {}
             }
         }
+    }
+}
+
+/// Whether a host's `appversion` quad is at least `major.minor.build`.
+///
+/// The reference client gates its session-start pair and its control-stream
+/// encryption on exactly this comparison, so the same reading has to happen
+/// here: a host one build older expects a different opening exchange.
+/// Unparseable versions read as older, which is the safe direction — the older
+/// pair is what every host understood before the newer one existed.
+fn app_version_at_least(version: &str, major: u32, minor: u32, build: u32) -> bool {
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let quad = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    quad >= (major, minor, build)
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn the_start_pair_follows_the_hosts_generation() {
+        // The build this host reports is the exact boundary the reference
+        // client uses, so it is the case worth pinning.
+        assert!(super::app_version_at_least("7.1.431.-1", 7, 1, 431));
+        assert!(super::app_version_at_least("7.1.432.0", 7, 1, 431));
+        assert!(!super::app_version_at_least("7.1.430.0", 7, 1, 431));
+        assert!(!super::app_version_at_least("7.0.999.0", 7, 1, 431));
+        // A host that says nothing readable is treated as older.
+        assert!(!super::app_version_at_least("", 7, 1, 431));
     }
 }

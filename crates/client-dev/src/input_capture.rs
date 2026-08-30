@@ -48,6 +48,17 @@ pub fn mouse_button(button: WMouseButton, state: ElementState) -> Option<InputEv
 }
 
 /// Absolute cursor move, normalized to [0,1] over the presented content rect.
+/// Raw pointer motion, which is what a game reads: a full-screen game watches
+/// the device rather than the system cursor, so an absolute reposition alone
+/// is invisible to it.
+pub fn mouse_move_rel(dx: f32, dy: f32) -> InputEvent {
+    InputEvent::MouseMove(MouseMove::Relative {
+        dx,
+        dy,
+        ts_us: now_us(),
+    })
+}
+
 pub fn mouse_move_abs(x: f32, y: f32) -> InputEvent {
     InputEvent::MouseMove(MouseMove::Absolute {
         x: x.clamp(0.0, 1.0),

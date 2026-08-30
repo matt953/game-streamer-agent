@@ -82,7 +82,7 @@ async fn main() {
                 packet_size: 1392,
                 channels: mode.channels,
             };
-            match rtsp.negotiate(want).await {
+            match rtsp.negotiate(want, true).await {
                 Ok(n) => {
                     println!("  negotiated:");
                     println!("    video port:   {}", n.video_port);
@@ -113,6 +113,7 @@ async fn main() {
                         gsa_backend_moonlight::run_control(
                             control_addr,
                             n.connect_data.unwrap_or(0),
+                            true,
                             crypto,
                             cmd_rx,
                             evt_tx,
