@@ -98,9 +98,19 @@ impl Rumble {
         if low.is_none() && high.is_none() {
             return None;
         }
+        // Which actuators the platform will address by name: this is what
+        // decides whether a pad can be driven per-grip and per-trigger, or
+        // only as one lump. It differs by pad *and* by how it is attached.
+        // SAFETY: property read on a live framework object.
+        let localities = unsafe { haptics.supportedLocalities() }
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         tracing::info!(
             low = low.is_some(),
             high = high.is_some(),
+            localities = %localities,
             "controller motors opened"
         );
         Some(Self { low, high })

@@ -97,14 +97,47 @@ const PAD_MID: u16 = 0x0014;
 const PAD_TAIL_A: u16 = 0x009c;
 const PAD_TAIL_B: u16 = 0x0055;
 
-/// One encoded message and how it should ride the control channel.
+/// ENet channels the control stream is demultiplexed by.
 ///
-/// Delivery is a property of the message, not of the caller: only the encoder
-/// knows that a motion sample supersedes itself while a button edge does not.
+/// **Every input class rides its own channel**, and a seated device rides one
+/// per seat. Reference clients do this, so a host is entitled to route on the
+/// channel alone and never look at the message type — send a mouse event on
+/// the generic channel and such a host simply never sees a mouse, with no
+/// error anywhere. Hosts that route by message type accept either, which is
+/// what makes the mistake survivable right up until it isn't.
+// The whole map is recorded even where a class has no encoder yet: a partial
+// map is how a later class ends up on a neighbouring channel.
+#[allow(dead_code)]
+pub mod channel {
+    /// Session upkeep: start, ping, loss stats.
+    pub const GENERIC: u8 = 0x00;
+    /// Recovery that must not queue behind input: keyframe and reference
+    /// invalidation requests.
+    pub const URGENT: u8 = 0x01;
+    pub const KEYBOARD: u8 = 0x02;
+    pub const MOUSE: u8 = 0x03;
+    /// A screen or pen contact — not a controller's own touch surface, which
+    /// belongs to its seat.
+    pub const TOUCH: u8 = 0x05;
+    pub const UTF8: u8 = 0x06;
+    /// Per seat: state, arrival, battery and the pad's touch surface.
+    pub const GAMEPAD_BASE: u8 = 0x10;
+    /// Per seat: motion samples, which are voluminous enough that mixing them
+    /// with button edges would delay the edges behind them.
+    pub const SENSOR_BASE: u8 = 0x20;
+}
+
+/// One encoded message, how it should ride the control channel, and which
+/// channel it belongs on.
+///
+/// Both are properties of the message rather than of the caller: only the
+/// encoder knows that a motion sample supersedes itself while a button edge
+/// does not, or that a pad's touch belongs to its seat's channel.
 #[derive(Debug, Clone)]
 pub struct WireMessage {
     pub bytes: Vec<u8>,
     pub delivery: Delivery,
+    pub channel: u8,
 }
 
 impl WireMessage {
@@ -113,6 +146,13 @@ impl WireMessage {
     #[must_use]
     fn unreliable(mut self) -> Self {
         self.delivery = Delivery::Unreliable;
+        self
+    }
+
+    /// Put this message on the channel its class belongs to.
+    #[must_use]
+    fn on(mut self, channel: u8) -> Self {
+        self.channel = channel;
         self
     }
 }
@@ -147,16 +187,16 @@ impl InputEncoder {
                 body.extend_from_slice(&(0x8000u16 | u16::from(vk)).to_le_bytes());
                 body.push(self.modifiers);
                 body.extend_from_slice(&[0, 0]);
-                Some(input_message(
-                    if *down { kind::KEY_DOWN } else { kind::KEY_UP },
-                    &body,
-                ))
+                Some(
+                    input_message(if *down { kind::KEY_DOWN } else { kind::KEY_UP }, &body)
+                        .on(channel::KEYBOARD),
+                )
             }
             InputEvent::MouseMove(MouseMove::Relative { dx, dy, .. }) => {
                 let mut body = Vec::with_capacity(4);
                 body.extend_from_slice(&clamp_i16(*dx).to_be_bytes());
                 body.extend_from_slice(&clamp_i16(*dy).to_be_bytes());
-                Some(input_message(kind::MOUSE_MOVE_REL, &body))
+                Some(input_message(kind::MOUSE_MOVE_REL, &body).on(channel::MOUSE))
             }
             InputEvent::MouseMove(MouseMove::Absolute { x, y, .. }) => {
                 let mut body = Vec::with_capacity(10);
@@ -165,16 +205,19 @@ impl InputEncoder {
                 body.extend_from_slice(&[0, 0]);
                 body.extend_from_slice(&ABS_REFERENCE.to_be_bytes());
                 body.extend_from_slice(&ABS_REFERENCE.to_be_bytes());
-                Some(input_message(kind::MOUSE_MOVE_ABS, &body))
+                Some(input_message(kind::MOUSE_MOVE_ABS, &body).on(channel::MOUSE))
             }
-            InputEvent::MouseButton { button, down, .. } => Some(input_message(
-                if *down {
-                    kind::MOUSE_BUTTON_DOWN
-                } else {
-                    kind::MOUSE_BUTTON_UP
-                },
-                &[mouse_button(*button)],
-            )),
+            InputEvent::MouseButton { button, down, .. } => Some(
+                input_message(
+                    if *down {
+                        kind::MOUSE_BUTTON_DOWN
+                    } else {
+                        kind::MOUSE_BUTTON_UP
+                    },
+                    &[mouse_button(*button)],
+                )
+                .on(channel::MOUSE),
+            ),
             InputEvent::MouseWheel { dx, dy, .. } => {
                 // Vertical and horizontal are separate message kinds with no
                 // combined form, so a diagonal scroll sends only its vertical
@@ -186,10 +229,13 @@ impl InputEncoder {
                     // The amount appears twice; hosts read only the first.
                     body.extend_from_slice(&amount.to_be_bytes());
                     body.extend_from_slice(&[0, 0]);
-                    Some(input_message(kind::MOUSE_SCROLL, &body))
+                    Some(input_message(kind::MOUSE_SCROLL, &body).on(channel::MOUSE))
                 } else if *dx != 0.0 {
                     let amount = clamp_i16(*dx * WHEEL_DETENT);
-                    Some(input_message(kind::MOUSE_HSCROLL, &amount.to_be_bytes()))
+                    Some(
+                        input_message(kind::MOUSE_HSCROLL, &amount.to_be_bytes())
+                            .on(channel::MOUSE),
+                    )
                 } else {
                     None
                 }
@@ -255,7 +301,7 @@ impl InputEncoder {
         // Which buttons the pad physically has. Advertising the standard set
         // is honest for every pad we support and costs nothing.
         body.extend_from_slice(&gsa_protocol::input::gamepad::XINPUT_MASK.to_le_bytes());
-        input_message(kind::CONTROLLER_ARRIVAL, &body)
+        input_message(kind::CONTROLLER_ARRIVAL, &body).on(channel::GAMEPAD_BASE + seat)
     }
 
     /// A motion sample for one sensor. Send only after the host asks.
@@ -319,7 +365,9 @@ fn motion_message(seat: u8, discriminator: u8, values: [f32; 3]) -> WireMessage 
     }
     // Motion supersedes itself many times a second; retransmitting a stale
     // sample would delay live input behind it for nothing.
-    input_message(kind::CONTROLLER_MOTION, &body).unreliable()
+    input_message(kind::CONTROLLER_MOTION, &body)
+        .unreliable()
+        .on(channel::SENSOR_BASE + seat)
 }
 
 /// Touchpad body: seat, event, two reserved bytes, pointer id, then x, y and
@@ -359,7 +407,7 @@ fn touch_message(
     for value in [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0), pressure] {
         body.extend_from_slice(&value.to_le_bytes());
     }
-    Some(input_message(kind::CONTROLLER_TOUCH, &body))
+    Some(input_message(kind::CONTROLLER_TOUCH, &body).on(channel::GAMEPAD_BASE + seat))
 }
 
 /// Battery body: seat, state, percentage, one reserved byte.
@@ -377,7 +425,7 @@ fn battery_message(seat: u8, state: BatteryState, percent: Option<u8>) -> WireMe
         percent.map_or(BATTERY_PERCENT_UNKNOWN, |p| p.min(100)),
         0,
     ];
-    input_message(kind::CONTROLLER_BATTERY, &body)
+    input_message(kind::CONTROLLER_BATTERY, &body).on(channel::GAMEPAD_BASE + seat)
 }
 
 impl InputEncoder {
@@ -406,7 +454,7 @@ impl InputEncoder {
         // its high 16 bits for exactly these, so they pass through unchanged.
         body.extend_from_slice(&((pad.buttons >> 16) as u16).to_le_bytes());
         body.extend_from_slice(&PAD_TAIL_B.to_le_bytes());
-        input_message(kind::CONTROLLER_MULTI, &body)
+        input_message(kind::CONTROLLER_MULTI, &body).on(channel::GAMEPAD_BASE + pad.seat)
     }
 
     /// Update the modifier byte. It is stamped on every key event while a
@@ -443,6 +491,8 @@ fn input_message(input_type: u32, body: &[u8]) -> WireMessage {
         // Reliable unless a caller downgrades it: losing an edge event leaves
         // the host holding a key or a button that the user released.
         delivery: Delivery::Reliable,
+        // Overridden per class by the caller, which knows the seat.
+        channel: channel::GENERIC,
     }
 }
 
@@ -716,6 +766,40 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[test]
+    fn every_input_class_rides_its_own_channel() {
+        // A host may route on the channel alone and never read the message
+        // type, so putting a class on the wrong one loses it silently. Seated
+        // devices are per seat, which is what lets a host keep two pads apart
+        // without parsing anything.
+        use gsa_client_backend_api::{GamepadProfile, MotionSensor, PadCaps, PadKind};
+
+        let mut encoder = super::InputEncoder::new();
+        let mouse = encoder
+            .encode(&InputEvent::MouseMove(MouseMove::Relative {
+                dx: 4.0,
+                dy: -2.0,
+                ts_us: 0,
+            }))
+            .expect("mouse move encodes");
+        assert_eq!(mouse.channel, super::channel::MOUSE);
+
+        let key = encoder
+            .encode(&InputEvent::Key {
+                usage: 0x0004,
+                down: true,
+                ts_us: 0,
+            })
+            .expect("key encodes");
+        assert_eq!(key.channel, super::channel::KEYBOARD);
+
+        let arrival = encoder.arrival_message(2, GamepadProfile::new(PadKind::Xbox, PadCaps::NONE));
+        assert_eq!(arrival.channel, super::channel::GAMEPAD_BASE + 2);
+
+        let motion = encoder.motion_message(1, MotionSensor::Gyro, [0.0, 0.0, 0.0]);
+        assert_eq!(motion.channel, super::channel::SENSOR_BASE + 1);
     }
 
     #[test]

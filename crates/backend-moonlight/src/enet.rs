@@ -1,14 +1,20 @@
 //! Driving the control channel's ENet connection.
 //!
-//! Hosts run a fork of ENet whose changes are local behaviour only — timers,
-//! IPv6 addressing, a lower default MTU. Its wire structures are byte-identical
-//! to upstream, so a stock Rust ENet interoperates. The MTU is negotiated down
-//! to whatever the host proposes; do not assume 1392.
+//! Hosts run a fork of ENet. Its wire structures are byte-identical to
+//! upstream and its other changes are local behaviour — timers, IPv6
+//! addressing, a lower default MTU (negotiated down to whatever the host
+//! proposes; do not assume 1392).
+//!
+//! One fork change is *not* local, and a stock ENet does not interoperate
+//! without matching it: the fork drops upstream's check that a datagram's
+//! source address equals the peer's, identifying the peer by the header's ids
+//! instead. See [`PeerAddr`] for why that matters and what it costs.
 //!
 //! ENet is poll-driven rather than async, so this runs on its own thread and
 //! talks to the rest of the client over channels.
 
 use crate::control::{Crypto, message, message_type, msg};
+use crate::input::channel;
 use gsa_core::{Error, Result};
 use rusty_enet as enet;
 
@@ -38,6 +44,92 @@ const MAX_PENDING_BEFORE_START: usize = 256;
 /// Channel count to request. Reference clients open this many and place some
 /// controller streams on the higher channels.
 const CHANNELS: usize = 48;
+
+/// The host's address, compared the way this protocol needs rather than the
+/// way ENet compares addresses by default.
+///
+/// **A datagram is matched to the peer by the ENet header's peer and session
+/// ids, not by where it came from.** Upstream ENet also requires the source
+/// address to equal the one dialled; reference clients bundle a fork with that
+/// comparison commented out, so a host answering from a *different* local
+/// address than the one it was reached on is ordinary here. A machine with two
+/// interfaces on one subnet, a NAT that remaps, a VPN — the reply arrives from
+/// an address the client never dialled, upstream ENet discards it, and the
+/// channel simply never connects while video and audio flow normally. That
+/// failure is silent and looks like the host ignoring us.
+///
+/// Accepting any source costs little: the peer and session ids must still
+/// match, the payloads are authenticated by the session key, and the host is
+/// free to move — ENet re-points the peer at whatever address answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PeerAddr(std::net::SocketAddr);
+
+impl enet::Address for PeerAddr {
+    fn same_host(&self, _other: &Self) -> bool {
+        true
+    }
+
+    fn same(&self, _other: &Self) -> bool {
+        true
+    }
+
+    fn is_broadcast(&self) -> bool {
+        false
+    }
+}
+
+/// The control channel's socket, wrapping the standard one so the address type
+/// above is the one ENet compares. Behaviour is otherwise the crate's own.
+struct ControlSocket {
+    socket: std::net::UdpSocket,
+    /// Where the host was dialled, so an answer from anywhere else is worth
+    /// one line: it is legal, and it is also the first thing to know when a
+    /// host behaves unexpectedly.
+    dialled: std::net::SocketAddr,
+    reported_elsewhere: bool,
+}
+
+impl enet::Socket for ControlSocket {
+    type Address = PeerAddr;
+    type Error = std::io::Error;
+
+    fn init(&mut self, _options: enet::SocketOptions) -> std::io::Result<()> {
+        self.socket.set_nonblocking(true)?;
+        self.socket.set_broadcast(true)?;
+        Ok(())
+    }
+
+    fn send(&mut self, address: PeerAddr, buffer: &[u8]) -> std::io::Result<usize> {
+        match self.socket.send_to(buffer, address.0) {
+            Ok(sent) => Ok(sent),
+            // A full send buffer is back-pressure, not a failure: ENet
+            // retransmits what it must.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn receive(
+        &mut self,
+        buffer: &mut [u8; enet::MTU_MAX],
+    ) -> std::io::Result<Option<(PeerAddr, enet::PacketReceived)>> {
+        match self.socket.recv_from(buffer) {
+            Ok((len, from)) => {
+                if from != self.dialled && !self.reported_elsewhere {
+                    self.reported_elsewhere = true;
+                    tracing::info!(
+                        dialled = %self.dialled,
+                        answered = %from,
+                        "host answers the control channel from another address"
+                    );
+                }
+                Ok(Some((PeerAddr(from), enet::PacketReceived::Complete(len))))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
 
 /// Something the host told us over the control channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +313,9 @@ pub enum Command {
     Input {
         bytes: Vec<u8>,
         delivery: Delivery,
+        /// Which control channel this class of input belongs on. See
+        /// [`crate::input::channel`]: a host may route on this alone.
+        channel: u8,
     },
     Stop,
 }
@@ -262,7 +357,11 @@ pub fn run(
     }
     // `Host::new` initialises the socket (non-blocking, broadcast) itself.
     let mut host = enet::Host::new(
-        socket,
+        ControlSocket {
+            socket,
+            dialled: addr,
+            reported_elsewhere: false,
+        },
         enet::HostSettings {
             peer_limit: 1,
             channel_limit: CHANNELS,
@@ -273,13 +372,13 @@ pub fn run(
 
     // The connect data binds this ENet peer to the RTSP session; the host does
     // not identify the peer by source address.
-    host.connect(addr, CHANNELS, connect_data)
+    host.connect(PeerAddr(addr), CHANNELS, connect_data)
         .map_err(|_| Error::Transport("no ENet peer slot".into()))?;
 
     let mut connected = false;
     let mut started = false;
     // Messages held while the channel comes up.
-    let mut pending: Vec<(Vec<u8>, Delivery)> = Vec::new();
+    let mut pending: Vec<(Vec<u8>, Delivery, u8)> = Vec::new();
     // Kinds already reported, so an unparsed message is logged once loudly
     // rather than every time it arrives.
     let mut seen_kinds = std::collections::HashSet::new();
@@ -359,12 +458,14 @@ pub fn run(
                 &mut crypto,
                 &message(msg::START_A, &[]),
                 Delivery::Reliable,
+                channel::GENERIC,
             )?;
             send(
                 &mut host,
                 &mut crypto,
                 &message(msg::START_B, &[1, 0, 0]),
                 Delivery::Reliable,
+                channel::GENERIC,
             )?;
             started = true;
         }
@@ -380,8 +481,8 @@ pub fn run(
         // announces its controller the moment the session starts would
         // otherwise vanish with nothing to show for it.
         if started {
-            for (plaintext, delivery) in std::mem::take(&mut pending) {
-                send(&mut host, &mut crypto, &plaintext, delivery)?;
+            for (plaintext, delivery, channel) in std::mem::take(&mut pending) {
+                send(&mut host, &mut crypto, &plaintext, delivery, channel)?;
             }
         }
 
@@ -400,10 +501,14 @@ pub fn run(
                     return Ok(());
                 }
                 Ok(command) => {
-                    let (plaintext, delivery) = match command {
-                        Command::RequestIdr => {
-                            (message(msg::IDR_FRAME, &[0, 0]), Delivery::Reliable)
-                        }
+                    let (plaintext, delivery, channel) = match command {
+                        // Recovery goes on the urgent channel so it is not
+                        // queued behind the input the user is still producing.
+                        Command::RequestIdr => (
+                            message(msg::IDR_FRAME, &[0, 0]),
+                            Delivery::Reliable,
+                            channel::URGENT,
+                        ),
                         Command::InvalidateReferenceFrames { first, last } => {
                             let mut payload = Vec::with_capacity(24);
                             payload.extend_from_slice(&first.to_le_bytes());
@@ -413,19 +518,24 @@ pub fn run(
                             (
                                 message(msg::INVALIDATE_REF_FRAMES, &payload),
                                 Delivery::Reliable,
+                                channel::URGENT,
                             )
                         }
-                        Command::Input { bytes, delivery } => (bytes, delivery),
+                        Command::Input {
+                            bytes,
+                            delivery,
+                            channel,
+                        } => (bytes, delivery, channel),
                         Command::Stop => unreachable!("handled above"),
                     };
                     if started {
-                        send(&mut host, &mut crypto, &plaintext, delivery)?;
+                        send(&mut host, &mut crypto, &plaintext, delivery, channel)?;
                     } else {
                         // Bounded: a host that never completes the handshake
                         // fails on the deadline below, and until then a
                         // runaway producer must not grow this without limit.
                         if pending.len() < MAX_PENDING_BEFORE_START {
-                            pending.push((plaintext, delivery));
+                            pending.push((plaintext, delivery, channel));
                         }
                     }
                 }
@@ -451,6 +561,7 @@ pub fn run(
                 &mut crypto,
                 &message(msg::PERIODIC_PING, &[4, 0, 0, 0, 0, 0, 0, 0]),
                 Delivery::Reliable,
+                channel::GENERIC,
             )?;
             last_ping = std::time::Instant::now();
         }
@@ -472,6 +583,7 @@ fn send<S: enet::Socket>(
     crypto: &mut Crypto,
     plaintext: &[u8],
     delivery: Delivery,
+    channel: u8,
 ) -> Result<()> {
     let frame = crypto.seal(plaintext)?;
     // The sequence number rides in the nonce, so a dropped unreliable message
@@ -482,7 +594,7 @@ fn send<S: enet::Socket>(
     };
     let mut sent = false;
     for peer in host.connected_peers_mut() {
-        match peer.send(0, &packet) {
+        match peer.send(channel, &packet) {
             Ok(()) => sent = true,
             // Logged, not dropped: a dead control channel is otherwise
             // indistinguishable from an idle one.

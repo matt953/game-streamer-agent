@@ -105,6 +105,7 @@ impl InputSink for MoonlightInput {
                     let _ = self.commands.send(Command::Input {
                         bytes: message.bytes,
                         delivery: message.delivery,
+                        channel: message.channel,
                     });
                 }
                 continue;
@@ -115,6 +116,7 @@ impl InputSink for MoonlightInput {
                 let _ = self.commands.send(Command::Input {
                     bytes: message.bytes,
                     delivery: message.delivery,
+                    channel: message.channel,
                 });
             }
         }
@@ -138,12 +140,14 @@ impl InputSink for MoonlightInput {
             let _ = self.commands.send(Command::Input {
                 bytes: clear.bytes,
                 delivery: clear.delivery,
+                channel: clear.channel,
             });
         }
         let message = encoder.arrival_message(seat, profile);
         let _ = self.commands.send(Command::Input {
             bytes: message.bytes,
             delivery: message.delivery,
+            channel: message.channel,
         });
     }
 }
