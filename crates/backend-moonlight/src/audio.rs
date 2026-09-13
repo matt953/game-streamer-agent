@@ -114,9 +114,10 @@ impl OpusSink for PcmSink {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-type SinkBox = Box<dyn OpusSink + Send>;
+/// A boxed Opus sink: `Send` where threads exist.
+pub type SinkBox = Box<dyn OpusSink + Send>;
 #[cfg(target_arch = "wasm32")]
-type SinkBox = Box<dyn OpusSink>;
+pub type SinkBox = Box<dyn OpusSink>;
 
 /// Strips the wire off the audio stream and keeps it in order for the sink.
 pub struct AudioReceive {

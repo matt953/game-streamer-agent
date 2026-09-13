@@ -44,11 +44,12 @@ mod rtsp;
 mod socket_links;
 #[cfg(feature = "native")]
 mod tls;
+pub mod tunnel;
 mod video;
 
 #[cfg(feature = "native")]
 pub use audio::PcmSink;
-pub use audio::{AudioReceive, OpusSink};
+pub use audio::{AudioReceive, OpusSink, SinkBox};
 #[cfg(feature = "native")]
 pub use backend::start;
 pub use backend::{MoonlightStream, start_with};
