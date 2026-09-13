@@ -46,8 +46,8 @@ pub struct StreamSession {
     /// The latency chain, stage by stage, composed the way the reference
     /// client's overlay is: durations and round trips, no clock sync.
     latency: stats::LatencyChain,
-    presented_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, std::time::Instant)>,
-    presented_tx: tokio::sync::mpsc::UnboundedSender<(u32, std::time::Instant)>,
+    presented_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, gsa_core::time::Instant)>,
+    presented_tx: tokio::sync::mpsc::UnboundedSender<(u32, gsa_core::time::Instant)>,
     /// Backend-maintained counters for frames it could not deliver whole.
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -792,7 +792,7 @@ impl StreamSession {
             self.held_frames += 1;
             #[allow(clippy::cast_possible_truncation)]
             self.latency.on_hold(wait as u32);
-            tokio::time::sleep(std::time::Duration::from_micros(wait)).await;
+            gsa_core::runtime::sleep(std::time::Duration::from_micros(wait)).await;
         }
     }
 

@@ -53,7 +53,9 @@ gsa-decode-videotoolbox = { path = "crates/decode-videotoolbox" }
 gsa-input = { path = "crates/input" }
 
 # external
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
+# Minimal on purpose: the browser build of the shared crates cannot take
+# tokio's net/time features. Native crates add what they use.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14"

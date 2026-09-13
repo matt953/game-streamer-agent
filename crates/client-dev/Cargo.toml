@@ -18,7 +18,7 @@ gsa-protocol = { workspace = true }
 gsa-client-core = { workspace = true }
 gsa-backend-moonlight = { workspace = true }
 gsa-decode-videotoolbox = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -8,17 +8,35 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "Embeddable streaming client core: connect, negotiate, reassemble, decode orchestration, stats"
 
+[features]
+default = ["quic"]
+# The native protocol's QUIC client (sockets, tokio runtime, libopus). Off
+# for the browser build, which keeps the transport-neutral engine only.
+quic = [
+    "dep:gsa-transport",
+    "dep:gsa-audio",
+    "dep:quinn",
+    "tokio/rt-multi-thread",
+    "tokio/macros",
+    "tokio/net",
+    "tokio/time",
+    "tokio/io-util",
+]
+
 [dependencies]
 gsa-core = { workspace = true }
 gsa-client-backend-api = { workspace = true }
 gsa-protocol = { workspace = true }
-gsa-transport = { workspace = true }
-gsa-audio = { workspace = true }
-quinn = { workspace = true }
-tokio = { workspace = true }
+gsa-transport = { workspace = true, optional = true }
+gsa-audio = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"] }
 bytes = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true

@@ -19,7 +19,7 @@ gsa-backend-moonlight = { workspace = true }
 gsa-core = { workspace = true }
 gsa-protocol = { workspace = true }
 gsa-transport = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

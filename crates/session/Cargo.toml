@@ -17,7 +17,7 @@ gsa-audio = { workspace = true }
 gsa-transport = { workspace = true }
 gsa-input = { workspace = true }
 quinn = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

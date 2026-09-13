@@ -13,7 +13,7 @@ gsa-core = { workspace = true }
 gsa-client-backend-api = { workspace = true }
 gsa-protocol = { workspace = true }
 gsa-audio = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 tracing = { workspace = true }
 rcgen = { workspace = true }
 roxmltree = "0.21"

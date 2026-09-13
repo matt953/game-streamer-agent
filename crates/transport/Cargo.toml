@@ -14,7 +14,7 @@ gsa-protocol = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 bytes = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
