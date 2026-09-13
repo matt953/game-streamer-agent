@@ -1,10 +1,13 @@
-//! Media clock: microsecond timestamps relative to a process-local epoch.
+//! Media clock: microsecond timestamps relative to a process-local epoch,
+//! and the portable [`Instant`] every crate should measure time with.
 //!
 //! Frames carry the *agent's* clock. Clients estimate the offset between
 //! their clock and the agent's via ping/pong (spec 04) and map timestamps
 //! into their own domain for latency accounting.
 
-use std::time::Instant;
+/// A monotonic instant that exists on every target: `std::time::Instant`
+/// natively, `performance.now()` on wasm32, where the standard one panics.
+pub use web_time::Instant;
 
 /// Process-local microsecond clock anchored at construction.
 #[derive(Debug, Clone)]

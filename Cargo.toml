@@ -71,6 +71,10 @@ winit = "0.30"
 wgpu = "30"
 pollster = "0.4"
 anyhow = "1"
+# Portable time and task primitives: the same code on native and wasm32.
+web-time = "1"
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
 
 # Apple FFI (macOS backends only)
 objc2 = "0.6"
