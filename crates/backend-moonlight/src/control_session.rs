@@ -11,6 +11,7 @@
 use crate::control::{Crypto, message, message_type, msg};
 use crate::input::channel;
 use gsa_core::Result;
+use gsa_core::runtime::MaybeSend;
 use gsa_core::time::Instant;
 
 /// Application-level keepalive period. Hosts drop a session after several
@@ -258,11 +259,12 @@ pub enum LinkEvent {
 /// [`LinkEvent::Connected`].
 pub trait ControlLink {
     /// Put one sealed frame on the wire.
-    fn send(&mut self, out: &Outgoing) -> impl std::future::Future<Output = Result<()>>;
+    fn send(&mut self, out: &Outgoing)
+    -> impl std::future::Future<Output = Result<()>> + MaybeSend;
     /// The next thing the link has to say; `None` once it is closed for good.
-    fn recv(&mut self) -> impl std::future::Future<Output = Option<LinkEvent>>;
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<LinkEvent>> + MaybeSend;
     /// Ask the peer to close, then let the link go.
-    fn close(&mut self) -> impl std::future::Future<Output = ()>;
+    fn close(&mut self) -> impl std::future::Future<Output = ()> + MaybeSend;
 }
 
 /// The protocol state of one control channel.

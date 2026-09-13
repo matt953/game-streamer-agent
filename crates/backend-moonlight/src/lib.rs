@@ -16,7 +16,6 @@
 //!
 
 mod audio;
-#[cfg(feature = "native")]
 mod backend;
 /// Codec negotiation against what a host advertises; the browser client
 /// chooses the same way from what WebCodecs can decode.
@@ -33,12 +32,16 @@ mod http;
 #[cfg(feature = "native")]
 mod identity;
 mod input;
+mod links;
 #[cfg(feature = "native")]
 mod media;
 mod media_link;
+mod mode;
 #[cfg(feature = "native")]
 mod pair;
 mod rtsp;
+#[cfg(feature = "native")]
+mod socket_links;
 #[cfg(feature = "native")]
 mod tls;
 mod video;
@@ -47,7 +50,8 @@ mod video;
 pub use audio::PcmSink;
 pub use audio::{AudioReceive, OpusSink};
 #[cfg(feature = "native")]
-pub use backend::{MoonlightStream, start};
+pub use backend::start;
+pub use backend::{MoonlightStream, start_with};
 pub use control::{Crypto, message, message_type, msg};
 pub use control_session::{
     Command, ControlLink, ControlSession, Delivery, HostMessage, LinkEvent, Outgoing, drive,
@@ -55,21 +59,25 @@ pub use control_session::{
 #[cfg(feature = "native")]
 pub use enet::{EnetLink, run_control};
 #[cfg(feature = "native")]
-pub use host::{LaunchedSession, PairedSession, StreamMode};
+pub use host::PairedSession;
 #[cfg(feature = "native")]
 pub use http::TcpRtsp;
 #[cfg(feature = "native")]
 pub use identity::ClientIdentity;
 pub use input::InputEncoder;
+pub use links::{SessionAuthority, StreamLinks};
 #[cfg(feature = "native")]
 pub use media::{MediaSocket, UdpMediaLink};
 pub use media_link::{
     Counters, LossInjector, MediaAssembler, MediaDatagram, MediaLink, receive_media,
     stream_clock_us,
 };
+pub use mode::{LaunchedSession, StreamMode};
 #[cfg(feature = "native")]
 pub use pair::{PairedHost, pair, random_pin};
 pub use rtsp::{Negotiated, Rtsp, RtspExchange, StreamRequest};
+#[cfg(feature = "native")]
+pub use socket_links::SocketLinks;
 pub use video::{Depacketizer, FrameLoss, Received, ShardHeader, VideoFrame, parse_header};
 
 /// The client certificate in the hex-encoded-PEM form the `/pair` endpoint

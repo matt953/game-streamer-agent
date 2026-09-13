@@ -6,8 +6,8 @@
 //! repair requests. The shared client core takes it from there.
 
 use crate::codec;
-use crate::host::{LaunchedSession, PairedSession, StreamMode};
-use crate::{Command, Crypto, Rtsp, StreamRequest};
+use crate::links::{SessionAuthority, StreamLinks};
+use crate::{Command, Crypto, LaunchedSession, Rtsp, StreamMode, StreamRequest};
 use gsa_client_backend_api::{BackendFrame, InputSink, RecoverySink, SessionOrigin};
 use gsa_core::media::Codec;
 use gsa_core::{Error, Result};
@@ -189,12 +189,12 @@ impl MoonlightStream {
     /// Counted on datagrams rather than assembled frames so a host that is
     /// sending but losing shards still reads as alive.
     async fn wait_for_media(&self, within: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + within;
-        while std::time::Instant::now() < deadline {
+        let deadline = gsa_core::time::Instant::now() + within;
+        while gsa_core::time::Instant::now() < deadline {
             if self.datagrams.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 return true;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            gsa_core::runtime::sleep(std::time::Duration::from_millis(50)).await;
         }
         false
     }
@@ -251,12 +251,37 @@ impl Drop for Worker {
     }
 }
 
-/// Launch an app and bring every stream up.
+/// Launch an app on a paired host over the network and bring every stream up.
 ///
 /// Returns once media is negotiated; frames start arriving on the channel.
+#[cfg(feature = "native")]
 pub async fn start(
-    session: &mut PairedSession,
+    session: &mut crate::PairedSession,
     host_ip: std::net::IpAddr,
+    app_id: u32,
+    mode: StreamMode,
+    bitrate_kbps: u32,
+    decode_codecs: &[Codec],
+) -> Result<MoonlightStream> {
+    let mut links = crate::SocketLinks::new(host_ip);
+    start_with(
+        session,
+        &mut links,
+        app_id,
+        mode,
+        bitrate_kbps,
+        decode_codecs,
+    )
+    .await
+}
+
+/// Launch an app through `authority` and bring every stream up over `links`.
+///
+/// The transport-neutral form of [`start`]: the same launch, retry and
+/// negotiation logic whether the links are sockets or a browser tunnel.
+pub async fn start_with<A: SessionAuthority, L: StreamLinks>(
+    authority: &mut A,
+    links: &mut L,
     app_id: u32,
     mode: StreamMode,
     bitrate_kbps: u32,
@@ -272,7 +297,7 @@ pub async fn start(
     // Read over mutual TLS: the cleartext probe understates what a host can
     // encode, so negotiating from it would settle for H.264 against a host
     // that offers better.
-    let (host_codecs, running, app_version) = match session.server_info().await {
+    let (host_codecs, running, app_version) = match authority.server_info().await {
         Ok(info) => (
             codec::HostCodecs {
                 modes: info.codec_mode_support,
@@ -292,20 +317,23 @@ pub async fn start(
 
     for (attempt, settle) in SETTLE.iter().enumerate() {
         if *settle > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(*settle)).await;
+            gsa_core::runtime::sleep(std::time::Duration::from_secs(*settle)).await;
         }
         // Only the first attempt rejoins a session the host is already
         // running: a session that failed to deliver reproduces the failure on
         // rejoin, so later attempts start a new one.
         let (launched, origin) = if attempt == 0 {
-            begin(session, app_id, mode, running).await?
+            begin(authority, app_id, mode, running).await?
         } else {
-            let _ = session.cancel().await;
-            (session.launch(app_id, mode).await?, SessionOrigin::Launched)
+            let _ = authority.cancel().await;
+            (
+                authority.launch(app_id, mode).await?,
+                SessionOrigin::Launched,
+            )
         };
         let mut stream = connect(
             &launched,
-            host_ip,
+            links,
             mode,
             bitrate_kbps,
             chosen,
@@ -321,7 +349,7 @@ pub async fn start(
             return Ok(stream);
         }
         drop(stream);
-        let _ = session.cancel().await;
+        let _ = authority.cancel().await;
         tracing::warn!(attempt, "host accepted the session but sent no media");
     }
     Err(Error::Session(
@@ -334,8 +362,8 @@ pub async fn start(
 /// The host's state must be read first: launching over a session the host
 /// still holds yields one that handshakes and never streams, and resuming
 /// with nothing running has nothing to resume.
-async fn begin(
-    session: &PairedSession,
+async fn begin<A: SessionAuthority>(
+    session: &A,
     app_id: u32,
     mode: StreamMode,
     running: u32,
@@ -350,9 +378,9 @@ async fn begin(
     Ok((session.launch(app_id, mode).await?, SessionOrigin::Launched))
 }
 
-async fn connect(
+async fn connect<L: StreamLinks>(
     launched: &LaunchedSession,
-    host_ip: std::net::IpAddr,
+    links: &mut L,
     mode: StreamMode,
     bitrate_kbps: u32,
     codec: Codec,
@@ -388,7 +416,7 @@ async fn connect(
     }
 
     let mut rtsp = Rtsp::new(&launched.rtsp_url)?;
-    let mut exchange = crate::TcpRtsp::new(rtsp.addr()?);
+    let mut exchange = links.rtsp(&rtsp).await?;
     let negotiated = rtsp
         .negotiate(
             &mut exchange,
@@ -431,10 +459,9 @@ async fn connect(
         "control encryption chosen from the host's advertisement"
     );
     let crypto = Crypto::new(launched.riaes_key, negotiated.control_v2());
-    let control_addr = std::net::SocketAddr::new(host_ip, negotiated.control_port);
-    let connect_data = negotiated.connect_data.unwrap_or(0);
-    // The protocol runs here, transport-neutral; ENet is the link under it.
-    let link = crate::EnetLink::connect(control_addr, connect_data)?;
+    // The protocol runs here, transport-neutral; the link under it is the
+    // caller's business.
+    let link = links.control(&negotiated).await?;
     let control = crate::ControlSession::new(crypto, modern_start);
     gsa_core::runtime::spawn(async move {
         if let Err(e) = crate::drive(link, control, command_rx, event_tx).await {
@@ -446,14 +473,13 @@ async fn connect(
     if let Some(layout) = &negotiated.surround {
         tracing::info!(?layout, "surround audio negotiated");
     }
-    let (audio_rx, audio_pcm) = crate::AudioReceive::new(negotiated.surround.as_ref())?;
+    let (audio_rx, audio_pcm) = links.audio(&negotiated)?;
     let recovery = std::sync::Arc::new(MoonlightRecovery {
         commands: command_tx.clone(),
         // Off unless explicitly requested: it makes recovery from loss worse
         // on every host measured. The host's advertised capability is
         // recorded during negotiation, not acted on here.
-        reference_invalidation: negotiated.reference_invalidation
-            && std::env::var("GSA_MOONLIGHT_INVALIDATE").is_ok(),
+        reference_invalidation: negotiated.reference_invalidation && invalidation_opted_in(),
         invalidations: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         keyframes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
@@ -463,10 +489,7 @@ async fn connect(
     let datagrams = counters.datagrams.clone();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // One socket for every media stream; the link pings both ports from it.
-    let video_addr = std::net::SocketAddr::new(host_ip, negotiated.video_port);
-    let link =
-        crate::UdpMediaLink::open(video_addr, negotiated.audio_port, negotiated.ping_payload)?;
+    let link = links.media(&negotiated).await?;
     let assembler = crate::MediaAssembler::new(
         audio_rx,
         frames_tx,
@@ -513,6 +536,19 @@ fn app_version_at_least(version: &str, major: u32, minor: u32, build: u32) -> bo
         parts.next().unwrap_or(0),
     );
     quad >= (major, minor, build)
+}
+
+/// Reference invalidation is opt-in through the environment, natively; a
+/// browser has no environment and keeps the measured default.
+fn invalidation_opted_in() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var("GSA_MOONLIGHT_INVALIDATE").is_ok()
+    }
 }
 
 #[cfg(test)]

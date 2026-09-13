@@ -1,7 +1,8 @@
 //! A paired host: everything reachable once mutual TLS is established.
 
 use crate::identity::ClientIdentity;
-use crate::{ServerInfo, parse_server_info, tls};
+use crate::links::SessionAuthority;
+use crate::{LaunchedSession, ServerInfo, StreamMode, parse_server_info, tls};
 use gsa_client_backend_api::{CatalogEntry, CatalogKind};
 use gsa_core::{Error, Result};
 
@@ -170,67 +171,6 @@ fn new_stream_key() -> ([u8; 16], i32) {
     (key, id)
 }
 
-/// What we ask the host to encode.
-#[derive(Debug, Clone, Copy)]
-pub struct StreamMode {
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    /// Let the host change its desktop resolution to match. Off by default.
-    pub allow_host_mode_change: bool,
-    pub hdr: bool,
-    /// Speaker count we can render. 2 is stereo.
-    pub channels: u8,
-    /// Play audio on the host instead of streaming it to this client.
-    ///
-    /// The wire flag's real meaning, learned the hard way: one host treated
-    /// it leniently and streamed audio anyway, which made "keep the host's
-    /// speakers too" look like what it did — until a strict host honoured it
-    /// and the client went silent. Off by default: a streaming client wants
-    /// the audio.
-    pub keep_host_audio: bool,
-}
-
-impl Default for StreamMode {
-    fn default() -> Self {
-        Self {
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            allow_host_mode_change: false,
-            hdr: false,
-            channels: 2,
-            keep_host_audio: false,
-        }
-    }
-}
-
-impl StreamMode {
-    /// Channel count in the low half, channel mask in the high half — the
-    /// packing the launch endpoint expects.
-    fn surround_audio_info(self) -> u32 {
-        let mask: u32 = match self.channels {
-            6 => 0x3f,
-            8 => 0x63f,
-            // 7.1.4: the 7.1 positions plus four height speakers.
-            12 => 0x2d63f,
-            _ => 0x3,
-        };
-        (mask << 16) | u32::from(self.channels.max(2))
-    }
-}
-
-/// A stream the host has started for us.
-#[derive(Debug, Clone)]
-pub struct LaunchedSession {
-    /// Where to run the RTSP handshake.
-    pub rtsp_url: String,
-    /// AES key for the control channel, chosen by us at launch.
-    pub riaes_key: [u8; 16],
-    /// Identifies that key; also feeds the control channel's nonces.
-    pub riaes_key_id: i32,
-}
-
 /// One element's text from a host reply; a missing element errors with the
 /// body quoted.
 fn xml_field(body: &[u8], name: &str) -> Result<String> {
@@ -301,6 +241,24 @@ fn parse_catalog(body: &[u8], running_id: u32) -> Result<Vec<CatalogEntry>> {
         });
     }
     Ok(entries)
+}
+
+impl SessionAuthority for PairedSession {
+    async fn server_info(&self) -> Result<ServerInfo> {
+        PairedSession::server_info(self).await
+    }
+
+    async fn launch(&self, app_id: u32, mode: StreamMode) -> Result<LaunchedSession> {
+        PairedSession::launch(self, app_id, mode).await
+    }
+
+    async fn resume(&self, mode: StreamMode) -> Result<LaunchedSession> {
+        PairedSession::resume(self, mode).await
+    }
+
+    async fn cancel(&self) -> Result<()> {
+        PairedSession::cancel(self).await
+    }
 }
 
 #[cfg(test)]

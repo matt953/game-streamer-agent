@@ -7,6 +7,7 @@
 
 use crate::{AudioReceive, Depacketizer, Received};
 use gsa_client_backend_api::BackendFrame;
+use gsa_core::runtime::MaybeSend;
 
 /// One datagram off the wire.
 #[derive(Debug, Clone)]
@@ -22,7 +23,7 @@ pub struct MediaDatagram {
 /// send (pings) itself; the session only reads.
 pub trait MediaLink {
     /// The next datagram, or `None` once the link is closed.
-    fn recv(&mut self) -> impl std::future::Future<Output = Option<MediaDatagram>>;
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<MediaDatagram>> + MaybeSend;
 }
 
 /// Counters the receive loop keeps for the shared health stats.
