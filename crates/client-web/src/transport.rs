@@ -91,6 +91,28 @@ async fn datagram_writable(
     Ok(datagrams.writable())
 }
 
+/// Whether a `create_bidirectional_stream` error is the transient
+/// "session still settling" race worth retrying, rather than a real failure.
+///
+/// Both engines report it as `InvalidStateError` — Chrome's message is "No
+/// connection", Safari's "The object is in an invalid state" — so the name
+/// catches both, with a message match as a fallback for anything that throws
+/// a plain error instead of a `DOMException`.
+fn is_transient_open_error(e: &JsValue) -> bool {
+    if let Some(d) = e.dyn_ref::<web_sys::DomException>() {
+        if d.name() == "InvalidStateError" {
+            return true;
+        }
+    }
+    let text = js_sys::Reflect::get(e, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|m| m.as_string())
+        .or_else(|| e.as_string())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    text.contains("no connection") || text.contains("invalid state")
+}
+
 /// One chunk from a reader: `Ok(None)` at the end of the stream.
 async fn read_chunk(reader: &ReadableStreamDefaultReader) -> Result<Option<Vec<u8>>> {
     let result = JsFuture::from(reader.read())
@@ -143,29 +165,29 @@ impl TunnelSession for WebTunnel {
     type Reader = WebStreamReader;
 
     async fn open_stream(&self) -> Result<(WebStreamWriter, WebStreamReader)> {
-        // Safari can throw `InvalidStateError` for a stream opened in the
-        // instant after `ready` resolves; the transport is a hair from
-        // usable and settles within a frame. Retry that specific race a few
-        // times before giving up. A genuinely closed transport throws the
-        // same error, so the attempts are few and short.
+        // A stream opened in the instant after `ready` resolves can be
+        // refused while the session finishes settling: Safari throws
+        // `InvalidStateError`, Chrome throws with "No connection". Both clear
+        // within a few frames, so retry those with a widening backoff up to
+        // ~1.5s before giving up. Any other error is a real failure and ends
+        // the attempt at once.
         let mut stream: Option<WebTransportBidirectionalStream> = None;
         let mut last = None;
-        for attempt in 0..5 {
+        let mut backoff = 20u64;
+        for _ in 0..12 {
             match JsFuture::from(self.transport.create_bidirectional_stream()).await {
                 Ok(s) => {
                     stream = Some(s.unchecked_into());
                     break;
                 }
                 Err(e) => {
-                    let invalid = e
-                        .dyn_ref::<web_sys::DomException>()
-                        .is_some_and(|d| d.name() == "InvalidStateError");
+                    let transient = is_transient_open_error(&e);
                     last = Some(js_error("open stream", &e));
-                    if !invalid {
+                    if !transient {
                         break;
                     }
-                    gsa_core::runtime::sleep(std::time::Duration::from_millis(20 * (attempt + 1)))
-                        .await;
+                    gsa_core::runtime::sleep(std::time::Duration::from_millis(backoff)).await;
+                    backoff = (backoff + 20).min(200);
                 }
             }
         }
