@@ -60,3 +60,31 @@ async fn the_authority_calls_javascript_and_reads_the_backend_types_back() {
     let calls = js_sys::Reflect::get(&object, &"calls".into()).unwrap();
     assert_eq!(js_sys::Array::from(&calls).length(), 3);
 }
+
+/// The page builds gamepad events as plain JS objects and posts them to the
+/// worker, which deserializes them exactly as `WebStream::send_input` does.
+/// If that deserialization drops the gamepad variant, no pad reaches the
+/// host however well the browser detects it — so this pins the wire.
+#[wasm_bindgen_test]
+fn a_page_built_gamepad_event_deserializes() {
+    use gsa_protocol::input::InputEvent;
+    let js = js_sys::eval(
+        r#"([
+            { Gamepad: { seat: 0, buttons: 4096, axes: [100, -100, 0, 0, 32000, 0, 0, 0], ts_us: 123 } },
+            { GamepadDisconnect: { seat: 0, ts_us: 124 } }
+        ])"#,
+    )
+    .unwrap();
+    let events: Vec<InputEvent> =
+        serde_wasm_bindgen::from_value(js).expect("gamepad events must deserialize");
+    assert_eq!(events.len(), 2);
+    match &events[0] {
+        InputEvent::Gamepad(pad) => {
+            assert_eq!(pad.buttons, 4096);
+            assert_eq!(pad.axes[0], 100);
+            assert_eq!(pad.axes[4], 32000);
+        }
+        other => panic!("expected a gamepad, got {other:?}"),
+    }
+    assert!(matches!(events[1], InputEvent::GamepadDisconnect { seat: 0, .. }));
+}
