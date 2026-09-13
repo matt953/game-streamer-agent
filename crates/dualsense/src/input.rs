@@ -137,7 +137,13 @@ impl Parser {
     }
 
     fn parse_touch(&mut self, b: usize, data: &[u8], ts_us: u64, out: &mut Vec<InputEvent>) {
-        for (slot, off) in [(0usize, b + 33), (1usize, b + 37)] {
+        // The two 4-byte touch points sit at body offset 32 and 36 (plus the
+        // Bluetooth shift `b`): the reference DualSense report puts `touchData`
+        // at 32 + base. Byte 0 of a point is the contact id with bit 7 set
+        // while no finger is down; the next three pack x (12 bits) and y (12
+        // bits). Reading these one byte late scrambled position, which broke
+        // touchpad pan and pinch-zoom.
+        for (slot, off) in [(0usize, b + 32), (1usize, b + 36)] {
             let raw = &data[off..off + 4];
             let down = raw[0] & 0x80 == 0;
             let id = raw[0] & 0x7f;
@@ -273,8 +279,8 @@ mod tests {
         r[7] = 0x08; // hat neutral, no face buttons
         r[52] = 0x08; // discharging, 80%
         // Both touch slots empty (not-touching bit set).
-        r[33] = 0x80;
-        r[37] = 0x80;
+        r[32] = 0x80;
+        r[36] = 0x80;
         r
     }
 
@@ -345,11 +351,11 @@ mod tests {
         let mut p = Parser::new(0);
         let mut out = Vec::new();
         let mut r = report();
-        // Slot 0 down: id 5, x=480, y=270.
-        r[33] = 0x05;
-        r[34] = 480u16 as u8;
-        r[35] = ((480u16 >> 8) as u8) | (((270u16 & 0x0f) as u8) << 4);
-        r[36] = (270u16 >> 4) as u8;
+        // Slot 0 down: id 5, x=480, y=270 (touchData at body offset 32).
+        r[32] = 0x05;
+        r[33] = 480u16 as u8;
+        r[34] = ((480u16 >> 8) as u8) | (((270u16 & 0x0f) as u8) << 4);
+        r[35] = (270u16 >> 4) as u8;
         p.parse(Connection::Usb, &r, 1, &mut out);
         let down = out.iter().find_map(|e| match e {
             InputEvent::GamepadTouch { phase, x, .. } => Some((*phase, *x)),
@@ -360,8 +366,8 @@ mod tests {
         assert!((x - 0.25).abs() < 0.01, "x={x}");
         // Move the same id.
         out.clear();
-        r[34] = 960u16 as u8;
-        r[35] = ((960u16 >> 8) as u8) | (((270u16 & 0x0f) as u8) << 4);
+        r[33] = 960u16 as u8;
+        r[34] = ((960u16 >> 8) as u8) | (((270u16 & 0x0f) as u8) << 4);
         p.parse(Connection::Usb, &r, 2, &mut out);
         assert!(out.iter().any(|e| matches!(
             e,
@@ -372,7 +378,7 @@ mod tests {
         )));
         // Lift.
         out.clear();
-        r[33] = 0x80;
+        r[32] = 0x80;
         p.parse(Connection::Usb, &r, 3, &mut out);
         assert!(out.iter().any(|e| matches!(
             e,
