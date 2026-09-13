@@ -10,8 +10,13 @@
 //! packets at all; silence here can be a host condition rather than a client
 //! fault.
 
-use gsa_audio::{OpusDecoder, SurroundDecoder, SurroundLayout};
+#[cfg(feature = "native")]
+use gsa_audio::{OpusDecoder, SurroundDecoder};
+#[cfg(feature = "native")]
 use gsa_core::Result;
+#[cfg(feature = "native")]
+use gsa_core::media::SurroundLayout;
+#[cfg(feature = "native")]
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 /// Bytes of RTP header before the Opus payload.
@@ -28,12 +33,25 @@ pub const AUDIO_PARITY: u8 = 127;
 /// never sent.
 const MAX_CONCEAL: u16 = 5;
 
+/// Where the Opus frames go once the wire has been stripped off them.
+///
+/// Natively a libopus decoder producing PCM for the embedder; in the browser
+/// the frames are handed to WebCodecs and this only tracks gaps.
+pub trait OpusSink {
+    /// One Opus frame, in stream order.
+    fn frame(&mut self, opus: &[u8]);
+    /// `count` frames are missing before the next one; conceal them.
+    fn lost(&mut self, count: u16);
+}
+
 /// Stereo or a host-declared surround layout — one decode path either way.
+#[cfg(feature = "native")]
 enum Decode {
     Stereo(OpusDecoder),
     Surround(SurroundDecoder),
 }
 
+#[cfg(feature = "native")]
 impl Decode {
     fn decode(&mut self, opus: &[u8]) -> gsa_core::Result<Vec<i16>> {
         match self {
@@ -50,11 +68,60 @@ impl Decode {
     }
 }
 
-/// Decodes the audio stream into interleaved PCM for the embedder to play.
-pub struct AudioReceive {
+/// The native sink: libopus into interleaved PCM for the embedder to play.
+#[cfg(feature = "native")]
+pub struct PcmSink {
     decoder: Decode,
-    last_seq: Option<u16>,
     out: Sender<Vec<i16>>,
+}
+
+#[cfg(feature = "native")]
+impl std::fmt::Debug for PcmSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PcmSink").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "native")]
+impl PcmSink {
+    /// `surround` is the host's declared multistream layout, or `None` for
+    /// stereo; the PCM comes out interleaved at that channel count.
+    pub fn new(surround: Option<&SurroundLayout>) -> Result<(Self, Receiver<Vec<i16>>)> {
+        let (out, rx) = channel();
+        let decoder = match surround {
+            Some(layout) => Decode::Surround(SurroundDecoder::new(layout)?),
+            None => Decode::Stereo(OpusDecoder::new()?),
+        };
+        Ok((Self { decoder, out }, rx))
+    }
+}
+
+#[cfg(feature = "native")]
+impl OpusSink for PcmSink {
+    fn frame(&mut self, opus: &[u8]) {
+        if let Ok(pcm) = self.decoder.decode(opus) {
+            let _ = self.out.send(pcm);
+        }
+    }
+
+    fn lost(&mut self, count: u16) {
+        for _ in 0..count {
+            if let Ok(pcm) = self.decoder.conceal() {
+                let _ = self.out.send(pcm);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type SinkBox = Box<dyn OpusSink + Send>;
+#[cfg(target_arch = "wasm32")]
+type SinkBox = Box<dyn OpusSink>;
+
+/// Strips the wire off the audio stream and keeps it in order for the sink.
+pub struct AudioReceive {
+    sink: SinkBox,
+    last_seq: Option<u16>,
 }
 
 impl std::fmt::Debug for AudioReceive {
@@ -69,20 +136,19 @@ impl AudioReceive {
     /// Create the receiver and the PCM channel the embedder plays from.
     /// `surround` is the host's declared multistream layout, or `None` for
     /// stereo; the PCM comes out interleaved at that channel count.
+    #[cfg(feature = "native")]
     pub fn new(surround: Option<&SurroundLayout>) -> Result<(Self, Receiver<Vec<i16>>)> {
-        let (out, rx) = channel();
-        let decoder = match surround {
-            Some(layout) => Decode::Surround(SurroundDecoder::new(layout)?),
-            None => Decode::Stereo(OpusDecoder::new()?),
-        };
-        Ok((
-            Self {
-                decoder,
-                last_seq: None,
-                out,
-            },
-            rx,
-        ))
+        let (sink, rx) = PcmSink::new(surround)?;
+        Ok((Self::with_sink(Box::new(sink)), rx))
+    }
+
+    /// A receiver feeding any sink.
+    #[must_use]
+    pub fn with_sink(sink: SinkBox) -> Self {
+        Self {
+            sink,
+            last_seq: None,
+        }
     }
 
     /// True for datagrams this receiver should be given.
@@ -109,20 +175,17 @@ impl AudioReceive {
                 // as backwards: replaying it would stutter the output.
                 return;
             }
-            for _ in 0..(delta - 1).min(MAX_CONCEAL) {
-                if let Ok(pcm) = self.decoder.conceal() {
-                    let _ = self.out.send(pcm);
-                }
+            let missing = (delta - 1).min(MAX_CONCEAL);
+            if missing > 0 {
+                self.sink.lost(missing);
             }
         }
-        if let Ok(pcm) = self.decoder.decode(&datagram[HEADER_LEN..]) {
-            let _ = self.out.send(pcm);
-        }
+        self.sink.frame(&datagram[HEADER_LEN..]);
         self.last_seq = Some(seq);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::{AUDIO_DATA, AUDIO_PARITY, AudioReceive, HEADER_LEN};
 

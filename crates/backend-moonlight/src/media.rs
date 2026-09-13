@@ -125,3 +125,77 @@ impl MediaSocket {
             .map_or(0, |a: std::net::SocketAddr| a.port())
     }
 }
+
+/// The media UDP socket as a [`MediaLink`](crate::MediaLink): a thread pings
+/// both ports and reads, stamping every datagram at arrival; the session
+/// takes them through a channel.
+#[derive(Debug)]
+pub struct UdpMediaLink {
+    datagrams: tokio::sync::mpsc::UnboundedReceiver<crate::MediaDatagram>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl UdpMediaLink {
+    /// One socket for every media stream, and it must stay one. A host binds
+    /// a stream to whichever address pinged its port, so a second socket in
+    /// the same session takes the first stream's binding. Both ports are
+    /// pinged from this single socket, because a stream the host cannot
+    /// deliver tears the session down after ten seconds.
+    pub fn open(
+        video: std::net::SocketAddr,
+        audio_port: u16,
+        payload: Option<[u8; 16]>,
+    ) -> Result<Self> {
+        const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let mut media = MediaSocket::bind(video, payload)?;
+        let (tx, datagrams) = tokio::sync::mpsc::unbounded_channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        std::thread::Builder::new()
+            .name("moonlight-media".into())
+            .spawn(move || {
+                let clock = gsa_core::time::MediaClock::new();
+                let mut buf = vec![0u8; 4096];
+                let mut last_ping = std::time::Instant::now() - PING_INTERVAL;
+                while !stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    if last_ping.elapsed() >= PING_INTERVAL {
+                        if let Err(e) = media.ping().and_then(|()| media.ping_port(audio_port)) {
+                            tracing::warn!(error = %e, "media ping failed");
+                            return;
+                        }
+                        last_ping = std::time::Instant::now();
+                    }
+                    match media.recv(&mut buf) {
+                        Ok(Some(n)) => {
+                            let datagram = crate::MediaDatagram {
+                                bytes: buf[..n].to_vec(),
+                                arrival_us: clock.now_us(),
+                            };
+                            if tx.send(datagram).is_err() {
+                                return; // the session let go of the link
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "video receive stopped");
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| Error::Transport(format!("spawn media thread: {e}")))?;
+        Ok(Self { datagrams, stop })
+    }
+}
+
+impl crate::MediaLink for UdpMediaLink {
+    async fn recv(&mut self) -> Option<crate::MediaDatagram> {
+        self.datagrams.recv().await
+    }
+}
+
+impl Drop for UdpMediaLink {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+}

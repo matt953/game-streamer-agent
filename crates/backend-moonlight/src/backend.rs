@@ -7,7 +7,7 @@
 
 use crate::codec;
 use crate::host::{LaunchedSession, PairedSession, StreamMode};
-use crate::{Command, Crypto, Depacketizer, MediaSocket, Received, Rtsp, StreamRequest};
+use crate::{Command, Crypto, Rtsp, StreamRequest};
 use gsa_client_backend_api::{BackendFrame, InputSink, RecoverySink, SessionOrigin};
 use gsa_core::media::Codec;
 use gsa_core::{Error, Result};
@@ -388,8 +388,10 @@ async fn connect(
     }
 
     let mut rtsp = Rtsp::new(&launched.rtsp_url)?;
+    let mut exchange = crate::TcpRtsp::new(rtsp.addr()?);
     let negotiated = rtsp
         .negotiate(
+            &mut exchange,
             StreamRequest {
                 width,
                 height,
@@ -455,40 +457,23 @@ async fn connect(
         invalidations: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         keyframes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
-    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let recovered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let datagrams = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counters = crate::Counters::default();
+    let dropped = counters.dropped.clone();
+    let recovered = counters.recovered.clone();
+    let datagrams = counters.datagrams.clone();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // One socket for every media stream, and it must stay one. A host binds a
-    // stream to whichever address pinged its port, so a second socket in the
-    // same session takes the first stream's binding: video then arrives on
-    // the audio socket and is indistinguishable from a host sending nothing.
-    // Both ports are still pinged, from this single socket, because a stream
-    // the host cannot deliver tears the session down after ten seconds.
+    // One socket for every media stream; the link pings both ports from it.
     let video_addr = std::net::SocketAddr::new(host_ip, negotiated.video_port);
-    let media = MediaSocket::bind(video_addr, negotiated.ping_payload)?;
-    let audio_port = negotiated.audio_port;
-
-    let worker_stop = stop.clone();
-    let worker_counters = Counters {
-        dropped: dropped.clone(),
-        recovered: recovered.clone(),
-        datagrams: datagrams.clone(),
-    };
-    std::thread::Builder::new()
-        .name("moonlight-video".into())
-        .spawn(move || {
-            receive_media(
-                media,
-                audio_port,
-                audio_rx,
-                &frames_tx,
-                &worker_stop,
-                &worker_counters,
-            );
-        })
-        .map_err(|e| Error::Transport(format!("spawn video thread: {e}")))?;
+    let link =
+        crate::UdpMediaLink::open(video_addr, negotiated.audio_port, negotiated.ping_payload)?;
+    let assembler = crate::MediaAssembler::new(
+        audio_rx,
+        frames_tx,
+        counters,
+        crate::LossInjector::from_env(),
+    );
+    gsa_core::runtime::spawn(crate::receive_media(link, assembler));
 
     Ok(MoonlightStream {
         frames: Some(frames_rx),
@@ -511,170 +496,6 @@ async fn connect(
             stop,
         },
     })
-}
-
-/// Deterministic packet-loss injection for chaos runs.
-///
-/// Drops a share of received datagrams before anything inspects them, which
-/// exercises FEC recovery, the reference gate and the repair path against a
-/// real host without degrading the network. Deterministic so a failure can be
-/// re-run; off unless `GSA_MOONLIGHT_LOSS` is set.
-#[derive(Debug)]
-struct LossInjector {
-    /// Drop probability in parts per thousand.
-    per_mille: u32,
-    state: u32,
-    dropped: u64,
-}
-
-impl LossInjector {
-    fn from_env() -> Option<Self> {
-        let per_mille: u32 = std::env::var("GSA_MOONLIGHT_LOSS").ok()?.parse().ok()?;
-        (per_mille > 0).then(|| {
-            tracing::warn!(per_mille, "injecting packet loss for a chaos run");
-            Self {
-                per_mille: per_mille.min(1000),
-                state: 0x2545_f491,
-                dropped: 0,
-            }
-        })
-    }
-
-    /// True when this datagram should be discarded.
-    fn drops(&mut self) -> bool {
-        // xorshift from a fixed seed: cheap, and repeatable, so a chaos run
-        // that finds a bug replays exactly.
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 17;
-        self.state ^= self.state << 5;
-        let drop = self.state % 1000 < self.per_mille;
-        if drop {
-            self.dropped += 1;
-        }
-        drop
-    }
-}
-
-/// Convert the host's 90 kHz stream clock to microseconds.
-///
-/// Wraps with the field, which the shared clock handling already expects.
-fn stream_clock_us(ticks: u32) -> u32 {
-    // 90 kHz → µs is ×100/9; done in 64-bit so the multiply cannot overflow
-    // before the division brings it back into range.
-    ((u64::from(ticks) * 100 / 9) & u64::from(u32::MAX)) as u32
-}
-
-/// Video datagrams carry packet type 0; audio uses its own types.
-fn is_video(datagram: &[u8]) -> bool {
-    datagram.len() > 1 && datagram[1] == 0
-}
-
-/// Counters the receive loop keeps for the shared health stats.
-struct Counters {
-    /// Frames the wire could not deliver whole.
-    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Frames rebuilt from parity: loss with no visible cost.
-    recovered: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Any media datagram, used to tell streaming from silence.
-    datagrams: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl Counters {
-    fn bump(counter: &std::sync::atomic::AtomicU64) {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Read datagrams, reassemble, and publish frames stamped with their arrival.
-///
-/// Arrival is stamped here on the receive side, never on release: a frame
-/// stamped when it is released would make paced presentation look like
-/// network delay to anything reasoning about the link.
-fn receive_media(
-    mut media: MediaSocket,
-    audio_port: u16,
-    mut audio: crate::AudioReceive,
-    frames: &tokio::sync::mpsc::UnboundedSender<BackendFrame>,
-    stop: &std::sync::atomic::AtomicBool,
-    counters: &Counters,
-) {
-    const PING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-    let clock = gsa_core::time::MediaClock::new();
-    let mut loss = LossInjector::from_env();
-    let mut depacketizer = Depacketizer::new();
-    let mut buf = vec![0u8; 4096];
-    let mut last_ping = std::time::Instant::now() - PING_INTERVAL;
-
-    while !stop.load(std::sync::atomic::Ordering::Acquire) {
-        if last_ping.elapsed() >= PING_INTERVAL {
-            // Both ports, one socket. The audio port cannot be skipped: a
-            // host holding a media stream it cannot deliver tears the whole
-            // session down after ten seconds.
-            if let Err(e) = media.ping().and_then(|()| media.ping_port(audio_port)) {
-                tracing::warn!(error = %e, "media ping failed");
-                return;
-            }
-            last_ping = std::time::Instant::now();
-        }
-        let n = match media.recv(&mut buf) {
-            Ok(Some(n)) => n,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(error = %e, "video receive stopped");
-                return;
-            }
-        };
-        // Drop before anything inspects the packet, so the rest of the path
-        // cannot tell an injected loss from a real one.
-        if let Some(injector) = loss.as_mut()
-            && injector.drops()
-        {
-            continue;
-        }
-        let arrival_us = clock.now_us();
-        Counters::bump(&counters.datagrams);
-        // Both streams share this socket, so each is routed by packet type.
-        if crate::AudioReceive::owns(&buf[..n]) {
-            audio.handle(&buf[..n]);
-            continue;
-        }
-        if !is_video(&buf[..n]) {
-            continue;
-        }
-        depacketizer.push(&buf[..n]);
-        while let Some(event) = depacketizer.next_event() {
-            match event {
-                Received::Frame(frame) => {
-                    if frame.recovered {
-                        Counters::bump(&counters.recovered);
-                    }
-                    let out = BackendFrame {
-                        data: frame.data,
-                        frame_id: frame.frame_index,
-                        keyframe: frame.keyframe,
-                        // The host's 90 kHz stream clock, in µs. Its origin
-                        // is unknown, so absolute latency from it is
-                        // meaningless; the *gaps* between frames are real
-                        // host-side timing, which is what the de-jitter
-                        // window measures. Stamping arrival here instead
-                        // would make every frame look perfectly timed and the
-                        // window would never engage.
-                        capture_ts_us: stream_clock_us(frame.timestamp),
-                        host_latency_us: frame.host_latency_us,
-                        arrival_us,
-                    };
-                    if frames.send(out).is_err() {
-                        return; // consumer gone
-                    }
-                }
-                Received::Lost(loss) => {
-                    tracing::debug!(?loss, "frame lost");
-                    Counters::bump(&counters.dropped);
-                }
-                Received::Nothing => {}
-            }
-        }
-    }
 }
 
 /// Whether a host's `appversion` quad is at least `major.minor.build`.

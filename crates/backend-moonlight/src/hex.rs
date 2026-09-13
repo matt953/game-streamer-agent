@@ -2,6 +2,7 @@
 //!
 //! Hosts emit either case, so decoding must accept both; we emit uppercase.
 
+#[cfg(feature = "native")]
 use gsa_core::{Error, Result};
 
 pub(crate) fn encode(bytes: &[u8]) -> String {
@@ -14,6 +15,7 @@ pub(crate) fn encode(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(feature = "native")]
 pub(crate) fn decode(text: &str) -> Result<Vec<u8>> {
     let text = text.trim();
     if !text.len().is_multiple_of(2) {
@@ -29,6 +31,7 @@ pub(crate) fn decode(text: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(feature = "native")]
 fn nibble(c: u8) -> Result<u8> {
     match c {
         b'0'..=b'9' => Ok(c - b'0'),

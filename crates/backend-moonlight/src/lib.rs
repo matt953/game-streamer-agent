@@ -16,39 +16,65 @@
 //!
 
 mod audio;
+#[cfg(feature = "native")]
 mod backend;
-mod codec;
+/// Codec negotiation against what a host advertises; the browser client
+/// chooses the same way from what WebCodecs can decode.
+pub mod codec;
 mod control;
 mod control_session;
+#[cfg(feature = "native")]
 mod enet;
 mod hex;
+#[cfg(feature = "native")]
 mod host;
+#[cfg(feature = "native")]
 mod http;
+#[cfg(feature = "native")]
 mod identity;
 mod input;
+#[cfg(feature = "native")]
 mod media;
+mod media_link;
+#[cfg(feature = "native")]
 mod pair;
 mod rtsp;
+#[cfg(feature = "native")]
 mod tls;
 mod video;
 
-pub use audio::AudioReceive;
+#[cfg(feature = "native")]
+pub use audio::PcmSink;
+pub use audio::{AudioReceive, OpusSink};
+#[cfg(feature = "native")]
 pub use backend::{MoonlightStream, start};
 pub use control::{Crypto, message, message_type, msg};
 pub use control_session::{
     Command, ControlLink, ControlSession, Delivery, HostMessage, LinkEvent, Outgoing, drive,
 };
+#[cfg(feature = "native")]
 pub use enet::{EnetLink, run_control};
+#[cfg(feature = "native")]
 pub use host::{LaunchedSession, PairedSession, StreamMode};
+#[cfg(feature = "native")]
+pub use http::TcpRtsp;
+#[cfg(feature = "native")]
 pub use identity::ClientIdentity;
 pub use input::InputEncoder;
-pub use media::MediaSocket;
+#[cfg(feature = "native")]
+pub use media::{MediaSocket, UdpMediaLink};
+pub use media_link::{
+    Counters, LossInjector, MediaAssembler, MediaDatagram, MediaLink, receive_media,
+    stream_clock_us,
+};
+#[cfg(feature = "native")]
 pub use pair::{PairedHost, pair, random_pin};
-pub use rtsp::{Negotiated, Rtsp, StreamRequest};
+pub use rtsp::{Negotiated, Rtsp, RtspExchange, StreamRequest};
 pub use video::{Depacketizer, FrameLoss, Received, ShardHeader, VideoFrame, parse_header};
 
 /// The client certificate in the hex-encoded-PEM form the `/pair` endpoint
 /// expects. Public so a pairing step can be reproduced by hand against a host.
+#[cfg(feature = "native")]
 #[must_use]
 pub fn cert_pem_hex(identity: &ClientIdentity) -> String {
     hex::encode(identity.cert_pem().as_bytes())
@@ -91,12 +117,15 @@ pub struct ServerInfo {
 ///
 /// `client_id` must stay stable across calls — it is the identity the host
 /// pairs with.
+#[cfg(feature = "native")]
 pub async fn probe(addr: std::net::SocketAddr, client_id: &str) -> Result<ServerInfo> {
     let body = http::get(addr, &format!("/serverinfo?uniqueid={client_id}")).await?;
     parse_server_info(&body)
 }
 
-pub(crate) fn parse_server_info(body: &[u8]) -> Result<ServerInfo> {
+/// Parse a `/serverinfo` body. Public so a client that fetched it another
+/// way (the altc API, in a browser) reads it identically.
+pub fn parse_server_info(body: &[u8]) -> Result<ServerInfo> {
     let text = std::str::from_utf8(body).map_err(|_| Error::Session("non-UTF-8 XML".into()))?;
     let doc = roxmltree::Document::parse(text)
         .map_err(|e| Error::Session(format!("malformed serverinfo XML: {e}")))?;

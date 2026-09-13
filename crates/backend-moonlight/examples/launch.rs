@@ -72,6 +72,8 @@ async fn main() {
             // Negotiate the streams. The host picks the ports and tells us
             // which encryption it wants, so nothing here is assumed.
             let mut rtsp = gsa_backend_moonlight::Rtsp::new(&launched.rtsp_url).expect("rtsp url");
+            let mut exchange =
+                gsa_backend_moonlight::TcpRtsp::new(rtsp.addr().expect("rtsp address"));
             let want = gsa_backend_moonlight::StreamRequest {
                 hdr: false,
                 width: mode.width,
@@ -82,7 +84,7 @@ async fn main() {
                 packet_size: 1392,
                 channels: mode.channels,
             };
-            match rtsp.negotiate(want, true).await {
+            match rtsp.negotiate(&mut exchange, want, true).await {
                 Ok(n) => {
                     println!("  negotiated:");
                     println!("    video port:   {}", n.video_port);

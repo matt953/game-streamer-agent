@@ -10,8 +10,16 @@
 //! - **The host assigns the media ports.** Whatever the client proposes in
 //!   `Transport` is ignored; the ports come back in the responses.
 
-use crate::http;
 use gsa_core::{Error, Result};
+
+/// Carries one RTSP request and returns the whole response.
+///
+/// The protocol is one request per connection, delimited by the peer closing
+/// it; natively that is a fresh TCP connection each time
+/// ([`crate::TcpRtsp`]), in the browser a fresh tunnel stream.
+pub trait RtspExchange {
+    fn exchange(&mut self, request: &[u8]) -> impl std::future::Future<Output = Result<Vec<u8>>>;
+}
 
 /// Client protocol generation. Hosts branch on this value.
 const CLIENT_VERSION: &str = "14";
@@ -60,7 +68,7 @@ pub struct Negotiated {
     /// The multistream layout the host will encode audio with, when more
     /// than stereo was requested. Parsed from the host's own `surround-params`
     /// lines — the encoder's declaration, not a table of assumptions.
-    pub surround: Option<gsa_audio::SurroundLayout>,
+    pub surround: Option<gsa_core::media::SurroundLayout>,
 }
 
 impl Negotiated {
@@ -96,7 +104,6 @@ pub struct StreamRequest {
 }
 
 pub struct Rtsp {
-    addr: std::net::SocketAddr,
     host_header: String,
     cseq: u32,
     session: Option<String>,
@@ -104,7 +111,9 @@ pub struct Rtsp {
 
 impl std::fmt::Debug for Rtsp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Rtsp").field("addr", &self.addr).finish()
+        f.debug_struct("Rtsp")
+            .field("host", &self.host_header)
+            .finish()
     }
 }
 
@@ -117,19 +126,29 @@ impl Rtsp {
             .strip_prefix("rtsp://")
             .ok_or_else(|| Error::Session(format!("not an rtsp url: {rtsp_url}")))?;
         let host_header = rest.trim_end_matches('/').to_owned();
-        let addr = host_header
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| Error::Session(format!("bad rtsp address {host_header}: {e}")))?;
         Ok(Self {
-            addr,
             host_header,
             cseq: 0,
             session: None,
         })
     }
 
-    async fn request(
+    /// The host string the URL carried, `host:port` as the host wrote it.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host_header
+    }
+
+    /// The socket address the URL names, for a native exchange.
+    pub fn addr(&self) -> Result<std::net::SocketAddr> {
+        self.host_header
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| Error::Session(format!("bad rtsp address {}: {e}", self.host_header)))
+    }
+
+    async fn request<X: RtspExchange>(
         &mut self,
+        exchange: &mut X,
         method: &str,
         target: &str,
         extra: &[(&str, &str)],
@@ -158,7 +177,7 @@ impl Rtsp {
             head.push_str(body);
         }
 
-        let raw = http::request_raw(self.addr, head.as_bytes()).await?;
+        let raw = exchange.exchange(head.as_bytes()).await?;
         let response = parse(&raw)?;
         if response.status != 200 {
             return Err(Error::Session(format!(
@@ -170,8 +189,9 @@ impl Rtsp {
     }
 
     /// Run the whole handshake and start the streams.
-    pub async fn negotiate(
+    pub async fn negotiate<X: RtspExchange>(
         &mut self,
+        exchange: &mut X,
         want: StreamRequest,
         modern_control: bool,
     ) -> Result<Negotiated> {
@@ -186,6 +206,7 @@ impl Rtsp {
             "streamid=control/1/0"
         };
         self.request(
+            exchange,
             "OPTIONS",
             &format!("rtsp://{}", self.host_header),
             &[],
@@ -195,6 +216,7 @@ impl Rtsp {
 
         let describe = self
             .request(
+                exchange,
                 "DESCRIBE",
                 &format!("rtsp://{}", self.host_header),
                 &[("Accept", "application/sdp")],
@@ -217,6 +239,7 @@ impl Rtsp {
         let transport = "unicast;X-GS-ClientPort=50000-50001";
         let audio = self
             .request(
+                exchange,
                 "SETUP",
                 "streamid=audio/0/0",
                 &[("Transport", transport)],
@@ -237,6 +260,7 @@ impl Rtsp {
         }
         let video = self
             .request(
+                exchange,
                 "SETUP",
                 "streamid=video/0/0",
                 &[("Transport", transport)],
@@ -244,13 +268,19 @@ impl Rtsp {
             )
             .await?;
         let control = self
-            .request("SETUP", control_stream, &[("Transport", transport)], None)
+            .request(
+                exchange,
+                "SETUP",
+                control_stream,
+                &[("Transport", transport)],
+                None,
+            )
             .await?;
 
         let sdp = announce_sdp(&self.host_header, want, &host_sdp);
-        self.request("ANNOUNCE", control_stream, &[], Some(&sdp))
+        self.request(exchange, "ANNOUNCE", control_stream, &[], Some(&sdp))
             .await?;
-        self.request("PLAY", "/", &[], None).await?;
+        self.request(exchange, "PLAY", "/", &[], None).await?;
 
         Ok(Negotiated {
             video_port: server_port(&video)?,
@@ -285,7 +315,7 @@ impl Rtsp {
 /// comma-separated form `12,8,4,0,1,…`. Hosts list a coupled and an
 /// uncoupled variant per count; the first matches AudioQuality 0, which is
 /// what this client requests.
-fn surround_layout(host_sdp: &str, channels: u8) -> Option<gsa_audio::SurroundLayout> {
+fn surround_layout(host_sdp: &str, channels: u8) -> Option<gsa_core::media::SurroundLayout> {
     for line in host_sdp.lines() {
         let Some(params) = line.trim().strip_prefix("a=fmtp:97 surround-params=") else {
             continue;
@@ -296,7 +326,7 @@ fn surround_layout(host_sdp: &str, channels: u8) -> Option<gsa_audio::SurroundLa
             let streams = fields.next().flatten()?;
             let coupled = fields.next().flatten()?;
             let mapping: Option<Vec<u8>> = fields.collect();
-            gsa_audio::SurroundLayout {
+            gsa_core::media::SurroundLayout {
                 channels: ch,
                 streams,
                 coupled,
@@ -310,7 +340,7 @@ fn surround_layout(host_sdp: &str, channels: u8) -> Option<gsa_audio::SurroundLa
             if digits.len() < 3 {
                 continue;
             }
-            gsa_audio::SurroundLayout {
+            gsa_core::media::SurroundLayout {
                 channels: digits[0],
                 streams: digits[1],
                 coupled: digits[2],

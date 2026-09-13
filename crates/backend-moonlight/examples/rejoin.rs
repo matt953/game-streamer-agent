@@ -97,8 +97,10 @@ async fn report(
             return;
         }
     };
+    let mut exchange = gsa_backend_moonlight::TcpRtsp::new(rtsp.addr().expect("rtsp address"));
     let negotiated = match rtsp
         .negotiate(
+            &mut exchange,
             gsa_backend_moonlight::StreamRequest {
                 hdr: false,
                 width: mode.width,

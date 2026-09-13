@@ -166,3 +166,22 @@ mod tests {
         assert!(parse_response(b"HTTP/1.1 200 OK\r\n").is_err());
     }
 }
+
+/// RTSP over a fresh TCP connection per request, the way hosts expect it.
+#[derive(Debug, Clone, Copy)]
+pub struct TcpRtsp {
+    addr: std::net::SocketAddr,
+}
+
+impl TcpRtsp {
+    #[must_use]
+    pub fn new(addr: std::net::SocketAddr) -> Self {
+        Self { addr }
+    }
+}
+
+impl crate::RtspExchange for TcpRtsp {
+    async fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>> {
+        request_raw(self.addr, request).await
+    }
+}

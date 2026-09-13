@@ -104,17 +104,7 @@ impl OpusDecoder {
     }
 }
 
-/// Layout of a multistream surround feed, exactly as the host's SDP states
-/// it: channel count, elementary streams, how many are coupled pairs, and
-/// the output mapping. Parsed from the host rather than assumed, because the
-/// host's encoder is the only authority on how it packed the channels.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SurroundLayout {
-    pub channels: u8,
-    pub streams: u8,
-    pub coupled: u8,
-    pub mapping: Vec<u8>,
-}
+pub use gsa_core::media::SurroundLayout;
 
 /// Opus multistream decoder for a surround feed (client side).
 pub struct SurroundDecoder {

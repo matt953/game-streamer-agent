@@ -76,8 +76,10 @@ async fn capture(
     mode: StreamMode,
 ) -> gsa_core::Result<()> {
     let mut rtsp = gsa_backend_moonlight::Rtsp::new(&launched.rtsp_url)?;
+    let mut exchange = gsa_backend_moonlight::TcpRtsp::new(rtsp.addr()?);
     let negotiated = rtsp
         .negotiate(
+            &mut exchange,
             gsa_backend_moonlight::StreamRequest {
                 hdr: false,
                 width: mode.width,

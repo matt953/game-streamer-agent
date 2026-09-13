@@ -1235,6 +1235,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "fec-rs",
+ "getrandom 0.2.17",
  "gsa-audio",
  "gsa-client-backend-api",
  "gsa-client-core",
