@@ -92,21 +92,32 @@ impl Crypto {
 
     /// Wrap one plaintext message for sending.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        use aes_gcm::aead::AeadInPlace;
-        use aes_gcm::{Aes128Gcm, KeyInit};
+        self.seal_from(plaintext, false)
+    }
 
+    /// Unwrap one received message, returning its plaintext.
+    pub fn open(&self, frame: &[u8]) -> Result<Vec<u8>> {
+        self.open_from(frame, true)
+    }
+
+    /// Seal as the host would: the other direction tag. For tests that play
+    /// the host against a session.
+    #[cfg(test)]
+    pub(crate) fn seal_as_host(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.seal_from(plaintext, true)
+    }
+
+    /// Open as the host would, i.e. what the client sealed.
+    #[cfg(test)]
+    pub(crate) fn open_as_host(&self, frame: &[u8]) -> Result<Vec<u8>> {
+        self.open_from(frame, false)
+    }
+
+    fn seal_from(&mut self, plaintext: &[u8], from_host: bool) -> Result<Vec<u8>> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let cipher = Aes128Gcm::new_from_slice(&self.key)
-            .map_err(|e| Error::Session(format!("control key rejected: {e}")))?;
         let mut buffer = plaintext.to_vec();
-        let tag = cipher
-            .encrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(&self.nonce(seq, false)),
-                &[],
-                &mut buffer,
-            )
-            .map_err(|_| Error::Session("control encryption failed".into()))?;
+        let tag = self.encrypt(seq, from_host, &mut buffer)?;
 
         // Envelope, all little-endian: type u16, length u16 covering
         // everything after itself, sequence u32, 16-byte tag, ciphertext.
@@ -119,11 +130,7 @@ impl Crypto {
         Ok(out)
     }
 
-    /// Unwrap one received message, returning its plaintext.
-    pub fn open(&self, frame: &[u8]) -> Result<Vec<u8>> {
-        use aes_gcm::aead::AeadInPlace;
-        use aes_gcm::{Aes128Gcm, KeyInit};
-
+    fn open_from(&self, frame: &[u8], from_host: bool) -> Result<Vec<u8>> {
         if frame.len() < 24 {
             return Err(Error::Session(format!(
                 "control frame is {} bytes, too short to be encrypted",
@@ -137,19 +144,53 @@ impl Crypto {
             )));
         }
         let seq = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
-        let tag = &frame[8..24];
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&frame[8..24]);
         let mut buffer = frame[24..].to_vec();
-        let cipher = Aes128Gcm::new_from_slice(&self.key)
-            .map_err(|e| Error::Session(format!("control key rejected: {e}")))?;
-        cipher
-            .decrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(&self.nonce(seq, true)),
-                &[],
-                &mut buffer,
-                aes_gcm::Tag::from_slice(tag),
-            )
-            .map_err(|_| Error::Session("control frame failed authentication".into()))?;
+        self.decrypt(seq, from_host, &mut buffer, &tag)?;
         Ok(buffer)
+    }
+
+    /// AES-128-GCM in place with the scheme's nonce. The legacy scheme uses a
+    /// 16-byte nonce, which GCM supports through GHASH but which needs its
+    /// own cipher instantiation: the 12-byte one panics on any other size.
+    fn encrypt(&self, seq: u32, from_host: bool, buffer: &mut [u8]) -> Result<[u8; 16]> {
+        use aes_gcm::aead::AeadInPlace;
+        use aes_gcm::aead::consts::U16;
+        use aes_gcm::{Aes128Gcm, AesGcm, KeyInit};
+        let iv = self.nonce(seq, from_host);
+        let tag = match self.scheme {
+            Scheme::V2 => Aes128Gcm::new_from_slice(&self.key)
+                .map_err(|e| Error::Session(format!("control key rejected: {e}")))?
+                .encrypt_in_place_detached(aes_gcm::Nonce::<_>::from_slice(&iv), &[], buffer),
+            Scheme::Legacy => AesGcm::<aes::Aes128, U16>::new_from_slice(&self.key)
+                .map_err(|e| Error::Session(format!("control key rejected: {e}")))?
+                .encrypt_in_place_detached(aes_gcm::Nonce::<U16>::from_slice(&iv), &[], buffer),
+        }
+        .map_err(|_| Error::Session("control encryption failed".into()))?;
+        Ok(tag.into())
+    }
+
+    fn decrypt(&self, seq: u32, from_host: bool, buffer: &mut [u8], tag: &[u8; 16]) -> Result<()> {
+        use aes_gcm::aead::AeadInPlace;
+        use aes_gcm::aead::consts::U16;
+        use aes_gcm::{Aes128Gcm, AesGcm, KeyInit};
+        let iv = self.nonce(seq, from_host);
+        let tag = aes_gcm::Tag::from_slice(tag);
+        match self.scheme {
+            Scheme::V2 => Aes128Gcm::new_from_slice(&self.key)
+                .map_err(|e| Error::Session(format!("control key rejected: {e}")))?
+                .decrypt_in_place_detached(aes_gcm::Nonce::<_>::from_slice(&iv), &[], buffer, tag),
+            Scheme::Legacy => AesGcm::<aes::Aes128, U16>::new_from_slice(&self.key)
+                .map_err(|e| Error::Session(format!("control key rejected: {e}")))?
+                .decrypt_in_place_detached(
+                    aes_gcm::Nonce::<U16>::from_slice(&iv),
+                    &[],
+                    buffer,
+                    tag,
+                ),
+        }
+        .map_err(|_| Error::Session("control frame failed authentication".into()))
     }
 }
 
@@ -282,5 +323,23 @@ mod tests {
         fn scheme_for_test(&self) -> Scheme {
             self.scheme
         }
+    }
+
+    #[test]
+    fn the_legacy_scheme_seals_and_opens_with_its_sixteen_byte_nonce() {
+        let mut client = Crypto::new([3; 16], false);
+        let host = Crypto::new([3; 16], false);
+        let frame = client
+            .seal(&message(msg::PERIODIC_PING, &[1, 2, 3]))
+            .unwrap();
+        let plain = host.open_as_host(&frame).unwrap();
+        assert_eq!(message_type(&plain), Some(msg::PERIODIC_PING));
+        assert_eq!(&plain[4..], &[1, 2, 3]);
+        // Legacy has no direction tag, so the client can open it as well.
+        assert_eq!(client.open(&frame).unwrap(), plain);
+        // Tampering fails authentication rather than yielding bytes.
+        let mut bad = frame.clone();
+        bad[30] ^= 1;
+        assert!(host.open_as_host(&bad).is_err());
     }
 }

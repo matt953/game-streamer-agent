@@ -19,6 +19,7 @@ mod audio;
 mod backend;
 mod codec;
 mod control;
+mod control_session;
 mod enet;
 mod hex;
 mod host;
@@ -34,7 +35,10 @@ mod video;
 pub use audio::AudioReceive;
 pub use backend::{MoonlightStream, start};
 pub use control::{Crypto, message, message_type, msg};
-pub use enet::{Command, HostMessage, run as run_control};
+pub use control_session::{
+    Command, ControlLink, ControlSession, Delivery, HostMessage, LinkEvent, Outgoing, drive,
+};
+pub use enet::{EnetLink, run_control};
 pub use host::{LaunchedSession, PairedSession, StreamMode};
 pub use identity::ClientIdentity;
 pub use input::InputEncoder;

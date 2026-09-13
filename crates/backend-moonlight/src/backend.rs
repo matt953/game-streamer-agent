@@ -24,7 +24,7 @@ use gsa_core::{Error, Result};
 /// recovery point — the frame from which references are clean again.
 #[derive(Debug)]
 pub struct MoonlightRecovery {
-    commands: std::sync::Mutex<std::sync::mpsc::Sender<Command>>,
+    commands: tokio::sync::mpsc::UnboundedSender<Command>,
     reference_invalidation: bool,
     /// Repair requests by kind. Counted separately because a host may answer
     /// an invalidation with a full keyframe anyway, which makes the cheap
@@ -49,9 +49,7 @@ impl RecoverySink for MoonlightRecovery {
     fn request_keyframe(&self) {
         self.keyframes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(tx) = self.commands.lock() {
-            let _ = tx.send(Command::RequestIdr);
-        }
+        let _ = self.commands.send(Command::RequestIdr);
     }
 
     fn request_recovery(&self, last_good_frame_id: u32) {
@@ -62,12 +60,10 @@ impl RecoverySink for MoonlightRecovery {
         if self.reference_invalidation {
             self.invalidations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Ok(tx) = self.commands.lock() {
-                let _ = tx.send(Command::InvalidateReferenceFrames {
-                    first: last_good_frame_id.wrapping_add(1),
-                    last: last_good_frame_id.wrapping_add(1),
-                });
-            }
+            let _ = self.commands.send(Command::InvalidateReferenceFrames {
+                first: last_good_frame_id.wrapping_add(1),
+                last: last_good_frame_id.wrapping_add(1),
+            });
             return;
         }
         self.request_keyframe();
@@ -80,7 +76,7 @@ impl RecoverySink for MoonlightRecovery {
 /// it is retained here rather than rebuilt per event.
 #[derive(Debug)]
 pub struct MoonlightInput {
-    commands: std::sync::mpsc::Sender<Command>,
+    commands: tokio::sync::mpsc::UnboundedSender<Command>,
     encoder: std::sync::Mutex<crate::InputEncoder>,
 }
 
@@ -244,7 +240,7 @@ impl MoonlightStream {
 /// Owns the receive threads and stops them on drop.
 #[derive(Debug)]
 pub struct Worker {
-    commands: std::sync::mpsc::Sender<Command>,
+    commands: tokio::sync::mpsc::UnboundedSender<Command>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -416,7 +412,7 @@ async fn connect(
         connect_data = ?negotiated.connect_data,
         "negotiated"
     );
-    let (command_tx, command_rx) = std::sync::mpsc::channel();
+    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     // Say which scheme this session sealed with, and on whose word. Picking
     // wrong is invisible from here — the host drops what it cannot verify
@@ -435,22 +431,14 @@ async fn connect(
     let crypto = Crypto::new(launched.riaes_key, negotiated.control_v2());
     let control_addr = std::net::SocketAddr::new(host_ip, negotiated.control_port);
     let connect_data = negotiated.connect_data.unwrap_or(0);
-    let control_commands = command_rx;
-    std::thread::Builder::new()
-        .name("moonlight-control".into())
-        .spawn(move || {
-            if let Err(e) = crate::run_control(
-                control_addr,
-                connect_data,
-                modern_start,
-                crypto,
-                control_commands,
-                event_tx,
-            ) {
-                tracing::warn!(error = %e, "control channel ended");
-            }
-        })
-        .map_err(|e| Error::Transport(format!("spawn control thread: {e}")))?;
+    // The protocol runs here, transport-neutral; ENet is the link under it.
+    let link = crate::EnetLink::connect(control_addr, connect_data)?;
+    let control = crate::ControlSession::new(crypto, modern_start);
+    gsa_core::runtime::spawn(async move {
+        if let Err(e) = crate::drive(link, control, command_rx, event_tx).await {
+            tracing::warn!(error = %e, "control channel ended");
+        }
+    });
 
     let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
     if let Some(layout) = &negotiated.surround {
@@ -458,7 +446,7 @@ async fn connect(
     }
     let (audio_rx, audio_pcm) = crate::AudioReceive::new(negotiated.surround.as_ref())?;
     let recovery = std::sync::Arc::new(MoonlightRecovery {
-        commands: std::sync::Mutex::new(command_tx.clone()),
+        commands: command_tx.clone(),
         // Off unless explicitly requested: it makes recovery from loss worse
         // on every host measured. The host's advertised capability is
         // recorded during negotiation, not acted on here.

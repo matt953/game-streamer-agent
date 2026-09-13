@@ -16,7 +16,7 @@
 //! tracked here rather than left to callers.
 
 use crate::control::{message, msg};
-use crate::enet::Delivery;
+use crate::control_session::Delivery;
 use gsa_client_backend_api::{GamepadProfile, MotionSensor, PadCaps, PadKind};
 use gsa_protocol::input::{BatteryState, InputEvent, MouseButton, MouseMove, TouchPhase, gamepad};
 
@@ -685,7 +685,10 @@ mod arrival_tests {
             0.5
         );
         // A stale sample is worse than no sample.
-        assert_eq!(message.delivery, crate::enet::Delivery::Unreliable);
+        assert_eq!(
+            message.delivery,
+            crate::control_session::Delivery::Unreliable
+        );
         let accel = encoder.motion_message(1, MotionSensor::Accel, [0.0; 3]);
         assert_eq!(body(&accel)[1], 0x01, "acceleration discriminator");
     }

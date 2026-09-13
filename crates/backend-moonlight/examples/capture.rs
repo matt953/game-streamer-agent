@@ -99,7 +99,7 @@ async fn capture(
 
     // The control channel must be up: some hosts only begin sending media
     // once they have seen the start messages on it.
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (evt_tx, evt_rx) = std::sync::mpsc::channel();
     let control_addr = std::net::SocketAddr::new(addr.ip(), negotiated.control_port);
     let crypto = gsa_backend_moonlight::Crypto::new(launched.riaes_key, negotiated.control_v2());

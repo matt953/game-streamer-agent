@@ -120,7 +120,7 @@ async fn report(
         }
     };
 
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
     let crypto = gsa_backend_moonlight::Crypto::new(launched.riaes_key, negotiated.control_v2());
     let control_addr = std::net::SocketAddr::new(addr.ip(), negotiated.control_port);

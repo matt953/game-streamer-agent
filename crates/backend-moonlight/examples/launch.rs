@@ -104,7 +104,7 @@ async fn main() {
 
                     // Bring up the control channel. This is the real test of
                     // whether a stock Rust ENet talks to the host's fork.
-                    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+                    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
                     let (evt_tx, evt_rx) = std::sync::mpsc::channel();
                     let control_addr = std::net::SocketAddr::new(addr.ip(), n.control_port);
                     let crypto =
