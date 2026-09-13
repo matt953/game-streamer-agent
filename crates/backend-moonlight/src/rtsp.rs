@@ -431,6 +431,7 @@ fn announce_sdp(host: &str, want: StreamRequest, host_sdp: &str) -> String {
          a=x-nv-audio.surround.channelMask:{mask}\r\n\
          a=x-nv-audio.surround.AudioQuality:0\r\n\
          a=x-nv-general.useReliableUdp:13\r\n\
+         a=x-nv-general.featureFlags:167\r\n\
          a=x-ss-general.encryptionEnabled:{encryption}\r\n\
          m=video 47998\r\n",
         want.width,

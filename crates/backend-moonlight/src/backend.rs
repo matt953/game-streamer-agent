@@ -473,7 +473,13 @@ async fn connect<L: StreamLinks>(
     if let Some(layout) = &negotiated.surround {
         tracing::info!(?layout, "surround audio negotiated");
     }
-    let (audio_rx, audio_pcm) = links.audio(&negotiated)?;
+    let (mut audio_rx, audio_pcm) = links.audio(&negotiated)?;
+    // The feature flags announced ask for audio under the session key
+    // (0x20); every host honours it, so every packet arrives sealed.
+    audio_rx.set_cipher(crate::AudioCipher::new(
+        launched.riaes_key,
+        launched.riaes_key_id as u32,
+    ));
     let recovery = std::sync::Arc::new(MoonlightRecovery {
         commands: command_tx.clone(),
         // Off unless explicitly requested: it makes recovery from loss worse

@@ -119,16 +119,68 @@ pub type SinkBox = Box<dyn OpusSink + Send>;
 #[cfg(target_arch = "wasm32")]
 pub type SinkBox = Box<dyn OpusSink>;
 
+/// The audio stream's encryption: AES-128-CBC with PKCS#7 padding under the
+/// session's `riaes` key, the IV being the key id plus the packet's 16-bit
+/// sequence number, big-endian, in the first four bytes. Asked for by the
+/// `0x20` bit of the feature flags the client announces, and a GFE-era
+/// convention every host honours, so every packet arrives sealed.
+#[derive(Clone, Copy)]
+pub struct AudioCipher {
+    key: [u8; 16],
+    iv_seed: u32,
+}
+
+impl AudioCipher {
+    #[must_use]
+    pub fn new(key: [u8; 16], iv_seed: u32) -> Self {
+        Self { key, iv_seed }
+    }
+
+    fn iv(&self, seq: u16) -> [u8; 16] {
+        let mut iv = [0u8; 16];
+        iv[..4].copy_from_slice(&self.iv_seed.wrapping_add(u32::from(seq)).to_be_bytes());
+        iv
+    }
+
+    /// The Opus packet inside `sealed`, or an error for bytes that were
+    /// not sealed under this key.
+    pub fn open(&self, seq: u16, sealed: &[u8]) -> gsa_core::Result<Vec<u8>> {
+        use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+        cbc::Decryptor::<aes::Aes128>::new(&self.key.into(), &self.iv(seq).into())
+            .decrypt_padded_vec_mut::<Pkcs7>(sealed)
+            .map_err(|e| gsa_core::Error::Decode(format!("audio packet: {e}")))
+    }
+
+    /// Seal `opus` as the host does; tests and hosts alike.
+    #[must_use]
+    pub fn seal(&self, seq: u16, opus: &[u8]) -> Vec<u8> {
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+        cbc::Encryptor::<aes::Aes128>::new(&self.key.into(), &self.iv(seq).into())
+            .encrypt_padded_vec_mut::<Pkcs7>(opus)
+    }
+}
+
+impl std::fmt::Debug for AudioCipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioCipher")
+            .field("iv_seed", &self.iv_seed)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Strips the wire off the audio stream and keeps it in order for the sink.
 pub struct AudioReceive {
     sink: SinkBox,
     last_seq: Option<u16>,
+    cipher: Option<AudioCipher>,
+    reported_bad_packet: bool,
 }
 
 impl std::fmt::Debug for AudioReceive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AudioReceive")
             .field("last_seq", &self.last_seq)
+            .field("cipher", &self.cipher)
             .finish_non_exhaustive()
     }
 }
@@ -149,7 +201,14 @@ impl AudioReceive {
         Self {
             sink,
             last_seq: None,
+            cipher: None,
+            reported_bad_packet: false,
         }
+    }
+
+    /// Open every packet with `cipher` before the sink sees it.
+    pub fn set_cipher(&mut self, cipher: AudioCipher) {
+        self.cipher = Some(cipher);
     }
 
     /// True for datagrams this receiver should be given.
@@ -181,7 +240,20 @@ impl AudioReceive {
                 self.sink.lost(missing);
             }
         }
-        self.sink.frame(&datagram[HEADER_LEN..]);
+        let payload = &datagram[HEADER_LEN..];
+        match &self.cipher {
+            Some(cipher) => match cipher.open(seq, payload) {
+                Ok(opus) => self.sink.frame(&opus),
+                Err(e) => {
+                    if !self.reported_bad_packet {
+                        self.reported_bad_packet = true;
+                        tracing::warn!(error = %e, seq, "audio packet did not open (key mismatch?)");
+                    }
+                    self.sink.lost(1);
+                }
+            },
+            None => self.sink.frame(payload),
+        }
         self.last_seq = Some(seq);
     }
 }
@@ -209,6 +281,25 @@ mod tests {
             .map(|i| ((i as f32 * 0.05).sin() * 8000.0) as i16)
             .collect();
         encoder.encode(&pcm).expect("encode")
+    }
+
+    #[test]
+    fn sealed_packets_open_under_the_session_key() {
+        use super::AudioCipher;
+        let cipher = AudioCipher::new([7u8; 16], 0x1234_5678);
+        let opus = opus_frame();
+        let sealed = cipher.seal(9, &opus);
+        assert_ne!(sealed, opus);
+        assert_eq!(cipher.open(9, &sealed).unwrap(), opus);
+        assert!(cipher.open(10, &sealed).is_err() || cipher.open(10, &sealed).unwrap() != opus);
+        // Through the receiver: the sink sees the plaintext.
+        let (mut receiver, pcm) = AudioReceive::new(None).unwrap();
+        receiver.set_cipher(cipher);
+        receiver.handle(&packet(9, &sealed, AUDIO_DATA));
+        assert!(pcm.try_recv().is_ok(), "the decoded frame reached the sink");
+        // The IV follows the 16-bit sequence the wire carries, wrapping.
+        let sealed = cipher.seal(u16::MAX, &opus);
+        assert_eq!(cipher.open(u16::MAX, &sealed).unwrap(), opus);
     }
 
     #[test]
