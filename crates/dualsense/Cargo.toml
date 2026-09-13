@@ -1,0 +1,18 @@
+[package]
+name = "gsa-dualsense"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "DualSense HID report codec: raw input reports to InputEvents, feedback to output reports. Shared by the browser (wasm) and any native client that reads a real pad."
+
+# Pure byte work, no I/O: the browser supplies and consumes the raw reports.
+# Builds for wasm32 and native alike.
+[dependencies]
+gsa-protocol = { workspace = true }
+gsa-client-backend-api = { workspace = true }
+
+[lints]
+workspace = true

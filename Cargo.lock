@@ -1470,6 +1470,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gsa-dualsense"
+version = "0.1.0"
+dependencies = [
+ "gsa-client-backend-api",
+ "gsa-protocol",
+]
+
+[[package]]
 name = "gsa-encode-api"
 version = "0.1.0"
 dependencies = [

@@ -152,6 +152,11 @@ pub mod gamepad {
     /// which a DualSense does not have.
     pub const TOUCHPAD: u32 = 0x10_0000;
 
+    /// A miscellaneous button with no XInput equivalent: the DualSense's
+    /// mic-mute button. Sits above the touchpad bit, where the host's virtual
+    /// DualSense reads it (altc's `altc-input` MISC mask).
+    pub const MISC: u32 = 0x20_0000;
+
     pub const DPAD_UP: u32 = 0x0001;
     pub const DPAD_DOWN: u32 = 0x0002;
     pub const DPAD_LEFT: u32 = 0x0004;
