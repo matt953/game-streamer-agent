@@ -52,7 +52,7 @@ impl WebTunnel {
         datagrams.set_incoming_max_age(50.0);
         datagrams.set_outgoing_max_age(50.0);
         let datagram_reader = ReadableStreamDefaultReader::new(&datagrams.readable())?;
-        let datagram_writer = datagrams.writable().get_writer()?;
+        let datagram_writer = datagram_writable(&datagrams).await?.get_writer()?;
         Ok(Self {
             transport,
             datagram_reader,
@@ -72,6 +72,23 @@ impl WebTunnel {
     pub fn close(&self) {
         self.transport.close();
     }
+}
+
+/// The stream outgoing datagrams are written to.
+///
+/// The specification renamed it: `datagrams.writable` became
+/// `datagrams.createWritable()`, a promise of a send stream. Chrome still
+/// offers both; Safari only the new form, which web-sys does not bind yet,
+/// so it is called by name where it exists.
+async fn datagram_writable(
+    datagrams: &web_sys::WebTransportDatagramDuplexStream,
+) -> Result<web_sys::WritableStream, JsValue> {
+    let create = js_sys::Reflect::get(datagrams, &JsValue::from_str("createWritable"))?;
+    if let Some(create) = create.dyn_ref::<js_sys::Function>() {
+        let stream = JsFuture::from(js_sys::Promise::resolve(&create.call0(datagrams)?)).await?;
+        return stream.dyn_into::<web_sys::WritableStream>();
+    }
+    Ok(datagrams.writable())
 }
 
 /// One chunk from a reader: `Ok(None)` at the end of the stream.
