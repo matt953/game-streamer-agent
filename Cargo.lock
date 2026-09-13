@@ -1241,6 +1241,7 @@ dependencies = [
  "gsa-client-core",
  "gsa-core",
  "gsa-protocol",
+ "gsa-tunnel",
  "rand_core 0.6.4",
  "rcgen",
  "roxmltree",
@@ -1529,6 +1530,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "gsa-tunnel"
+version = "0.1.0"
 
 [[package]]
 name = "half"

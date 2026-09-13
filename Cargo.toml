@@ -10,6 +10,7 @@ members = [
     "crates/sources",
     "crates/encode-sw",
     "crates/session",
+    "crates/tunnel",
     "crates/backend-moonlight",
     "crates/client-backend-api",
     "crates/client-core",
@@ -41,6 +42,7 @@ gsa-transport = { path = "crates/transport" }
 gsa-sources = { path = "crates/sources" }
 gsa-encode-sw = { path = "crates/encode-sw" }
 gsa-session = { path = "crates/session" }
+gsa-tunnel = { path = "crates/tunnel" }
 gsa-backend-moonlight = { path = "crates/backend-moonlight" }
 gsa-client-backend-api = { path = "crates/client-backend-api" }
 gsa-client-core = { path = "crates/client-core" }

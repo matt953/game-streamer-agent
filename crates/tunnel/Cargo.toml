@@ -1,0 +1,16 @@
+[package]
+name = "gsa-tunnel"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Wire format of the altc Moonlight tunnel: the four Moonlight channels over one WebTransport session"
+
+# Deliberately dependency-free: both ends — the browser client and the altc
+# server — build this, and the server pulls it in from git.
+[dependencies]
+
+[lints]
+workspace = true
