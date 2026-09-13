@@ -15,6 +15,7 @@ members = [
     "crates/client-backend-api",
     "crates/client-core",
     "crates/client-ffi",
+    "crates/client-web",
     "crates/client-dev",
     "crates/capture-macos",
     "crates/capture-windows",
@@ -47,6 +48,7 @@ gsa-backend-moonlight = { path = "crates/backend-moonlight" }
 gsa-client-backend-api = { path = "crates/client-backend-api" }
 gsa-client-core = { path = "crates/client-core" }
 gsa-client-ffi = { path = "crates/client-ffi" }
+gsa-client-web = { path = "crates/client-web" }
 gsa-capture-macos = { path = "crates/capture-macos" }
 gsa-capture-windows = { path = "crates/capture-windows" }
 gsa-encode-nvenc = { path = "crates/encode-nvenc" }
@@ -79,6 +81,13 @@ anyhow = "1"
 web-time = "1"
 wasm-bindgen-futures = "0.4"
 gloo-timers = { version = "0.3", features = ["futures"] }
+# The browser client's bindings.
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+wasm-bindgen-test = "0.3"
 
 # Apple FFI (macOS backends only)
 objc2 = "0.6"

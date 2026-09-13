@@ -1,0 +1,55 @@
+[package]
+name = "gsa-client-web"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "The browser client: the Moonlight backend over altc's WebTransport tunnel, exposed to JavaScript through wasm-bindgen"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Empty on every target but wasm32 (see lib.rs), so the native workspace
+# builds and lints it without a browser in sight.
+[dependencies]
+gsa-core = { workspace = true }
+gsa-backend-moonlight = { path = "../backend-moonlight", default-features = false }
+gsa-client-backend-api = { workspace = true }
+gsa-protocol = { workspace = true }
+gsa-tunnel = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = [
+    "WebTransport",
+    "WebTransportOptions",
+    "WebTransportHash",
+    "WebTransportCongestionControl",
+    "WebTransportBidirectionalStream",
+    "WebTransportSendStream",
+    "WebTransportReceiveStream",
+    "WebTransportDatagramDuplexStream",
+    "WebTransportCloseInfo",
+    "WebTransportStats",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamReadResult",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+] }
+serde-wasm-bindgen = { workspace = true }
+console_error_panic_hook = { workspace = true }
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
+[lints]
+workspace = true

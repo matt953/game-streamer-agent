@@ -6,3 +6,4 @@ crates/protocol/fuzz/artifacts
 .DS_Store
 /logs
 /devlogs/
+/crates/client-web/pkg

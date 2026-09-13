@@ -27,7 +27,8 @@ const MAX_PENDING_BEFORE_START: usize = 256;
 pub const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Something the host told us over the control channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostMessage {
     /// The control channel is up and the host accepted the session binding.
     /// Reported explicitly: a failure to connect is otherwise indistinguishable

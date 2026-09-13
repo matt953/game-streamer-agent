@@ -1,2 +1,7 @@
 [alias]
 xtask = "run -q -p xtask --"
+
+# web-sys ships WebTransport behind its unstable cfg while the standard is
+# still a draft; the browser client needs it on every wasm32 build.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

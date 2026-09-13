@@ -69,6 +69,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo hack check --workspace --each-feature --no-dev-deps
 
+  web:
+    name: browser client (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: Swatinem/rust-cache@v2
+      # The shared crates without their native features are what the
+      # browser builds; lint them as such, on the target they run on. Their
+      # tests stay native (tokio), so only the library targets go here.
+      - run: cargo clippy -p gsa-backend-moonlight -p gsa-client-core --no-default-features --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy -p gsa-client-web --target wasm32-unknown-unknown --all-targets -- -D warnings
+      # Real browser: the tests drive WebTransport and JavaScript interop.
+      - run: wasm-pack test --headless --chrome crates/client-web
+
   # ── Tier 1: merge to main (also on PRs while the suite is cheap) ────
   e2e:
     name: e2e loopback (${{ matrix.os }})
