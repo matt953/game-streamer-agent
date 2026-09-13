@@ -143,10 +143,34 @@ impl TunnelSession for WebTunnel {
     type Reader = WebStreamReader;
 
     async fn open_stream(&self) -> Result<(WebStreamWriter, WebStreamReader)> {
-        let stream: WebTransportBidirectionalStream =
-            JsFuture::from(self.transport.create_bidirectional_stream())
-                .await
-                .map_err(|e| js_error("open stream", &e))?;
+        // Safari can throw `InvalidStateError` for a stream opened in the
+        // instant after `ready` resolves; the transport is a hair from
+        // usable and settles within a frame. Retry that specific race a few
+        // times before giving up. A genuinely closed transport throws the
+        // same error, so the attempts are few and short.
+        let mut stream: Option<WebTransportBidirectionalStream> = None;
+        let mut last = None;
+        for attempt in 0..5 {
+            match JsFuture::from(self.transport.create_bidirectional_stream()).await {
+                Ok(s) => {
+                    stream = Some(s.unchecked_into());
+                    break;
+                }
+                Err(e) => {
+                    let invalid = e
+                        .dyn_ref::<web_sys::DomException>()
+                        .is_some_and(|d| d.name() == "InvalidStateError");
+                    last = Some(js_error("open stream", &e));
+                    if !invalid {
+                        break;
+                    }
+                    gsa_core::runtime::sleep(std::time::Duration::from_millis(20 * (attempt + 1)))
+                        .await;
+                }
+            }
+        }
+        let stream =
+            stream.ok_or_else(|| last.unwrap_or_else(|| Error::Transport("open stream".into())))?;
         let writer = stream
             .writable()
             .get_writer()
