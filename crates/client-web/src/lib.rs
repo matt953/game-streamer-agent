@@ -13,10 +13,12 @@
 
 mod audio;
 mod authority;
+mod dualsense;
 mod stream;
 mod transport;
 
 pub use authority::JsAuthority;
+pub use dualsense::DualSenseCodec;
 pub use stream::{WebFrame, WebStream};
 pub use transport::WebTunnel;
 

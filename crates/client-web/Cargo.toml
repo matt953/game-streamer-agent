@@ -19,6 +19,7 @@ gsa-backend-moonlight = { path = "../backend-moonlight", default-features = fals
 gsa-client-backend-api = { workspace = true }
 gsa-protocol = { workspace = true }
 gsa-tunnel = { workspace = true }
+gsa-dualsense = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

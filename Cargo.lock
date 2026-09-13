@@ -1430,6 +1430,7 @@ dependencies = [
  "gsa-backend-moonlight",
  "gsa-client-backend-api",
  "gsa-core",
+ "gsa-dualsense",
  "gsa-protocol",
  "gsa-tunnel",
  "js-sys",

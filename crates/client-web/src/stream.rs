@@ -192,6 +192,19 @@ impl WebStream {
         Ok(())
     }
 
+    /// Tell the host a DualSense occupies `seat`, so it builds a matching
+    /// virtual pad and turns on its features. Call once when the pad is
+    /// claimed over WebHID, before its first input.
+    #[wasm_bindgen]
+    pub fn announce_dualsense(&self, seat: u8) {
+        use gsa_client_backend_api::{GamepadProfile, PadKind};
+        if let Some(stream) = self.inner.stream.borrow().as_ref() {
+            let profile =
+                GamepadProfile::new(PadKind::DualSense, PadKind::DualSense.implied_caps());
+            stream.input.announce_pad(seat, profile);
+        }
+    }
+
     /// Ask the host for a keyframe: the decoder lost its reference chain.
     #[wasm_bindgen]
     pub fn request_keyframe(&self) {
