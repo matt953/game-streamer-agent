@@ -1249,6 +1249,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rusty_enet",
+ "serde",
  "sha2",
  "tokio",
  "tokio-rustls",

@@ -2,7 +2,7 @@
 //! libopus for audio.
 
 use crate::links::StreamLinks;
-use crate::{AudioReceive, EnetLink, Negotiated, Rtsp, TcpRtsp, UdpMediaLink};
+use crate::{AudioReceive, EnetLink, LaunchedSession, Negotiated, Rtsp, TcpRtsp, UdpMediaLink};
 use gsa_core::Result;
 
 /// Sockets straight to `host_ip`, as a client on the same network dials.
@@ -23,7 +23,7 @@ impl StreamLinks for SocketLinks {
     type Control = EnetLink;
     type Media = UdpMediaLink;
 
-    async fn rtsp(&mut self, rtsp: &Rtsp) -> Result<TcpRtsp> {
+    async fn rtsp(&mut self, _launched: &LaunchedSession, rtsp: &Rtsp) -> Result<TcpRtsp> {
         Ok(TcpRtsp::new(rtsp.addr()?))
     }
 

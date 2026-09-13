@@ -416,7 +416,7 @@ async fn connect<L: StreamLinks>(
     }
 
     let mut rtsp = Rtsp::new(&launched.rtsp_url)?;
-    let mut exchange = links.rtsp(&rtsp).await?;
+    let mut exchange = links.rtsp(launched, &rtsp).await?;
     let negotiated = rtsp
         .negotiate(
             &mut exchange,

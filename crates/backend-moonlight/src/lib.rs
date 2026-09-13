@@ -97,7 +97,7 @@ use gsa_core::{Error, Result};
 /// `MaxLumaPixelsHEVC` reads 0 and the codec bitfield is minimal until the
 /// caller presents a paired client certificate. Re-read capabilities over
 /// mutual TLS before relying on them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServerInfo {
     pub hostname: String,
     /// Host application version. Selects the pairing hash generation, so it is

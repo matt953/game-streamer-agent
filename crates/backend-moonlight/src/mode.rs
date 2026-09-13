@@ -1,8 +1,10 @@
 //! What a session asks for and what a launch hands back — the same on every
 //! transport.
 
+use serde::{Deserialize, Serialize};
+
 /// What we ask the host to encode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct StreamMode {
     pub width: u32,
     pub height: u32,
@@ -53,7 +55,7 @@ impl StreamMode {
 }
 
 /// A stream the host has started for us.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchedSession {
     /// Where to run the RTSP handshake.
     pub rtsp_url: String,
@@ -61,4 +63,9 @@ pub struct LaunchedSession {
     pub riaes_key: [u8; 16],
     /// Identifies that key; also feeds the control channel's nonces.
     pub riaes_key_id: i32,
+    /// The one-time token that joins a browser's tunnel to this session,
+    /// issued by altc's web launch. Absent for a host reached over the
+    /// network, where the sockets bind the session themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_token: Option<Vec<u8>>,
 }

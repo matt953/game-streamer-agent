@@ -9,8 +9,8 @@
 
 use crate::links::StreamLinks;
 use crate::{
-    AudioReceive, ControlLink, Delivery, LinkEvent, MediaDatagram, MediaLink, Negotiated, Outgoing,
-    Rtsp, RtspExchange, SinkBox,
+    AudioReceive, ControlLink, Delivery, LaunchedSession, LinkEvent, MediaDatagram, MediaLink,
+    Negotiated, Outgoing, Rtsp, RtspExchange, SinkBox,
 };
 use gsa_core::runtime::MaybeSend;
 use gsa_core::{Error, Result};
@@ -52,7 +52,6 @@ pub trait TunnelSession: Clone + MaybeSend + 'static {
 /// [`StreamLinks`] over a tunnel session.
 pub struct TunnelLinks<S: TunnelSession> {
     session: S,
-    token: Vec<u8>,
     audio: Option<SinkBox>,
     control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LinkEvent>>,
     media_rx: Option<tokio::sync::mpsc::UnboundedReceiver<MediaDatagram>>,
@@ -62,7 +61,6 @@ pub struct TunnelLinks<S: TunnelSession> {
 impl<S: TunnelSession> std::fmt::Debug for TunnelLinks<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TunnelLinks")
-            .field("token_len", &self.token.len())
             .field("pump_started", &self.pump.is_none())
             .finish_non_exhaustive()
     }
@@ -75,15 +73,14 @@ struct Pump {
 }
 
 impl<S: TunnelSession> TunnelLinks<S> {
-    /// Links over `session`, joining the Moonlight session `token` was
-    /// minted for. Opus audio goes to `audio`: the browser decodes it with
-    /// WebCodecs, so no PCM comes back through these links.
-    pub fn new(session: S, token: impl Into<Vec<u8>>, audio: SinkBox) -> Self {
+    /// Links over `session`, which the launch's token binds to its Moonlight
+    /// session at the first stream. Opus audio goes to `audio`: the browser
+    /// decodes it with WebCodecs, so no PCM comes back through these links.
+    pub fn new(session: S, audio: SinkBox) -> Self {
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         let (media_tx, media_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             session,
-            token: token.into(),
             audio: Some(audio),
             control_rx: Some(control_rx),
             media_rx: Some(media_rx),
@@ -156,10 +153,14 @@ impl<S: TunnelSession> StreamLinks for TunnelLinks<S> {
     type Control = TunnelControlLink<S>;
     type Media = TunnelMediaLink;
 
-    async fn rtsp(&mut self, _rtsp: &Rtsp) -> Result<Self::Rtsp> {
+    async fn rtsp(&mut self, launched: &LaunchedSession, _rtsp: &Rtsp) -> Result<Self::Rtsp> {
+        let token = launched
+            .tunnel_token
+            .clone()
+            .ok_or_else(|| Error::Auth("the launch carried no tunnel token".into()))?;
         let (mut writer, mut reader) = self.session.open_stream().await?;
         let mut opening = StreamKind::Rtsp.encode();
-        opening.extend(Frame::encode(&Hello::new(self.token.clone()).encode()));
+        opening.extend(Frame::encode(&Hello::new(token).encode()));
         writer.write(&opening).await?;
         let mut frames = FrameReader::new();
         read_welcome(&mut reader, &mut frames).await?;
@@ -492,6 +493,15 @@ mod tests {
         fn lost(&mut self, _count: u16) {}
     }
 
+    fn launched(token: &[u8]) -> LaunchedSession {
+        LaunchedSession {
+            rtsp_url: "rtsp://127.0.0.1:48010".into(),
+            riaes_key: [0; 16],
+            riaes_key_id: 0,
+            tunnel_token: Some(token.to_vec()),
+        }
+    }
+
     fn negotiated() -> Negotiated {
         Negotiated {
             video_port: 0,
@@ -523,11 +533,7 @@ mod tests {
     #[tokio::test]
     async fn rtsp_stream_says_hello_then_exchanges_framed_requests() {
         let (session, _dg) = mock();
-        let mut links = TunnelLinks::new(
-            session.clone(),
-            b"tok".to_vec(),
-            Box::new(CountingSink::default()),
-        );
+        let mut links = TunnelLinks::new(session.clone(), Box::new(CountingSink::default()));
         let rtsp = Rtsp::new("rtsp://127.0.0.1:48010").unwrap();
 
         // The server side: welcome, then answer one request.
@@ -560,7 +566,7 @@ mod tests {
             }
         });
 
-        let mut exchange = links.rtsp(&rtsp).await.unwrap();
+        let mut exchange = links.rtsp(&launched(b"tok"), &rtsp).await.unwrap();
         let reply = exchange
             .exchange(b"OPTIONS rtsp://x RTSP/1.0\r\n\r\n")
             .await
@@ -572,11 +578,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_token_is_an_auth_error() {
         let (session, _dg) = mock();
-        let mut links = TunnelLinks::new(
-            session.clone(),
-            b"bad".to_vec(),
-            Box::new(CountingSink::default()),
-        );
+        let mut links = TunnelLinks::new(session.clone(), Box::new(CountingSink::default()));
         let rtsp = Rtsp::new("rtsp://127.0.0.1:48010").unwrap();
         tokio::spawn({
             let session = session.clone();
@@ -591,20 +593,30 @@ mod tests {
                     .unwrap();
             }
         });
-        match links.rtsp(&rtsp).await {
+        match links.rtsp(&launched(b"bad"), &rtsp).await {
             Err(Error::Auth(msg)) => assert!(msg.contains("token"), "{msg}"),
             other => panic!("expected an auth error, got {other:?}"),
         }
     }
 
     #[tokio::test]
+    async fn a_launch_without_a_token_cannot_open_the_tunnel() {
+        let (session, _dg) = mock();
+        let mut links = TunnelLinks::new(session.clone(), Box::new(CountingSink::default()));
+        let rtsp = Rtsp::new("rtsp://127.0.0.1:48010").unwrap();
+        let mut no_token = launched(b"");
+        no_token.tunnel_token = None;
+        assert!(matches!(
+            links.rtsp(&no_token, &rtsp).await,
+            Err(Error::Auth(_))
+        ));
+        assert!(session.inner.lock().unwrap().opened.is_empty());
+    }
+
+    #[tokio::test]
     async fn control_uses_a_stream_per_channel_and_datagrams_for_unreliable() {
         let (session, datagrams_in) = mock();
-        let mut links = TunnelLinks::new(
-            session.clone(),
-            b"tok".to_vec(),
-            Box::new(CountingSink::default()),
-        );
+        let mut links = TunnelLinks::new(session.clone(), Box::new(CountingSink::default()));
 
         // Server: welcome both control streams as they appear.
         let welcomer = tokio::spawn({
@@ -699,11 +711,7 @@ mod tests {
     #[tokio::test]
     async fn media_datagrams_lose_their_tag_and_gain_an_arrival_stamp() {
         let (session, datagrams_in) = mock();
-        let mut links = TunnelLinks::new(
-            session.clone(),
-            b"tok".to_vec(),
-            Box::new(CountingSink::default()),
-        );
+        let mut links = TunnelLinks::new(session.clone(), Box::new(CountingSink::default()));
         let mut media = links.media(&negotiated()).await.unwrap();
         datagrams_in
             .send([&[datagram::VIDEO][..], b"video-rtp"].concat())

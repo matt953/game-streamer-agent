@@ -38,8 +38,13 @@ pub trait StreamLinks {
     type Control: ControlLink + MaybeSend + 'static;
     type Media: MediaLink + MaybeSend + 'static;
 
-    /// The RTSP exchange for `rtsp`, before negotiation.
-    fn rtsp(&mut self, rtsp: &Rtsp) -> impl std::future::Future<Output = Result<Self::Rtsp>>;
+    /// The RTSP exchange for `rtsp`, before negotiation. `launched` is the
+    /// launch that produced it, for links that bind to a session by token.
+    fn rtsp(
+        &mut self,
+        launched: &LaunchedSession,
+        rtsp: &Rtsp,
+    ) -> impl std::future::Future<Output = Result<Self::Rtsp>>;
     /// The control link, bound to the session the host just negotiated.
     fn control(
         &mut self,

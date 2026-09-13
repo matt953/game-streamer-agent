@@ -34,6 +34,7 @@ gsa-core = { workspace = true }
 gsa-client-backend-api = { workspace = true }
 gsa-protocol = { workspace = true }
 gsa-tunnel = { workspace = true }
+serde = { workspace = true }
 gsa-audio = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync", "macros"] }
 tracing = { workspace = true }

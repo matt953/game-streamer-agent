@@ -94,6 +94,7 @@ impl PairedSession {
             rtsp_url,
             riaes_key,
             riaes_key_id,
+            tunnel_token: None,
         })
     }
 
@@ -131,6 +132,7 @@ impl PairedSession {
             rtsp_url,
             riaes_key,
             riaes_key_id,
+            tunnel_token: None,
         })
     }
 
