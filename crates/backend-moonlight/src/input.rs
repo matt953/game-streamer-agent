@@ -173,8 +173,13 @@ pub struct InputEncoder {
     seated: [Option<GamepadProfile>; 16],
     /// Bumped whenever `seated` changes, so a reader notices without diffing.
     pads_generation: u64,
-    /// Seats the host has confirmed it stood a device up for.
+    /// Seats the host has confirmed it stood a device up for, as they relate
+    /// to this client's own pads.
     confirmed: u16,
+    /// Every seat the host has a device on, whoever announced it. Unlike
+    /// `confirmed` this is never cleared by our own unplug: a pad another
+    /// client put there is not ours to forget.
+    host_live: u16,
     /// Whether this host reports pad state at all. Until it says so, an
     /// unconfirmed seat means nothing rather than a failure.
     host_reports_pads: bool,
@@ -321,6 +326,9 @@ impl InputEncoder {
     fn unseat(&mut self, seat: u8) {
         let slot = usize::from(seat & 0x0f);
         if self.seated[slot].take().is_some() {
+            // Our own pad's blessing goes with it, so a later pad on this seat
+            // does not inherit it. What the host holds (`host_live`) is the
+            // host's to say, and is left alone.
             self.confirmed &= !(1u16 << (seat & 0x0f));
             self.pads_generation += 1;
         }
@@ -344,6 +352,19 @@ impl InputEncoder {
             .collect()
     }
 
+    /// Every seat the host currently has a device on, as a bitmask, whoever
+    /// put it there.
+    ///
+    /// A session can be joined by more than one client — the same user
+    /// resuming in another browser — and the host keeps a virtual pad for the
+    /// life of the session, not the life of the client that announced it. So a
+    /// client arriving into a session must place its pad on a seat nobody
+    /// holds rather than assume it is first.
+    #[must_use]
+    pub fn occupied_seats(&self) -> u16 {
+        self.host_live
+    }
+
     /// Bumped whenever [`InputEncoder::pads`] would answer differently.
     #[must_use]
     pub fn pads_generation(&self) -> u64 {
@@ -353,13 +374,15 @@ impl InputEncoder {
     /// Record the host's own word on `seat`.
     pub fn confirm_pad(&mut self, seat: u8, live: bool) {
         let bit = 1u16 << (seat & 0x0f);
-        let was = self.confirmed & bit != 0;
-        if was != live {
-            self.confirmed = if live {
-                self.confirmed | bit
-            } else {
-                self.confirmed & !bit
-            };
+        let before = (self.confirmed, self.host_live);
+        if live {
+            self.confirmed |= bit;
+            self.host_live |= bit;
+        } else {
+            self.confirmed &= !bit;
+            self.host_live &= !bit;
+        }
+        if before != (self.confirmed, self.host_live) {
             self.pads_generation += 1;
         }
     }
@@ -801,6 +824,39 @@ mod arrival_tests {
             .encode(&gsa_client_backend_api::InputEvent::GamepadDisconnect { seat: 0, ts_us: 0 });
         let _ = encoder.arrival_message(0, ds);
         assert_eq!(encoder.pads()[0].confirmed, Some(false));
+    }
+
+    /// A session can be joined by more than one client, and the host keeps a
+    /// pad for the life of the session rather than the life of the client that
+    /// announced it. So a client must be able to see which seats are taken,
+    /// including ones it never announced, and must not forget them when its
+    /// own pad goes away.
+    #[test]
+    fn seats_the_host_holds_are_visible_even_when_they_are_not_ours() {
+        let mut encoder = InputEncoder::new();
+        encoder.note_pads_reported();
+        assert_eq!(encoder.occupied_seats(), 0);
+
+        // Another client's pad, which this one never announced.
+        encoder.confirm_pad(0, true);
+        assert_eq!(encoder.occupied_seats(), 0b1);
+        assert!(encoder.pads().is_empty(), "it is not ours to list");
+
+        // Ours goes beside it, and both seats read as taken.
+        let ds = GamepadProfile::new(PadKind::DualSense, PadCaps::TOUCHPAD);
+        let _ = encoder.arrival_message(1, ds);
+        encoder.confirm_pad(1, true);
+        assert_eq!(encoder.occupied_seats(), 0b11);
+
+        // Dropping ours frees only ours; the other client's seat stands until
+        // the host itself says the device is gone.
+        let _ = encoder
+            .encode(&gsa_client_backend_api::InputEvent::GamepadDisconnect { seat: 1, ts_us: 0 });
+        assert_eq!(encoder.occupied_seats(), 0b11);
+        encoder.confirm_pad(1, false);
+        assert_eq!(encoder.occupied_seats(), 0b1);
+        encoder.confirm_pad(0, false);
+        assert_eq!(encoder.occupied_seats(), 0);
     }
 
     /// A host that goes purely on the type byte gives motion to a PlayStation

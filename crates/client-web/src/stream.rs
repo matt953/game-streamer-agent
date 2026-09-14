@@ -281,6 +281,18 @@ impl WebStream {
         serde_wasm_bindgen::to_value(&pads).map_err(Into::into)
     }
 
+    /// Every seat the host has a device on, as a bitmask, whoever put it
+    /// there — including a pad announced by another browser resuming this same
+    /// session. A client must place its own pad clear of these.
+    #[wasm_bindgen]
+    pub fn occupied_seats(&self) -> u16 {
+        self.inner
+            .stream
+            .borrow()
+            .as_ref()
+            .map_or(0, |stream| stream.input.occupied_seats())
+    }
+
     /// Changes whenever [`WebStream::pads`] would answer differently, so the
     /// page watches one number instead of rebuilding the list every frame.
     #[wasm_bindgen]

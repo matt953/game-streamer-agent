@@ -158,6 +158,13 @@ pub trait InputSink: std::fmt::Debug + Send + Sync {
         0
     }
 
+    /// Every seat the host has a device on, as a bitmask, whoever announced it.
+    /// A client joining a session already in progress must read this before
+    /// choosing where to put its own pad.
+    fn occupied_seats(&self) -> u16 {
+        0
+    }
+
     /// Record the host's own word on a seat, where the protocol carries it.
     fn confirm_pad(&self, seat: u8, live: bool) {
         let _ = (seat, live);

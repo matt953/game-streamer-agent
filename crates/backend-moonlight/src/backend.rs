@@ -133,6 +133,11 @@ impl InputSink for MoonlightInput {
             .unwrap_or_default()
     }
 
+    fn occupied_seats(&self) -> u16 {
+        self.with_encoder(|e| e.occupied_seats())
+            .unwrap_or_default()
+    }
+
     fn confirm_pad(&self, seat: u8, live: bool) {
         self.with_encoder(|e| e.confirm_pad(seat, live));
     }
