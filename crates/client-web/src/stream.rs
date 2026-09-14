@@ -96,13 +96,13 @@ fn codec_name(codec: Codec) -> &'static str {
 /// Deliberately not `PadKind::DualSense.implied_caps()`: announcing a feature
 /// makes the host enable it and the game send it, so claiming rumble, trigger
 /// rumble, adaptive triggers or the lights while this client has no output
-/// report would send those effects into a void. Motion is absent for the same
-/// reason — nothing parses it yet. Widen this as each one lands, and the host,
-/// the game and the interface all follow from here.
+/// report would send those effects into a void. Widen this as each one lands,
+/// and the host, the game and the interface all follow from here.
 const WEB_DUALSENSE_CAPS: gsa_client_backend_api::PadCaps =
     gsa_client_backend_api::PadCaps::from_bits(
         gsa_client_backend_api::PadCaps::TOUCHPAD.bits()
-            | gsa_client_backend_api::PadCaps::BATTERY.bits(),
+            | gsa_client_backend_api::PadCaps::BATTERY.bits()
+            | gsa_client_backend_api::PadCaps::MOTION.bits(),
     );
 
 /// One seated pad, as the page renders it.

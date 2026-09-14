@@ -44,6 +44,27 @@ impl DualSenseCodec {
         events_to_js(&out)
     }
 
+    /// Give the codec this pad's own sensor calibration, as feature report
+    /// `0x05` without its report id.
+    ///
+    /// Optional and best-effort: a pad whose calibration cannot be read still
+    /// reports motion, on the scaling every DualSense shares.
+    #[wasm_bindgen]
+    pub fn calibration(&mut self, body: &[u8]) {
+        self.parser
+            .set_calibration(gsa_dualsense::Calibration::parse(body));
+    }
+
+    /// Start or stop motion samples, at the rate the host asked for.
+    ///
+    /// Nothing is sent until the host says it built a motion-capable pad, and
+    /// the pad's own 250 Hz is thinned to this rate rather than flooding the
+    /// control channel.
+    #[wasm_bindgen]
+    pub fn set_motion_rate(&mut self, hz: u16) {
+        self.parser.set_motion_rate(hz);
+    }
+
     /// The event marking this pad gone, for the page to forward on unplug.
     #[wasm_bindgen]
     pub fn disconnect(&self) -> Result<JsValue, JsValue> {
