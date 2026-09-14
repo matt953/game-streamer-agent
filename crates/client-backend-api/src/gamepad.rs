@@ -243,6 +243,13 @@ impl std::ops::BitAnd for PadCaps {
 pub struct SeatedPad {
     pub seat: u8,
     pub profile: GamepadProfile,
+    /// The host's own word on this pad, where the host gives one.
+    ///
+    /// `None` on a host that does not report pad state at all, where silence
+    /// means nothing and an interface should show no state. `Some(false)` on a
+    /// host that does report, and has not confirmed this seat: the pad was
+    /// announced but the host has not stood one up, which is worth showing.
+    pub confirmed: Option<bool>,
 }
 
 /// A pad as the client sees it, announced to the backend per seat.

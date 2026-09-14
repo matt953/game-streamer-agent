@@ -157,6 +157,15 @@ pub trait InputSink: std::fmt::Debug + Send + Sync {
     fn pads_generation(&self) -> u64 {
         0
     }
+
+    /// Record the host's own word on a seat, where the protocol carries it.
+    fn confirm_pad(&self, seat: u8, live: bool) {
+        let _ = (seat, live);
+    }
+
+    /// Note that this host reports pad state, so an unconfirmed seat means
+    /// "not yet" rather than "this host never says".
+    fn note_pads_reported(&self) {}
 }
 
 /// A host-side event the embedder may surface. Backend-neutral: a variant here

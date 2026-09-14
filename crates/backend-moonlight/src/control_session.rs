@@ -75,6 +75,13 @@ pub enum HostMessage {
     /// ENet measures it on its own acknowledgements — a same-clock round trip,
     /// which is what makes it a real wire figure with no clock sync anywhere.
     LinkRtt { rtt_us: u32 },
+    /// The host's own word on its virtual pad for `seat`: live, or gone. Only
+    /// hosts that announce [`HostMessage::PadsReported`] send these.
+    PadState { seat: u8, live: bool },
+    /// This host reports pad state. Sent once when the control link comes up,
+    /// so the absence of a confirmation means "not yet" on a host that speaks
+    /// this, and means nothing at all on a host that does not.
+    PadsReported,
     /// A message type not acted on here, surfaced so callers can log it rather
     /// than discard it silently.
     ///
@@ -134,6 +141,14 @@ impl HostMessage {
             Self::LinkRtt { rtt_us } => {
                 Some(gsa_client_backend_api::BackendEvent::LinkRtt { rtt_us })
             }
+            Self::PadState { seat, live: true } => {
+                Some(gsa_client_backend_api::BackendEvent::GamepadConnected { seat })
+            }
+            Self::PadState { seat, live: false } => {
+                Some(gsa_client_backend_api::BackendEvent::GamepadDisconnected { seat })
+            }
+            // A capability announcement is for the core, not the embedder.
+            Self::PadsReported => None,
             Self::SetLed { controller, rgb } => {
                 Some(gsa_client_backend_api::BackendEvent::Feedback(
                     gsa_client_backend_api::GamepadFeedback::Led {
@@ -487,6 +502,7 @@ pub async fn drive<L: ControlLink>(
     mut session: ControlSession,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
     events: std::sync::mpsc::Sender<HostMessage>,
+    pads: std::sync::Arc<dyn gsa_client_backend_api::InputSink>,
 ) -> Result<()> {
     let opened = Instant::now();
     loop {
@@ -511,6 +527,14 @@ pub async fn drive<L: ControlLink>(
                 Some(LinkEvent::Frame(frame)) => {
                     if let Some(m) = session.on_frame(&frame) {
                         let terminated = matches!(m, HostMessage::Terminated { .. });
+                        // The host's word on its pads belongs in the core's
+                        // registry, so an interface reads one source rather
+                        // than stitching this together itself.
+                        match m {
+                            HostMessage::PadsReported => pads.note_pads_reported(),
+                            HostMessage::PadState { seat, live } => pads.confirm_pad(seat, live),
+                            _ => {}
+                        }
                         let _ = events.send(m);
                         if terminated {
                             link.close().await;
@@ -564,6 +588,26 @@ fn interpret(plaintext: &[u8]) -> Option<HostMessage> {
             .get(at..at + 2)
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
     };
+    if kind == msg::PAD_STATE && payload.len() >= 7 {
+        // Magic and version first: this type is ours, and a body that does not
+        // introduce itself is not one we are willing to read.
+        let magic = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        if magic != msg::PAD_STATE_MAGIC || payload[4] != msg::PAD_STATE_VERSION {
+            return None;
+        }
+        return match payload[6] {
+            0 => Some(HostMessage::PadState {
+                seat: payload[5],
+                live: false,
+            }),
+            1 => Some(HostMessage::PadState {
+                seat: payload[5],
+                live: true,
+            }),
+            2 => Some(HostMessage::PadsReported),
+            _ => None,
+        };
+    }
     if kind == msg::RUMBLE && payload.len() >= 10 {
         // Four bytes of padding precede the fields in this one, unlike its
         // trigger counterpart below.
@@ -783,6 +827,13 @@ mod session_tests {
         }
     }
 
+    /// A sink for tests that drive the control loop without a pad registry.
+    #[derive(Debug)]
+    struct NoPads;
+    impl gsa_client_backend_api::InputSink for NoPads {
+        fn send(&self, _events: Vec<gsa_client_backend_api::InputEvent>) {}
+    }
+
     #[tokio::test]
     async fn the_driver_starts_the_session_relays_the_host_and_stops_on_command() {
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -810,6 +861,7 @@ mod session_tests {
             ControlSession::new(Crypto::new(KEY, true), true),
             cmd_rx,
             evt_tx,
+            std::sync::Arc::new(NoPads),
         ));
         // Let the scripted events and the queued command flow, then stop.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -840,6 +892,46 @@ mod session_tests {
 mod tests {
     use super::{HostMessage, interpret};
     use crate::control::{message, msg};
+
+    /// The host's word on its pads is ours alone, so a body that does not
+    /// introduce itself with our magic and version must be refused rather than
+    /// read: that is what keeps a future upstream message on this type from
+    /// being silently misparsed as a pad state.
+    #[test]
+    fn pad_state_is_read_only_when_it_identifies_itself() {
+        let body = |magic: u32, version: u8, seat: u8, state: u8| {
+            let mut b = magic.to_be_bytes().to_vec();
+            b.extend_from_slice(&[version, seat, state]);
+            message(msg::PAD_STATE, &b)
+        };
+        assert_eq!(
+            interpret(&body(msg::PAD_STATE_MAGIC, msg::PAD_STATE_VERSION, 1, 1)),
+            Some(HostMessage::PadState {
+                seat: 1,
+                live: true
+            })
+        );
+        assert_eq!(
+            interpret(&body(msg::PAD_STATE_MAGIC, msg::PAD_STATE_VERSION, 1, 0)),
+            Some(HostMessage::PadState {
+                seat: 1,
+                live: false
+            })
+        );
+        assert_eq!(
+            interpret(&body(msg::PAD_STATE_MAGIC, msg::PAD_STATE_VERSION, 0xff, 2)),
+            Some(HostMessage::PadsReported)
+        );
+        // Someone else's message that happens to land on this type.
+        assert_eq!(interpret(&body(0xdead_beef, 1, 1, 1)), None);
+        // A body layout from a later version we have not been taught.
+        assert_eq!(interpret(&body(msg::PAD_STATE_MAGIC, 9, 1, 1)), None);
+        // A state we do not know is not a state we will guess at.
+        assert_eq!(
+            interpret(&body(msg::PAD_STATE_MAGIC, msg::PAD_STATE_VERSION, 1, 7)),
+            None
+        );
+    }
 
     #[test]
     fn reads_a_termination_reason_as_big_endian() {

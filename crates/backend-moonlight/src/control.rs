@@ -27,6 +27,21 @@ pub mod msg {
     pub const RGB_LED: u16 = 0x5502;
     /// Opaque trigger-effect blobs, host → client.
     pub const ADAPTIVE_TRIGGER: u16 = 0x5503;
+    /// Pad state, host → client: the host saying its virtual pad for a seat is
+    /// live or gone, and first that it reports this at all.
+    ///
+    /// Deliberately outside the `0x55xx` block, which upstream owns and is
+    /// still adding to: taking the next value there would collide the day a
+    /// real message is assigned it, and this client would then misread it. The
+    /// body carries a magic and a version so a renumbering is detected rather
+    /// than silently misparsed, and a host that never sends it simply leaves
+    /// the client with what it announced itself.
+    pub const PAD_STATE: u16 = 0x7a00;
+    /// `altc` in ASCII: the first four bytes of every [`PAD_STATE`] body.
+    pub const PAD_STATE_MAGIC: u32 = 0x616c_7463;
+    /// The only body layout this client reads.
+    pub const PAD_STATE_VERSION: u8 = 1;
+
     /// Implementations disagree with the specification here; both values are
     /// accepted on receive.
     pub const TERMINATION: u16 = 0x0109;

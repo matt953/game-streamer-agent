@@ -348,11 +348,20 @@ pub fn run_control(
     commands: tokio::sync::mpsc::UnboundedReceiver<crate::Command>,
     events: std::sync::mpsc::Sender<crate::HostMessage>,
 ) -> Result<()> {
+    /// Tools that drive the control channel on its own keep no pad registry;
+    /// a client that wants one calls `drive` with its own input sink.
+    #[derive(Debug)]
+    struct NoPadRegistry;
+    impl gsa_client_backend_api::InputSink for NoPadRegistry {
+        fn send(&self, _events: Vec<gsa_client_backend_api::InputEvent>) {}
+    }
+    let pads = std::sync::Arc::new(NoPadRegistry);
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| Error::Transport(format!("control runtime: {e}")))?;
     let link = EnetLink::connect(addr, connect_data)?;
     let session = crate::ControlSession::new(crypto, modern_start);
-    runtime.block_on(crate::drive(link, session, commands, events))
+    runtime.block_on(crate::drive(link, session, commands, events, pads))
 }

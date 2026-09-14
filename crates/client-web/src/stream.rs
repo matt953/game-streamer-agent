@@ -112,6 +112,9 @@ struct WebPad {
     kind: &'static str,
     caps: u16,
     features: Vec<&'static str>,
+    /// The host's own word: `None` where the host does not report pad state,
+    /// so the interface shows nothing rather than inventing a worry.
+    confirmed: Option<bool>,
 }
 
 #[wasm_bindgen]
@@ -248,6 +251,7 @@ impl WebStream {
                         kind: pad.profile.kind.label(),
                         caps: pad.profile.caps.bits(),
                         features: pad.profile.caps.names(),
+                        confirmed: pad.confirmed,
                     })
                     .collect()
             })

@@ -133,6 +133,14 @@ impl InputSink for MoonlightInput {
             .unwrap_or_default()
     }
 
+    fn confirm_pad(&self, seat: u8, live: bool) {
+        self.with_encoder(|e| e.confirm_pad(seat, live));
+    }
+
+    fn note_pads_reported(&self) {
+        self.with_encoder(crate::InputEncoder::note_pads_reported);
+    }
+
     fn announce_pad(&self, seat: u8, profile: gsa_client_backend_api::GamepadProfile) {
         let Ok(mut encoder) = self.encoder.lock() else {
             return;
@@ -473,13 +481,20 @@ async fn connect<L: StreamLinks>(
         encryption_supported = format!("{:#x}", negotiated.encryption_supported),
         "control encryption chosen from the host's advertisement"
     );
+    // The input sink owns the pad registry, and the control task writes the
+    // host's confirmations into it, so it is built before that task starts.
+    let input: std::sync::Arc<dyn InputSink> = std::sync::Arc::new(MoonlightInput {
+        commands: command_tx.clone(),
+        encoder: std::sync::Mutex::new(crate::InputEncoder::new()),
+    });
     let crypto = Crypto::new(launched.riaes_key, negotiated.control_v2());
     // The protocol runs here, transport-neutral; the link under it is the
     // caller's business.
     let link = links.control(&negotiated).await?;
     let control = crate::ControlSession::new(crypto, modern_start);
+    let pads = input.clone();
     gsa_core::runtime::spawn(async move {
-        if let Err(e) = crate::drive(link, control, command_rx, event_tx).await {
+        if let Err(e) = crate::drive(link, control, command_rx, event_tx, pads).await {
             tracing::warn!(error = %e, "control channel ended");
         }
     });
@@ -525,10 +540,7 @@ async fn connect<L: StreamLinks>(
         events: event_rx,
         recovery: recovery.clone(),
         repairs: recovery,
-        input: std::sync::Arc::new(MoonlightInput {
-            commands: command_tx.clone(),
-            encoder: std::sync::Mutex::new(crate::InputEncoder::new()),
-        }),
+        input,
         dropped,
         recovered,
         datagrams,

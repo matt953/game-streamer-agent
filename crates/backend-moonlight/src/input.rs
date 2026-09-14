@@ -173,6 +173,11 @@ pub struct InputEncoder {
     seated: [Option<GamepadProfile>; 16],
     /// Bumped whenever `seated` changes, so a reader notices without diffing.
     pads_generation: u64,
+    /// Seats the host has confirmed it stood a device up for.
+    confirmed: u16,
+    /// Whether this host reports pad state at all. Until it says so, an
+    /// unconfirmed seat means nothing rather than a failure.
+    host_reports_pads: bool,
 }
 
 impl InputEncoder {
@@ -316,6 +321,7 @@ impl InputEncoder {
     fn unseat(&mut self, seat: u8) {
         let slot = usize::from(seat & 0x0f);
         if self.seated[slot].take().is_some() {
+            self.confirmed &= !(1u16 << (seat & 0x0f));
             self.pads_generation += 1;
         }
     }
@@ -330,6 +336,9 @@ impl InputEncoder {
                 profile.map(|profile| gsa_client_backend_api::SeatedPad {
                     seat: seat as u8,
                     profile,
+                    confirmed: self
+                        .host_reports_pads
+                        .then(|| self.confirmed & (1u16 << (seat & 0x0f)) != 0),
                 })
             })
             .collect()
@@ -339,6 +348,28 @@ impl InputEncoder {
     #[must_use]
     pub fn pads_generation(&self) -> u64 {
         self.pads_generation
+    }
+
+    /// Record the host's own word on `seat`.
+    pub fn confirm_pad(&mut self, seat: u8, live: bool) {
+        let bit = 1u16 << (seat & 0x0f);
+        let was = self.confirmed & bit != 0;
+        if was != live {
+            self.confirmed = if live {
+                self.confirmed | bit
+            } else {
+                self.confirmed & !bit
+            };
+            self.pads_generation += 1;
+        }
+    }
+
+    /// Note that this host reports pad state at all.
+    pub fn note_pads_reported(&mut self) {
+        if !self.host_reports_pads {
+            self.host_reports_pads = true;
+            self.pads_generation += 1;
+        }
     }
 
     /// Announce what pad occupies `seat`, so the host builds a matching device.
@@ -736,6 +767,40 @@ mod arrival_tests {
         let pads = encoder.pads();
         assert_eq!(pads.len(), 1, "{pads:?}");
         assert_eq!(pads[0].seat, 1);
+    }
+
+    /// An unconfirmed seat means nothing on a host that never reports pad
+    /// state, and means "the host has not stood one up" on a host that does.
+    /// The difference is the whole point of the host announcing itself first.
+    #[test]
+    fn confirmation_is_only_meaningful_once_the_host_says_it_reports() {
+        let mut encoder = InputEncoder::new();
+        let ds = GamepadProfile::new(PadKind::DualSense, PadCaps::TOUCHPAD);
+        let _ = encoder.arrival_message(0, ds);
+        assert_eq!(
+            encoder.pads()[0].confirmed,
+            None,
+            "a silent host tells us nothing about the seat"
+        );
+
+        encoder.note_pads_reported();
+        assert_eq!(
+            encoder.pads()[0].confirmed,
+            Some(false),
+            "a reporting host that has not confirmed means not yet"
+        );
+
+        let before = encoder.pads_generation();
+        encoder.confirm_pad(0, true);
+        assert_eq!(encoder.pads()[0].confirmed, Some(true));
+        assert!(encoder.pads_generation() > before, "confirming is a change");
+
+        // The seat going away takes its confirmation with it, so a later pad
+        // on the same seat does not inherit the old one's blessing.
+        let _ = encoder
+            .encode(&gsa_client_backend_api::InputEvent::GamepadDisconnect { seat: 0, ts_us: 0 });
+        let _ = encoder.arrival_message(0, ds);
+        assert_eq!(encoder.pads()[0].confirmed, Some(false));
     }
 
     /// A host that goes purely on the type byte gives motion to a PlayStation
