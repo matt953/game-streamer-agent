@@ -86,21 +86,6 @@ impl PadKind {
         }
     }
 
-    /// The name of this pad's system button — the one every platform reserves
-    /// for its own overlay, and which a game is therefore not expecting.
-    ///
-    /// Named here rather than in each client so a prompt says "PS" to someone
-    /// holding a DualSense and "Guide" to someone holding an Xbox pad, from the
-    /// same place that decides which pad they are holding.
-    #[must_use]
-    pub const fn system_button(self) -> &'static str {
-        match self {
-            Self::DualSense | Self::DualShock4 => "PS",
-            Self::SwitchPro => "Home",
-            Self::Xbox | Self::Generic => "Guide",
-        }
-    }
-
     /// Identify a pad from a browser's `Gamepad.id`.
     ///
     /// Chrome writes the USB ids into that string ("… Vendor: 045e Product:
@@ -554,18 +539,6 @@ impl GamepadFeedback {
 #[cfg(test)]
 mod tests {
     use super::{DecodedTriggerEffect, GamepadFeedback, PadCaps, PadKind, TriggerEffect};
-
-    /// A prompt must name the button the person is actually looking at.
-    #[test]
-    fn the_system_button_is_named_for_the_pad_in_hand() {
-        assert_eq!(PadKind::DualSense.system_button(), "PS");
-        assert_eq!(PadKind::DualShock4.system_button(), "PS");
-        assert_eq!(PadKind::Xbox.system_button(), "Guide");
-        assert_eq!(PadKind::SwitchPro.system_button(), "Home");
-        // A pad we could not place is emulated as an Xbox, so it is told the
-        // same thing an Xbox would be.
-        assert_eq!(PadKind::Generic.system_button(), "Guide");
-    }
 
     /// The same pad must come out right whichever browser described it: by its
     /// USB ids where Chrome supplies them, and by its name where Safari does

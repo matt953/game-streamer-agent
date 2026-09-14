@@ -112,8 +112,6 @@ struct WebPad {
     kind: &'static str,
     caps: u16,
     features: Vec<&'static str>,
-    /// The button that opens the overlay on this pad, named for it.
-    system_button: &'static str,
     /// The host's own word: `None` where the host does not report pad state,
     /// so the interface shows nothing rather than inventing a worry.
     confirmed: Option<bool>,
@@ -272,7 +270,6 @@ impl WebStream {
                         kind: pad.profile.kind.label(),
                         caps: pad.profile.caps.bits(),
                         features: pad.profile.caps.names(),
-                        system_button: pad.profile.kind.system_button(),
                         confirmed: pad.confirmed,
                     })
                     .collect()
