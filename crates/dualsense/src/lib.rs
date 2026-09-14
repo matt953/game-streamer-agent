@@ -17,8 +17,10 @@
 #![forbid(unsafe_code)]
 
 mod input;
+mod motion;
 
 pub use input::{Connection, Parser};
+pub use motion::Calibration;
 
 /// Sony's USB vendor id.
 pub const VENDOR_SONY: u16 = 0x054c;

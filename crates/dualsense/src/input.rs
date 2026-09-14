@@ -6,6 +6,7 @@
 //! so every field shifts by one. WebHID hands the body without the report id, so
 //! the shift is decided by the connection, not by reading a leading byte.
 
+use crate::motion::Calibration;
 use gsa_protocol::input::{BatteryState, GamepadInput, InputEvent, TouchPhase, gamepad};
 
 /// How the pad is attached, which sets the report's field offsets.
@@ -58,6 +59,14 @@ pub struct Parser {
     have_axes: bool,
     contacts: [Contact; 2],
     last_battery: Option<(BatteryState, Option<u8>)>,
+    /// This pad's own sensor calibration, once its feature report has been
+    /// read. Until then every pad is read with the generic fallback.
+    calibration: Calibration,
+    /// Samples per second the host asked for, or zero for "not yet".
+    motion_hz: u16,
+    /// When the last motion sample went out, so the pad's own 250 Hz is
+    /// thinned to what was asked for.
+    last_motion_us: Option<u64>,
 }
 
 /// The DualSense touchpad's reported resolution.
@@ -87,7 +96,30 @@ impl Parser {
             have_axes: false,
             contacts: [Contact::default(); 2],
             last_battery: None,
+            calibration: Calibration::UNCALIBRATED,
+            motion_hz: 0,
+            last_motion_us: None,
         }
+    }
+
+    /// Give the pad its own calibration, read from feature report `0x05`.
+    ///
+    /// Optional: a pad works without it, on the generic scaling every pad
+    /// shares. With it, two controllers agree about what "still" is.
+    pub fn set_calibration(&mut self, calibration: Calibration) {
+        self.calibration = calibration;
+    }
+
+    /// The rate the host wants motion samples at, or zero to stop.
+    ///
+    /// Motion is opt-in: a pad that volunteers it floods a control channel
+    /// nobody asked to fill, so nothing is sent until the host has said it
+    /// built a motion-capable device and at what rate.
+    pub fn set_motion_rate(&mut self, hz: u16) {
+        if hz == 0 {
+            self.last_motion_us = None;
+        }
+        self.motion_hz = hz;
     }
 
     /// Parse one report body (without the report id), appending the events it
@@ -100,8 +132,36 @@ impl Parser {
             return;
         }
         self.parse_pad(b, data, ts_us, out);
+        self.parse_motion(b, data, ts_us, out);
         self.parse_touch(b, data, ts_us, out);
         self.parse_battery(b, data, ts_us, out);
+    }
+
+    /// Gyro and accelerometer, at the rate the host asked for.
+    ///
+    /// Unlike buttons, an unchanged sample is still worth sending: a game
+    /// integrating rotation reads "no new sample" as a dropped one, so these
+    /// go out on their cadence rather than on change.
+    fn parse_motion(&mut self, b: usize, data: &[u8], ts_us: u64, out: &mut Vec<InputEvent>) {
+        if self.motion_hz == 0 {
+            return;
+        }
+        let interval_us = 1_000_000 / u64::from(self.motion_hz);
+        if let Some(last) = self.last_motion_us
+            && ts_us.saturating_sub(last) < interval_us
+        {
+            return;
+        }
+        self.last_motion_us = Some(ts_us);
+        let word = |at: usize| i16::from_le_bytes([data[b + at], data[b + at + 1]]);
+        let raw_gyro = [word(15), word(17), word(19)];
+        let raw_accel = [word(21), word(23), word(25)];
+        out.push(InputEvent::GamepadMotion {
+            seat: self.seat,
+            gyro: self.calibration.gyro_deg_s(raw_gyro),
+            accel: self.calibration.accel_ms2(raw_accel),
+            ts_us,
+        });
     }
 
     fn parse_pad(&mut self, b: usize, data: &[u8], ts_us: u64, out: &mut Vec<InputEvent>) {
@@ -282,6 +342,79 @@ mod tests {
         r[32] = 0x80;
         r[36] = 0x80;
         r
+    }
+
+    /// One USB input report captured from a real DualSense lying still on a
+    /// desk, and that same pad's own calibration report. Both were read over
+    /// hidraw from the controller, not composed here: a report written to suit
+    /// the parser would agree with it no matter what either of them said.
+    #[rustfmt::skip]
+    const REST_REPORT: [u8; 63] = [
+        0x7e, 0x7f, 0x80, 0x82, 0x00, 0x00, 0x38, 0x08, 0x00, 0x00, 0x00, 0x7d,
+        0x94, 0x32, 0xc0, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x47, 0xff, 0xac,
+        0x1f, 0x27, 0x05, 0xda, 0x26, 0xfa, 0x09, 0x14, 0x81, 0x25, 0x60, 0x3f,
+        0x80, 0x00, 0x00, 0x00, 0x76, 0x09, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x34, 0x3d, 0xfa, 0x09, 0x28, 0x08, 0x00, 0xb3, 0xc9, 0xd3, 0x71, 0x9b,
+        0xa9, 0x07, 0x38,
+    ];
+    const REST_CALIBRATION: [u8; 40] = [
+        0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x63, 0x22, 0x9f, 0xdd, 0x4e, 0x22, 0xb7, 0xdd, 0x0d,
+        0x23, 0xfb, 0xdc, 0x1c, 0x02, 0x1c, 0x02, 0x05, 0x20, 0x1c, 0xe0, 0x26, 0x20, 0x2e, 0xe0,
+        0xe5, 0x1f, 0x07, 0xe0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    fn motion_of(events: &[InputEvent]) -> Option<([f32; 3], [f32; 3])> {
+        events.iter().find_map(|e| match e {
+            InputEvent::GamepadMotion { gyro, accel, .. } => Some((*gyro, *accel)),
+            _ => None,
+        })
+    }
+
+    /// Motion is opt-in and paced. Nothing goes out until the host has asked,
+    /// what does go out is the pad's real orientation, and a pad reporting at
+    /// 250 Hz does not send 250 samples a second when 100 were asked for.
+    #[test]
+    fn motion_waits_to_be_asked_and_then_arrives_at_the_rate_asked_for() {
+        let mut parser = Parser::new(0);
+        parser.set_calibration(crate::Calibration::parse(&REST_CALIBRATION));
+
+        let mut out = Vec::new();
+        parser.parse(Connection::Usb, &REST_REPORT, 0, &mut out);
+        assert!(
+            motion_of(&out).is_none(),
+            "a pad nobody asked must stay quiet: {out:?}"
+        );
+
+        parser.set_motion_rate(100);
+        out.clear();
+        parser.parse(Connection::Usb, &REST_REPORT, 1_000, &mut out);
+        let (gyro, accel) = motion_of(&out).expect("the host asked, so it arrives");
+        let magnitude = accel.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (magnitude - 9.80665).abs() < 0.25,
+            "a still pad feels one g, got {magnitude} from {accel:?}"
+        );
+        assert!(gyro.iter().all(|v| v.abs() < 1.0), "{gyro:?}");
+
+        // 100 Hz is one sample per 10 ms, whatever the pad's own rate is.
+        out.clear();
+        parser.parse(Connection::Usb, &REST_REPORT, 5_000, &mut out);
+        assert!(motion_of(&out).is_none(), "too soon: {out:?}");
+        out.clear();
+        parser.parse(Connection::Usb, &REST_REPORT, 11_000, &mut out);
+        assert!(motion_of(&out).is_some(), "the next slot is due");
+
+        // An unchanged sample still goes out: a game integrating rotation
+        // reads a missing sample as a dropped one, not as stillness.
+        out.clear();
+        parser.parse(Connection::Usb, &REST_REPORT, 22_000, &mut out);
+        assert!(motion_of(&out).is_some(), "identical, and still due");
+
+        // And the host can take it away again.
+        parser.set_motion_rate(0);
+        out.clear();
+        parser.parse(Connection::Usb, &REST_REPORT, 99_000, &mut out);
+        assert!(motion_of(&out).is_none(), "{out:?}");
     }
 
     fn buttons_of(events: &[InputEvent]) -> Option<u32> {
