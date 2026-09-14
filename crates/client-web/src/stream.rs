@@ -91,6 +91,29 @@ fn codec_name(codec: Codec) -> &'static str {
     }
 }
 
+/// What a DualSense read over WebHID can actually deliver in a browser today.
+///
+/// Deliberately not `PadKind::DualSense.implied_caps()`: announcing a feature
+/// makes the host enable it and the game send it, so claiming rumble, trigger
+/// rumble, adaptive triggers or the lights while this client has no output
+/// report would send those effects into a void. Motion is absent for the same
+/// reason — nothing parses it yet. Widen this as each one lands, and the host,
+/// the game and the interface all follow from here.
+const WEB_DUALSENSE_CAPS: gsa_client_backend_api::PadCaps =
+    gsa_client_backend_api::PadCaps::from_bits(
+        gsa_client_backend_api::PadCaps::TOUCHPAD.bits()
+            | gsa_client_backend_api::PadCaps::BATTERY.bits(),
+    );
+
+/// One seated pad, as the page renders it.
+#[derive(serde::Serialize)]
+struct WebPad {
+    seat: u8,
+    kind: &'static str,
+    caps: u16,
+    features: Vec<&'static str>,
+}
+
 #[wasm_bindgen]
 impl WebStream {
     /// Launch `app_id` through `authority` and bring the stream up over
@@ -199,10 +222,48 @@ impl WebStream {
     pub fn announce_dualsense(&self, seat: u8) {
         use gsa_client_backend_api::{GamepadProfile, PadKind};
         if let Some(stream) = self.inner.stream.borrow().as_ref() {
-            let profile =
-                GamepadProfile::new(PadKind::DualSense, PadKind::DualSense.implied_caps());
-            stream.input.announce_pad(seat, profile);
+            stream.input.announce_pad(
+                seat,
+                GamepadProfile::new(PadKind::DualSense, WEB_DUALSENSE_CAPS),
+            );
         }
+    }
+
+    /// Every pad the core currently has seated, as the interface should list
+    /// them: the seat, what the pad is, and what it carries.
+    #[wasm_bindgen]
+    pub fn pads(&self) -> Result<JsValue, JsValue> {
+        let pads: Vec<WebPad> = self
+            .inner
+            .stream
+            .borrow()
+            .as_ref()
+            .map(|stream| {
+                stream
+                    .input
+                    .pads()
+                    .into_iter()
+                    .map(|pad| WebPad {
+                        seat: pad.seat,
+                        kind: pad.profile.kind.label(),
+                        caps: pad.profile.caps.bits(),
+                        features: pad.profile.caps.names(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        serde_wasm_bindgen::to_value(&pads).map_err(Into::into)
+    }
+
+    /// Changes whenever [`WebStream::pads`] would answer differently, so the
+    /// page watches one number instead of rebuilding the list every frame.
+    #[wasm_bindgen]
+    pub fn pads_generation(&self) -> f64 {
+        self.inner
+            .stream
+            .borrow()
+            .as_ref()
+            .map_or(0, |stream| stream.input.pads_generation()) as f64
     }
 
     /// Ask the host for a keyframe: the decoder lost its reference chain.

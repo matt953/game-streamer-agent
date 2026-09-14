@@ -86,5 +86,8 @@ fn a_page_built_gamepad_event_deserializes() {
         }
         other => panic!("expected a gamepad, got {other:?}"),
     }
-    assert!(matches!(events[1], InputEvent::GamepadDisconnect { seat: 0, .. }));
+    assert!(matches!(
+        events[1],
+        InputEvent::GamepadDisconnect { seat: 0, .. }
+    ));
 }
