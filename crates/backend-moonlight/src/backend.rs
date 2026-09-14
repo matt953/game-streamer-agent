@@ -397,7 +397,17 @@ async fn begin<A: SessionAuthority>(
     running: u32,
 ) -> Result<(LaunchedSession, SessionOrigin)> {
     if running == app_id {
-        return Ok((session.resume(mode).await?, SessionOrigin::Rejoined));
+        // The host's state was read a moment ago and may have moved on since:
+        // the session can end between that read and this call, and then there
+        // is nothing to rejoin. That is not a failure, it is a race — launch
+        // the app instead of handing the viewer a dead end.
+        match session.resume(mode).await {
+            Ok(launched) => return Ok((launched, SessionOrigin::Rejoined)),
+            Err(e) => tracing::info!(
+                error = %e,
+                "nothing to resume after all; launching instead"
+            ),
+        }
     }
     if running != 0 {
         // Something else is running; it must stop before ours can start.
