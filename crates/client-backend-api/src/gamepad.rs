@@ -86,6 +86,27 @@ impl PadKind {
         }
     }
 
+    /// Identify a pad from a browser's `Gamepad.id`.
+    ///
+    /// Chrome writes the USB ids into that string ("… Vendor: 045e Product:
+    /// 0b12") while Safari and Firefox give a name only, so the ids are used
+    /// where they exist and the name carries it where they do not. Kept beside
+    /// [`PadKind::identify`] rather than in the web client, so the rule is
+    /// tested with the rest of them instead of only inside a browser.
+    #[must_use]
+    pub fn from_browser_id(id: &str) -> Self {
+        let field = |label: &str| -> u32 {
+            id.find(label)
+                .map(|at| id[at + label.len()..].trim_start())
+                .and_then(|rest| {
+                    let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+                    u32::from_str_radix(&hex, 16).ok()
+                })
+                .unwrap_or(0)
+        };
+        Self::identify(field("Vendor:"), field("Product:"), id)
+    }
+
     /// This kind's name, as a client shows it. One vocabulary, so every
     /// client labels a pad the same way rather than each inventing strings.
     #[must_use]
@@ -518,6 +539,40 @@ impl GamepadFeedback {
 #[cfg(test)]
 mod tests {
     use super::{DecodedTriggerEffect, GamepadFeedback, PadCaps, PadKind, TriggerEffect};
+
+    /// The same pad must come out right whichever browser described it: by its
+    /// USB ids where Chrome supplies them, and by its name where Safari does
+    /// not. A pad we cannot place is an Xbox, which is what every host emulates
+    /// best and claims no feature a stranger pad might lack.
+    #[test]
+    fn a_browser_id_identifies_a_pad_with_or_without_usb_ids() {
+        assert_eq!(
+            PadKind::from_browser_id(
+                "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b12)"
+            ),
+            PadKind::Xbox
+        );
+        assert_eq!(
+            PadKind::from_browser_id(
+                "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)"
+            ),
+            PadKind::DualSense
+        );
+        // Safari names the pad and gives no ids at all.
+        assert_eq!(
+            PadKind::from_browser_id("Xbox Wireless Controller Extended Gamepad"),
+            PadKind::Xbox
+        );
+        assert_eq!(
+            PadKind::from_browser_id("DualSense Extended Gamepad"),
+            PadKind::DualSense
+        );
+        // A Sony pad that is not a DualSense claims less, never more.
+        assert_eq!(
+            PadKind::from_browser_id("Wireless Controller (Vendor: 054c Product: 09cc)"),
+            PadKind::DualShock4
+        );
+    }
 
     /// The zone unpack against live captures: a host sending uniform force
     /// produces the same 3-bit value in every zone, which a wrong bit layout

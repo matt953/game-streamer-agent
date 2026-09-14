@@ -232,6 +232,25 @@ impl WebStream {
         }
     }
 
+    /// Announce a pad the browser reported through the Gamepad API, named by
+    /// its `Gamepad.id`.
+    ///
+    /// The core decides what the pad is, from the same rules every client
+    /// uses, so the host builds a matching device and the interface can say
+    /// "Xbox Controller" rather than "Controller". Capabilities stay empty:
+    /// the Gamepad API carries buttons, sticks and triggers and nothing else,
+    /// whatever the pad in the user's hands can do.
+    #[wasm_bindgen]
+    pub fn announce_gamepad(&self, seat: u8, id: &str) {
+        use gsa_client_backend_api::{GamepadProfile, PadCaps, PadKind};
+        if let Some(stream) = self.inner.stream.borrow().as_ref() {
+            let kind = PadKind::from_browser_id(id);
+            stream
+                .input
+                .announce_pad(seat, GamepadProfile::new(kind, PadCaps::NONE));
+        }
+    }
+
     /// Every pad the core currently has seated, as the interface should list
     /// them: the seat, what the pad is, and what it carries.
     #[wasm_bindgen]
