@@ -86,6 +86,19 @@ impl PadKind {
         }
     }
 
+    /// This kind's name, as a client shows it. One vocabulary, so every
+    /// client labels a pad the same way rather than each inventing strings.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Generic => "Controller",
+            Self::Xbox => "Xbox Controller",
+            Self::DualShock4 => "DualShock 4",
+            Self::DualSense => "DualSense",
+            Self::SwitchPro => "Switch Pro Controller",
+        }
+    }
+
     /// Features implied by the family alone, whatever the platform reports.
     ///
     /// A client ORs these with what it can actually observe (sensors, a
@@ -164,6 +177,37 @@ impl PadCaps {
         self.0 & other.0 == other.0
     }
 
+    /// The names of the capabilities in this set, in a stable order. The one
+    /// place a capability is given a human name, so an interface can list what
+    /// a pad carries without restating these bits in another language.
+    #[must_use]
+    pub fn names(self) -> Vec<&'static str> {
+        // Gyro and accel are reported together as "Motion": a pad with one and
+        // not the other is a case no hardware presents, and two rows for one
+        // feature reads as clutter.
+        let mut out = Vec::new();
+        if self.contains(Self::MOTION) {
+            out.push("Motion");
+        } else if self.contains(Self::GYRO) {
+            out.push("Gyro");
+        } else if self.contains(Self::ACCEL) {
+            out.push("Accelerometer");
+        }
+        for (bit, name) in [
+            (Self::RUMBLE, "Rumble"),
+            (Self::TRIGGER_RUMBLE, "Trigger rumble"),
+            (Self::TOUCHPAD, "Touchpad"),
+            (Self::ADAPTIVE_TRIGGERS, "Adaptive triggers"),
+            (Self::LED, "Lightbar"),
+            (Self::BATTERY, "Battery"),
+        ] {
+            if self.contains(bit) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -191,6 +235,14 @@ impl std::ops::BitAnd for PadCaps {
     fn bitand(self, rhs: Self) -> Self {
         Self(self.0 & rhs.0)
     }
+}
+
+/// A pad the client currently has seated, as the core knows it: the registry
+/// an interface should read rather than keeping its own tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeatedPad {
+    pub seat: u8,
+    pub profile: GamepadProfile,
 }
 
 /// A pad as the client sees it, announced to the backend per seat.

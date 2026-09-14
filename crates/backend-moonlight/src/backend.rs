@@ -80,6 +80,12 @@ pub struct MoonlightInput {
     encoder: std::sync::Mutex<crate::InputEncoder>,
 }
 
+impl MoonlightInput {
+    fn with_encoder<T>(&self, f: impl FnOnce(&mut crate::InputEncoder) -> T) -> Option<T> {
+        self.encoder.lock().ok().map(|mut e| f(&mut e))
+    }
+}
+
 impl InputSink for MoonlightInput {
     fn send(&self, events: Vec<gsa_client_backend_api::InputEvent>) {
         let Ok(mut encoder) = self.encoder.lock() else {
@@ -116,6 +122,15 @@ impl InputSink for MoonlightInput {
                 });
             }
         }
+    }
+
+    fn pads(&self) -> Vec<gsa_client_backend_api::SeatedPad> {
+        self.with_encoder(|e| e.pads()).unwrap_or_default()
+    }
+
+    fn pads_generation(&self) -> u64 {
+        self.with_encoder(|e| e.pads_generation())
+            .unwrap_or_default()
     }
 
     fn announce_pad(&self, seat: u8, profile: gsa_client_backend_api::GamepadProfile) {

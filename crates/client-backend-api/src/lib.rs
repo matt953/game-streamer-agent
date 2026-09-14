@@ -24,7 +24,7 @@ pub mod gamepad;
 
 pub use gamepad::{
     DecodedTriggerEffect, GamepadFeedback, GamepadProfile, MotionSensor, PadCaps, PadKind,
-    TriggerEffect,
+    SeatedPad, TriggerEffect,
 };
 use gsa_core::Result;
 pub use gsa_protocol::input::InputEvent;
@@ -141,6 +141,21 @@ pub trait InputSink: std::fmt::Debug + Send + Sync {
     /// announcement keep the default and infer the pad from its input.
     fn announce_pad(&self, seat: u8, profile: GamepadProfile) {
         let _ = (seat, profile);
+    }
+
+    /// Every pad the client currently has seated, lowest seat first.
+    ///
+    /// The core's own registry: what it announced, and what it has seen state
+    /// for. An interface lists controllers from this rather than keeping a
+    /// parallel tally of its own, which is how the two drift apart.
+    fn pads(&self) -> Vec<SeatedPad> {
+        Vec::new()
+    }
+
+    /// Bumped whenever [`InputSink::pads`] would return something different,
+    /// so a caller can notice a change without comparing the list each frame.
+    fn pads_generation(&self) -> u64 {
+        0
     }
 }
 

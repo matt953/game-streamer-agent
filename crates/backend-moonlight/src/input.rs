@@ -166,6 +166,13 @@ pub struct InputEncoder {
     modifiers: u8,
     /// Bitmask of controller slots that should stay plugged in.
     active_pads: u16,
+    /// What occupies each seat, by seat index. The core's own registry: an
+    /// announced pad records its profile here, and a seat seen only through a
+    /// state packet records a generic one, so an interface can list what is
+    /// connected from the same place the wire is built from.
+    seated: [Option<GamepadProfile>; 16],
+    /// Bumped whenever `seated` changes, so a reader notices without diffing.
+    pads_generation: u64,
 }
 
 impl InputEncoder {
@@ -242,10 +249,15 @@ impl InputEncoder {
             }
             InputEvent::Gamepad(pad) => {
                 self.active_pads |= 1u16 << (pad.seat & 0x0f);
+                // A seat that arrives as bare state was never announced, so
+                // the host builds a default device for it; record it as the
+                // generic pad it is rather than leaving the registry blind.
+                self.seat_default(pad.seat);
                 Some(self.controller_message(pad))
             }
             InputEvent::GamepadDisconnect { seat, .. } => {
                 self.active_pads &= !(1u16 << (seat & 0x0f));
+                self.unseat(*seat);
                 // There is no unplug message: removal is a normal state packet
                 // whose active mask no longer includes the slot.
                 let idle = gsa_protocol::input::GamepadInput {
@@ -282,12 +294,63 @@ impl InputEncoder {
         }
     }
 
+    /// Record a seat nobody announced as a plain pad. Announcing later
+    /// replaces this, so an early state packet cannot pin the seat as generic.
+    fn seat_default(&mut self, seat: u8) {
+        let slot = usize::from(seat & 0x0f);
+        if self.seated[slot].is_none() {
+            self.seated[slot] = Some(GamepadProfile::new(PadKind::Generic, PadCaps::NONE));
+            self.pads_generation += 1;
+        }
+    }
+
+    /// Record what a client announced for `seat`.
+    fn seat_profile(&mut self, seat: u8, profile: GamepadProfile) {
+        let slot = usize::from(seat & 0x0f);
+        if self.seated[slot] != Some(profile) {
+            self.seated[slot] = Some(profile);
+            self.pads_generation += 1;
+        }
+    }
+
+    fn unseat(&mut self, seat: u8) {
+        let slot = usize::from(seat & 0x0f);
+        if self.seated[slot].take().is_some() {
+            self.pads_generation += 1;
+        }
+    }
+
+    /// Every pad currently seated, lowest seat first.
+    #[must_use]
+    pub fn pads(&self) -> Vec<gsa_client_backend_api::SeatedPad> {
+        self.seated
+            .iter()
+            .enumerate()
+            .filter_map(|(seat, profile)| {
+                profile.map(|profile| gsa_client_backend_api::SeatedPad {
+                    seat: seat as u8,
+                    profile,
+                })
+            })
+            .collect()
+    }
+
+    /// Bumped whenever [`InputEncoder::pads`] would answer differently.
+    #[must_use]
+    pub fn pads_generation(&self) -> u64 {
+        self.pads_generation
+    }
+
     /// Announce what pad occupies `seat`, so the host builds a matching device.
     ///
     /// Nothing richer than buttons works before this: a host that has not been
     /// told what the pad is creates a plain Xbox device, and then drops motion,
     /// touch and battery for it without complaint.
-    pub fn arrival_message(&self, seat: u8, profile: GamepadProfile) -> WireMessage {
+    pub fn arrival_message(&mut self, seat: u8, profile: GamepadProfile) -> WireMessage {
+        // Announcing is what makes the seat authoritative: record it here so
+        // every caller registers by the act of announcing, rather than each
+        // remembering to tell the registry separately.
+        self.seat_profile(seat, profile);
         let mut body = Vec::with_capacity(8);
         body.push(seat & 0x0f);
         body.push(pad_type_byte(profile.kind));
@@ -613,7 +676,7 @@ mod arrival_tests {
     /// with a zero high byte is the only encoding both accept.
     #[test]
     fn an_arrival_body_is_eight_bytes_so_either_reading_works() {
-        let encoder = InputEncoder::new();
+        let mut encoder = InputEncoder::new();
         let message = encoder.arrival_message(
             0,
             GamepadProfile::new(PadKind::DualSense, PadCaps::RUMBLE | PadCaps::MOTION),
@@ -631,12 +694,56 @@ mod arrival_tests {
         );
     }
 
+    /// The registry is what an interface lists controllers from, so it must
+    /// follow both ways a seat fills: an announcement, and bare state from a
+    /// pad nobody announced.
+    #[test]
+    fn the_registry_follows_announced_and_unannounced_seats() {
+        let mut encoder = InputEncoder::new();
+        assert!(encoder.pads().is_empty());
+        let start = encoder.pads_generation();
+
+        let ds = GamepadProfile::new(PadKind::DualSense, PadCaps::TOUCHPAD | PadCaps::BATTERY);
+        let _ = encoder.arrival_message(0, ds);
+        assert_eq!(encoder.pads().len(), 1);
+        assert_eq!(encoder.pads()[0].seat, 0);
+        assert_eq!(encoder.pads()[0].profile, ds);
+        assert!(
+            encoder.pads_generation() > start,
+            "announcing must be noticed"
+        );
+
+        // A seat that only ever sends state is a generic pad, not nothing.
+        let _ = encoder.encode(&gsa_client_backend_api::InputEvent::Gamepad(
+            gsa_protocol::input::GamepadInput {
+                seat: 1,
+                buttons: 0,
+                axes: [0; 8],
+                ts_us: 0,
+            },
+        ));
+        let pads = encoder.pads();
+        assert_eq!(pads.len(), 2, "{pads:?}");
+        assert_eq!(pads[1].profile.kind, PadKind::Generic);
+
+        // Announcing after state replaces the generic guess rather than
+        // leaving the seat pinned as the wrong device.
+        let _ = encoder.arrival_message(1, ds);
+        assert_eq!(encoder.pads()[1].profile, ds);
+
+        let _ = encoder
+            .encode(&gsa_client_backend_api::InputEvent::GamepadDisconnect { seat: 0, ts_us: 0 });
+        let pads = encoder.pads();
+        assert_eq!(pads.len(), 1, "{pads:?}");
+        assert_eq!(pads[0].seat, 1);
+    }
+
     /// A host that goes purely on the type byte gives motion to a PlayStation
     /// pad and to nothing else, so the pad must be reported honestly.
     #[test]
     fn pad_types_map_to_the_hosts_families() {
-        let encoder = InputEncoder::new();
-        let kind_byte =
+        let mut encoder = InputEncoder::new();
+        let mut kind_byte =
             |kind| body(&encoder.arrival_message(0, GamepadProfile::new(kind, PadCaps::NONE)))[1];
         assert_eq!(kind_byte(PadKind::DualSense), 0x02);
         assert_eq!(kind_byte(PadKind::DualShock4), 0x02);
@@ -665,7 +772,7 @@ mod arrival_tests {
 
     #[test]
     fn motion_is_three_little_endian_floats_and_never_retransmitted() {
-        let encoder = InputEncoder::new();
+        let mut encoder = InputEncoder::new();
         let message = encoder.motion_message(1, MotionSensor::Gyro, [1.0, -2.0, 0.5]);
         let fields = body(&message);
         assert_eq!(input_type(&message), 0x5500_0006);
@@ -911,7 +1018,7 @@ mod tests {
             ts_us: 0,
         }));
         let out = e
-            .encode(&InputEvent::GamepadDisconnect { seat: 0, ts_us: 0 })
+            .encode(&gsa_client_backend_api::InputEvent::GamepadDisconnect { seat: 0, ts_us: 0 })
             .unwrap();
         // The active mask lives 4 bytes into the body; a cleared bit is what
         // tells the host to unplug the pad.
