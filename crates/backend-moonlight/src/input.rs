@@ -171,6 +171,10 @@ pub struct InputEncoder {
     /// state packet records a generic one, so an interface can list what is
     /// connected from the same place the wire is built from.
     seated: [Option<GamepadProfile>; 16],
+    /// The last charge each seat reported, by seat index. A pad speaks its
+    /// battery on the way past to the host; the registry keeps it so an
+    /// interface reads the level from the same place it reads the pad.
+    battery: [Option<gsa_client_backend_api::PadBattery>; 16],
     /// Bumped whenever `seated` changes, so a reader notices without diffing.
     pads_generation: u64,
     /// Seats the host has confirmed it stood a device up for, as they relate
@@ -296,11 +300,27 @@ impl InputEncoder {
                 state,
                 percent,
                 ..
-            } => Some(battery_message(*seat, *state, *percent)),
+            } => {
+                self.note_battery(*seat, *state, *percent);
+                Some(battery_message(*seat, *state, *percent))
+            }
             // Touchscreen and pen events have wire kinds this backend does not
             // send: the scope here is gaming, and a pad's touchpad is a
             // different message from a screen's.
             _ => None,
+        }
+    }
+
+    /// Record what a seat last said about its charge. Pads repeat this, so
+    /// only a change is a change: the generation is what an interface watches,
+    /// and bumping it every report would rebuild the list several times a
+    /// second for no news.
+    fn note_battery(&mut self, seat: u8, state: BatteryState, percent: Option<u8>) {
+        let slot = usize::from(seat & 0x0f);
+        let now = Some(gsa_client_backend_api::PadBattery { state, percent });
+        if self.battery[slot] != now {
+            self.battery[slot] = now;
+            self.pads_generation += 1;
         }
     }
 
@@ -330,6 +350,9 @@ impl InputEncoder {
             // does not inherit it. What the host holds (`host_live`) is the
             // host's to say, and is left alone.
             self.confirmed &= !(1u16 << (seat & 0x0f));
+            // The charge belonged to the pad that left; the next pad on this
+            // seat is a different controller with a different battery.
+            self.battery[slot] = None;
             self.pads_generation += 1;
         }
     }
@@ -347,6 +370,7 @@ impl InputEncoder {
                     confirmed: self
                         .host_reports_pads
                         .then(|| self.confirmed & (1u16 << (seat & 0x0f)) != 0),
+                    battery: self.battery[seat & 0x0f],
                 })
             })
             .collect()
@@ -792,6 +816,57 @@ mod arrival_tests {
         assert_eq!(pads[0].seat, 1);
     }
 
+    /// The charge a pad reports on its way to the host is kept beside the pad
+    /// in the registry, so an interface reads the level from the core rather
+    /// than parsing reports itself. Repeats are not news, and the level
+    /// belongs to the pad that gave it.
+    #[test]
+    fn a_pad_carries_its_last_reported_charge_in_the_registry() {
+        let mut encoder = InputEncoder::new();
+        let ds = GamepadProfile::new(PadKind::DualSense, PadCaps::TOUCHPAD | PadCaps::BATTERY);
+        let _ = encoder.arrival_message(0, ds);
+        assert_eq!(encoder.pads()[0].battery, None, "silence is not empty");
+
+        let report = |state, percent| gsa_client_backend_api::InputEvent::GamepadBattery {
+            seat: 0,
+            state,
+            percent,
+            ts_us: 0,
+        };
+        let _ = encoder.encode(&report(BatteryState::Discharging, Some(70)));
+        assert_eq!(
+            encoder.pads()[0].battery,
+            Some(gsa_client_backend_api::PadBattery {
+                state: BatteryState::Discharging,
+                percent: Some(70),
+            })
+        );
+
+        // A pad repeats its charge; only a change is a change.
+        let settled = encoder.pads_generation();
+        let _ = encoder.encode(&report(BatteryState::Discharging, Some(70)));
+        assert_eq!(encoder.pads_generation(), settled, "a repeat is not news");
+        let _ = encoder.encode(&report(BatteryState::Charging, Some(70)));
+        assert!(encoder.pads_generation() > settled, "plugging in is news");
+
+        // A state with no level is still worth showing: charging is charging.
+        let _ = encoder.encode(&report(BatteryState::Charging, None));
+        assert_eq!(
+            encoder.pads()[0].battery,
+            Some(gsa_client_backend_api::PadBattery {
+                state: BatteryState::Charging,
+                percent: None,
+            })
+        );
+
+        // The charge left with the pad, so the next controller on this seat
+        // does not inherit the last one's battery.
+        let _ = encoder
+            .encode(&gsa_client_backend_api::InputEvent::GamepadDisconnect { seat: 0, ts_us: 0 });
+        let _ = encoder.arrival_message(0, ds);
+        assert_eq!(encoder.pads()[0].battery, None);
+    }
+
     /// An unconfirmed seat means nothing on a host that never reports pad
     /// state, and means "the host has not stood one up" on a host that does.
     /// The difference is the whole point of the host announcing itself first.
@@ -893,7 +968,7 @@ mod arrival_tests {
 
     #[test]
     fn motion_is_three_little_endian_floats_and_never_retransmitted() {
-        let mut encoder = InputEncoder::new();
+        let encoder = InputEncoder::new();
         let message = encoder.motion_message(1, MotionSensor::Gyro, [1.0, -2.0, 0.5]);
         let fields = body(&message);
         assert_eq!(input_type(&message), 0x5500_0006);

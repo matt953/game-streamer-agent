@@ -23,8 +23,8 @@
 pub mod gamepad;
 
 pub use gamepad::{
-    DecodedTriggerEffect, GamepadFeedback, GamepadProfile, MotionSensor, PadCaps, PadKind,
-    SeatedPad, TriggerEffect,
+    DecodedTriggerEffect, GamepadFeedback, GamepadProfile, MotionSensor, PadBattery, PadCaps,
+    PadKind, SeatedPad, TriggerEffect,
 };
 use gsa_core::Result;
 pub use gsa_protocol::input::InputEvent;

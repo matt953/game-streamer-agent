@@ -271,6 +271,21 @@ pub struct SeatedPad {
     /// host that does report, and has not confirmed this seat: the pad was
     /// announced but the host has not stood one up, which is worth showing.
     pub confirmed: Option<bool>,
+    /// How full the pad's battery is, where the pad says so at all.
+    ///
+    /// `None` until the pad has reported once, and on every pad that never
+    /// will: a wired-only controller, or a browser path that carries no
+    /// battery. Silence is not "empty", so an interface shows nothing.
+    pub battery: Option<PadBattery>,
+}
+
+/// A pad's charge, as the pad itself reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PadBattery {
+    pub state: gsa_protocol::input::BatteryState,
+    /// Percent full, where the pad gives a level. A pad can report its state
+    /// without one — `Charging` with no number is a thing a DualSense says.
+    pub percent: Option<u8>,
 }
 
 /// A pad as the client sees it, announced to the backend per seat.

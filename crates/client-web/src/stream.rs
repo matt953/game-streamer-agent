@@ -115,6 +115,28 @@ struct WebPad {
     /// The host's own word: `None` where the host does not report pad state,
     /// so the interface shows nothing rather than inventing a worry.
     confirmed: Option<bool>,
+    /// The pad's charge, where it reports one at all.
+    battery: Option<WebBattery>,
+}
+
+/// A pad's charge as the page renders it: the state by name, and the level
+/// where the pad gives one.
+#[derive(serde::Serialize)]
+struct WebBattery {
+    state: &'static str,
+    percent: Option<u8>,
+}
+
+/// The charge state's name, in the vocabulary the page writes.
+fn battery_state_name(state: gsa_protocol::input::BatteryState) -> &'static str {
+    use gsa_protocol::input::BatteryState;
+    match state {
+        BatteryState::NotPresent => "absent",
+        BatteryState::Discharging => "discharging",
+        BatteryState::Charging => "charging",
+        BatteryState::Full => "full",
+        _ => "unknown",
+    }
 }
 
 #[wasm_bindgen]
@@ -271,6 +293,10 @@ impl WebStream {
                         caps: pad.profile.caps.bits(),
                         features: pad.profile.caps.names(),
                         confirmed: pad.confirmed,
+                        battery: pad.battery.map(|battery| WebBattery {
+                            state: battery_state_name(battery.state),
+                            percent: battery.percent,
+                        }),
                     })
                     .collect()
             })
