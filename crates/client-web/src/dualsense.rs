@@ -115,12 +115,48 @@ impl DualSenseCodec {
         self.current_report()
     }
 
+    /// The reports that set the light to `rgb`: usually one, but over
+    /// Bluetooth the first colour is preceded by the one-off report that ends
+    /// the pad's connection animation — and not before the pad's own clock
+    /// says that animation is over, or both are ignored. Empty before the pad
+    /// has said how it is attached, or while the animation is still running;
+    /// the colour is kept and rides the next report once it can.
+    #[wasm_bindgen]
+    pub fn led_reports(&mut self, r: u8, g: u8, b: u8) -> Result<JsValue, JsValue> {
+        self.effects.led = Some([r, g, b]);
+        let Some(conn) = self.conn else {
+            return serde_wasm_bindgen::to_value(&Vec::<WebOutputReport>::new())
+                .map_err(Into::into);
+        };
+        let mut reports = Vec::new();
+        if let Some(ts) = self.parser.sensor_timestamp()
+            && let Some(reset) = self.encoder.led_reset_report(conn, ts)
+        {
+            reports.push(WebOutputReport {
+                report_id: reset.report_id,
+                data: reset.data,
+            });
+        }
+        if self.encoder.led_ready(conn) {
+            let report = self.encoder.report(conn, &self.effects);
+            reports.push(WebOutputReport {
+                report_id: report.report_id,
+                data: report.data,
+            });
+        }
+        serde_wasm_bindgen::to_value(&reports).map_err(Into::into)
+    }
+
     /// Everything the pad should be doing now, framed for how it is attached.
     fn current_report(&mut self) -> Result<JsValue, JsValue> {
         let Some(conn) = self.conn else {
             return Ok(JsValue::UNDEFINED);
         };
-        let report = self.encoder.report(conn, &self.effects);
+        let mut effects = self.effects;
+        if !self.encoder.led_ready(conn) {
+            effects.led = None;
+        }
+        let report = self.encoder.report(conn, &effects);
         serde_wasm_bindgen::to_value(&WebOutputReport {
             report_id: report.report_id,
             data: report.data,

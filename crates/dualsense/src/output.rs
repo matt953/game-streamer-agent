@@ -41,8 +41,20 @@ const FLAG3_RUMBLE: u8 = 0x04;
 const FLAG1_RIGHT_TRIGGER: u8 = 0x04;
 const FLAG1_LEFT_TRIGGER: u8 = 0x08;
 
+/// `ucEnableBits2`: the light's colour bytes are to be applied.
+const FLAG2_LIGHTBAR: u8 = 0x04;
+/// `ucEnableBits2`: forget the light's connection state. Over Bluetooth a pad
+/// runs its own connection animation and ignores a colour until it has been
+/// told that is over; this is how it is told. USB needs no such thing.
+const FLAG2_LIGHTBAR_RESET: u8 = 0x08;
+
+/// The pad's sensor timestamp at which its connection animation has run its
+/// course, in the units the pad counts in. A reset sent earlier is ignored.
+pub const CONNECTION_ANIMATION_DONE: u32 = 10_200_000;
+
 /// Offsets in the common block.
 const RUMBLE_RIGHT: usize = 2;
+const LIGHTBAR_RGB: usize = 44;
 const RUMBLE_LEFT: usize = 3;
 const RIGHT_TRIGGER: usize = 10;
 const LEFT_TRIGGER: usize = 21;
@@ -76,6 +88,8 @@ pub struct Effects {
     /// anything; [`TRIGGER_OFF`] is a trigger the game has released.
     pub left_trigger: Option<[u8; TRIGGER_BLOCK_LEN]>,
     pub right_trigger: Option<[u8; TRIGGER_BLOCK_LEN]>,
+    /// The light's colour, sRGB, once anyone has set one.
+    pub led: Option<[u8; 3]>,
 }
 
 /// One report, as a HID transport wants it: the id, and the bytes after it.
@@ -92,6 +106,9 @@ pub struct OutputEncoder {
     /// its firmware says otherwise, as SDL assumes it for a pad whose
     /// firmware it could not read.
     enhanced_rumble: bool,
+    /// Whether the light has been told its connection animation is over.
+    /// Only Bluetooth needs telling, and only once.
+    led_reset_sent: bool,
 }
 
 impl OutputEncoder {
@@ -99,6 +116,7 @@ impl OutputEncoder {
     pub fn new() -> Self {
         Self {
             enhanced_rumble: true,
+            led_reset_sent: false,
         }
     }
 
@@ -113,6 +131,29 @@ impl OutputEncoder {
         let version = u16::from_le_bytes([*body.get(43)?, *body.get(44)?]);
         self.enhanced_rumble = version == 0 || version >= ENHANCED_RUMBLE_FIRMWARE;
         Some(version)
+    }
+
+    /// Whether a colour sent over `conn` now would take, given the pad's
+    /// latest sensor timestamp `ts`: USB always; Bluetooth once the reset
+    /// has gone out, which itself waits for the connection animation.
+    #[must_use]
+    pub fn led_ready(&self, conn: Connection) -> bool {
+        conn == Connection::Usb || self.led_reset_sent
+    }
+
+    /// The one-off report that ends the light's connection state over
+    /// Bluetooth, or `None` when it is not needed (USB, already sent) or not
+    /// yet allowed (the pad's animation, by its own timestamp `ts`, is still
+    /// running — sent early it is ignored, and a colour after it too).
+    #[must_use]
+    pub fn led_reset_report(&mut self, conn: Connection, ts: u32) -> Option<OutputReport> {
+        if conn != Connection::Bluetooth || self.led_reset_sent || ts < CONNECTION_ANIMATION_DONE {
+            return None;
+        }
+        self.led_reset_sent = true;
+        let mut common = [0u8; COMMON_LEN];
+        common[1] |= FLAG2_LIGHTBAR_RESET;
+        Some(frame(conn, &common))
     }
 
     /// The report that makes the pad do `effects`, framed for `conn`.
@@ -149,13 +190,27 @@ impl OutputEncoder {
             common[0] |= FLAG1_LEFT_TRIGGER;
             common[LEFT_TRIGGER..LEFT_TRIGGER + TRIGGER_BLOCK_LEN].copy_from_slice(&block);
         }
+        // The colour rides every report too, for the same reason as the
+        // triggers: a report that leaves the flag clear reads as no opinion,
+        // and on some firmware as the light going back to its own idea.
+        if let Some(rgb) = effects.led {
+            common[1] |= FLAG2_LIGHTBAR;
+            common[LIGHTBAR_RGB..LIGHTBAR_RGB + 3].copy_from_slice(&rgb);
+        }
         // Leaving the rumble bits clear is what gives the pad its audio
         // haptics back, so a zeroed report is how rumble stops.
+        frame(conn, &common)
+    }
+}
+
+/// One common block in the framing `conn` wants.
+fn frame(conn: Connection, common: &[u8; COMMON_LEN]) -> OutputReport {
+    {
         match conn {
             Connection::Usb => {
                 let mut frame = [0u8; USB_LEN];
                 frame[0] = REPORT_USB;
-                frame[USB_COMMON_AT..USB_COMMON_AT + COMMON_LEN].copy_from_slice(&common);
+                frame[USB_COMMON_AT..USB_COMMON_AT + COMMON_LEN].copy_from_slice(common);
                 OutputReport {
                     report_id: REPORT_USB,
                     data: frame[1..].to_vec(),
@@ -167,7 +222,7 @@ impl OutputEncoder {
                 // Tag and sequence, then the magic byte the pad expects.
                 frame[1] = 0x00;
                 frame[2] = 0x10;
-                frame[BT_COMMON_AT..BT_COMMON_AT + COMMON_LEN].copy_from_slice(&common);
+                frame[BT_COMMON_AT..BT_COMMON_AT + COMMON_LEN].copy_from_slice(common);
                 let crc = crc32(&[BT_CRC_TAG], 0);
                 let end = BT_LEN - 4;
                 let crc = crc32(&frame[..end], crc);
@@ -340,11 +395,63 @@ mod tests {
                 rumble: (0xFFFF, 0),
                 left_trigger: Some(super::TRIGGER_OFF),
                 right_trigger: Some(weapon),
+                ..Effects::default()
             },
         );
         assert_eq!(report.data[0] & 0x0c, 0x0c);
         assert_eq!(report.data[3], 255);
         assert_eq!(&report.data[10..21], &weapon);
+    }
+
+    #[test]
+    fn a_colour_lands_in_the_light_bytes_and_is_flagged() {
+        let mut encoder = OutputEncoder::new();
+        let report = encoder.report(
+            Connection::Usb,
+            &Effects {
+                led: Some([120, 120, 239]),
+                ..Effects::default()
+            },
+        );
+        assert_eq!(report.data[1] & 0x04, 0x04, "colour flagged");
+        assert_eq!(&report.data[44..47], &[120, 120, 239]);
+        assert_eq!(report.data[1] & 0x08, 0, "no reset over USB");
+    }
+
+    /// Over Bluetooth the pad ignores a colour until told its connection
+    /// animation is over, and ignores that too if told too early — so the
+    /// reset waits for the pad's own clock, goes once, and USB never needs it.
+    #[test]
+    fn bluetooth_resets_the_light_once_and_only_after_the_animation() {
+        let mut encoder = OutputEncoder::new();
+        assert!(
+            encoder.led_ready(Connection::Usb),
+            "USB takes a colour at once"
+        );
+        assert!(!encoder.led_ready(Connection::Bluetooth));
+        assert!(
+            encoder
+                .led_reset_report(Connection::Usb, u32::MAX)
+                .is_none()
+        );
+        assert!(
+            encoder
+                .led_reset_report(Connection::Bluetooth, super::CONNECTION_ANIMATION_DONE - 1)
+                .is_none(),
+            "too early: the pad would ignore it"
+        );
+        let reset = encoder
+            .led_reset_report(Connection::Bluetooth, super::CONNECTION_ANIMATION_DONE)
+            .expect("due");
+        assert_eq!(reset.report_id, 0x31);
+        assert_eq!(reset.data[2 + 1] & 0x08, 0x08, "reset flag, nothing else");
+        assert!(encoder.led_ready(Connection::Bluetooth));
+        assert!(
+            encoder
+                .led_reset_report(Connection::Bluetooth, u32::MAX)
+                .is_none(),
+            "once is enough"
+        );
     }
 
     #[test]

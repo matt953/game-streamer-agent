@@ -124,7 +124,8 @@ const WEB_DUALSENSE_CAPS: gsa_client_backend_api::PadCaps =
             | gsa_client_backend_api::PadCaps::BATTERY.bits()
             | gsa_client_backend_api::PadCaps::MOTION.bits()
             | gsa_client_backend_api::PadCaps::RUMBLE.bits()
-            | gsa_client_backend_api::PadCaps::ADAPTIVE_TRIGGERS.bits(),
+            | gsa_client_backend_api::PadCaps::ADAPTIVE_TRIGGERS.bits()
+            | gsa_client_backend_api::PadCaps::LED.bits(),
     );
 
 /// What a browser's haptic actuator says it can play, as capabilities.
@@ -395,11 +396,24 @@ impl WebStream {
     #[wasm_bindgen]
     pub fn announce_dualsense(&self, seat: u8) {
         use gsa_client_backend_api::{GamepadProfile, PadKind};
+        let profile = GamepadProfile::new(PadKind::DualSense, WEB_DUALSENSE_CAPS);
         if let Some(stream) = self.inner.stream.borrow().as_ref() {
-            stream.input.announce_pad(
+            stream.input.announce_pad(seat, profile);
+        }
+        // Claim the light the moment the pad is ours, as every client does:
+        // a lit pad nobody has programmed pulses blue forever, which a person
+        // reads as the session having failed. The colour is the core's, and
+        // it reaches the page the way every other effect does.
+        if let Some(rgb) = profile.claim_led() {
+            self.inner.feedback.borrow_mut().push_back(WebFeedback {
+                kind: "led",
                 seat,
-                GamepadProfile::new(PadKind::DualSense, WEB_DUALSENSE_CAPS),
-            );
+                low: 0,
+                high: 0,
+                rgb,
+                left: Vec::new(),
+                right: Vec::new(),
+            });
         }
     }
 

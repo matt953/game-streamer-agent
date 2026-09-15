@@ -67,6 +67,10 @@ pub struct Parser {
     /// When the last motion sample went out, so the pad's own 250 Hz is
     /// thinned to what was asked for.
     last_motion_us: Option<u64>,
+    /// The pad's own sensor clock as of its last report. It counts from the
+    /// moment the pad connected, which is what makes it the clock the light's
+    /// connection animation runs on.
+    sensor_timestamp: Option<u32>,
 }
 
 /// The DualSense touchpad's reported resolution.
@@ -99,7 +103,15 @@ impl Parser {
             calibration: Calibration::UNCALIBRATED,
             motion_hz: 0,
             last_motion_us: None,
+            sensor_timestamp: None,
         }
+    }
+
+    /// The pad's own sensor clock as of its last report, or `None` before
+    /// the first. Its units are the pad's; it is compared, not converted.
+    #[must_use]
+    pub fn sensor_timestamp(&self) -> Option<u32> {
+        self.sensor_timestamp
     }
 
     /// Give the pad its own calibration, read from feature report `0x05`.
@@ -132,6 +144,12 @@ impl Parser {
             return;
         }
         self.parse_pad(b, data, ts_us, out);
+        self.sensor_timestamp = Some(u32::from_le_bytes([
+            data[b + 27],
+            data[b + 28],
+            data[b + 29],
+            data[b + 30],
+        ]));
         self.parse_motion(b, data, ts_us, out);
         self.parse_touch(b, data, ts_us, out);
         self.parse_battery(b, data, ts_us, out);
@@ -368,6 +386,28 @@ mod tests {
             InputEvent::GamepadMotion { gyro, accel, .. } => Some((*gyro, *accel)),
             _ => None,
         })
+    }
+
+    /// The pad's sensor clock, read from the same real report as the motion
+    /// above. It is what the light's connection animation is timed against,
+    /// so a wrong offset here would leave a Bluetooth pad's light unset.
+    #[test]
+    fn the_sensor_clock_is_read_from_the_report() {
+        let mut parser = Parser::new(0);
+        assert_eq!(parser.sensor_timestamp(), None);
+        let mut out = Vec::new();
+        parser.parse(Connection::Usb, &REST_REPORT, 0, &mut out);
+        // Bytes 27..31 of the captured body, little-endian.
+        let want = u32::from_le_bytes([
+            REST_REPORT[27],
+            REST_REPORT[28],
+            REST_REPORT[29],
+            REST_REPORT[30],
+        ]);
+        assert_eq!(parser.sensor_timestamp(), Some(want));
+        // A pad that has been up long enough to have finished its animation:
+        // this one had been on the desk a while when the report was taken.
+        assert!(want >= crate::CONNECTION_ANIMATION_DONE, "{want}");
     }
 
     /// Motion is opt-in and paced. Nothing goes out until the host has asked,

@@ -22,7 +22,9 @@ mod output;
 
 pub use input::{Connection, Parser};
 pub use motion::Calibration;
-pub use output::{Effects, OutputEncoder, OutputReport, TRIGGER_BLOCK_LEN, TRIGGER_OFF};
+pub use output::{
+    CONNECTION_ANIMATION_DONE, Effects, OutputEncoder, OutputReport, TRIGGER_BLOCK_LEN, TRIGGER_OFF,
+};
 
 /// Sony's USB vendor id.
 pub const VENDOR_SONY: u16 = 0x054c;
