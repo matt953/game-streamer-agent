@@ -125,7 +125,8 @@ const WEB_DUALSENSE_CAPS: gsa_client_backend_api::PadCaps =
             | gsa_client_backend_api::PadCaps::MOTION.bits()
             | gsa_client_backend_api::PadCaps::RUMBLE.bits()
             | gsa_client_backend_api::PadCaps::ADAPTIVE_TRIGGERS.bits()
-            | gsa_client_backend_api::PadCaps::LED.bits(),
+            | gsa_client_backend_api::PadCaps::LED.bits()
+            | gsa_client_backend_api::PadCaps::PLAYER_LEDS.bits(),
     );
 
 /// What a browser's haptic actuator says it can play, as capabilities.
@@ -304,6 +305,24 @@ impl WebStream {
                 left: Vec::new(),
                 right: Vec::new(),
             },
+            GamepadFeedback::PlayerLights { mask, .. } => WebFeedback {
+                kind: "player_lights",
+                seat,
+                low: u16::from(mask),
+                high: 0,
+                rgb: [0; 3],
+                left: Vec::new(),
+                right: Vec::new(),
+            },
+            GamepadFeedback::MuteLight { mode, .. } => WebFeedback {
+                kind: "mute_light",
+                seat,
+                low: u16::from(mode),
+                high: 0,
+                rgb: [0; 3],
+                left: Vec::new(),
+                right: Vec::new(),
+            },
             GamepadFeedback::AdaptiveTriggers { left, right, .. } => WebFeedback {
                 kind: "adaptive_triggers",
                 seat,
@@ -411,6 +430,19 @@ impl WebStream {
                 low: 0,
                 high: 0,
                 rgb,
+                left: Vec::new(),
+                right: Vec::new(),
+            });
+        }
+        // And the player row for this seat, so a person can tell the pads
+        // apart without looking at the screen — the console's own convention.
+        if let Some(mask) = profile.claim_player_lights(seat) {
+            self.inner.feedback.borrow_mut().push_back(WebFeedback {
+                kind: "player_lights",
+                seat,
+                low: u16::from(mask),
+                high: 0,
+                rgb: [0; 3],
                 left: Vec::new(),
                 right: Vec::new(),
             });

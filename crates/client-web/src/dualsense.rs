@@ -115,6 +115,21 @@ impl DualSenseCodec {
         self.current_report()
     }
 
+    /// The report that sets the player-light row: a five-bit mask plus the
+    /// pad's "no fade" bit, as the game wrote it.
+    #[wasm_bindgen]
+    pub fn player_lights_report(&mut self, mask: u8) -> Result<JsValue, JsValue> {
+        self.effects.player_lights = Some(mask);
+        self.current_report()
+    }
+
+    /// The report that sets the mic-mute light: 0 off, 1 solid, 2 pulsing.
+    #[wasm_bindgen]
+    pub fn mute_light_report(&mut self, mode: u8) -> Result<JsValue, JsValue> {
+        self.effects.mute_light = Some(mode);
+        self.current_report()
+    }
+
     /// The reports that set the light to `rgb`: usually one, but over
     /// Bluetooth the first colour is preceded by the one-off report that ends
     /// the pad's connection animation — and not before the pad's own clock

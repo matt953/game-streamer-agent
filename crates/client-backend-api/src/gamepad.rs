@@ -178,6 +178,8 @@ impl PadCaps {
     pub const LED: Self = Self(1 << 6);
     /// The pad reports its charge level.
     pub const BATTERY: Self = Self(1 << 7);
+    /// A row of player lights and a mic-mute light the host can set.
+    pub const PLAYER_LEDS: Self = Self(1 << 8);
 
     /// Both motion sensors, which pads carry together in practice.
     pub const MOTION: Self = Self(Self::GYRO.0 | Self::ACCEL.0);
@@ -220,6 +222,7 @@ impl PadCaps {
             (Self::TOUCHPAD, "Touchpad"),
             (Self::ADAPTIVE_TRIGGERS, "Adaptive triggers"),
             (Self::LED, "Lightbar"),
+            (Self::PLAYER_LEDS, "Player lights"),
             (Self::BATTERY, "Battery"),
         ] {
             if self.contains(bit) {
@@ -309,6 +312,23 @@ impl GamepadProfile {
     /// having failed. Claiming the light is what stops it, so every client
     /// does it at announce time and the host's own colours take over from
     /// there. The value matches what other streaming clients write at init.
+    /// The player-light row to show the moment a client claims this pad on
+    /// `seat`, or `None` for a pad without one.
+    ///
+    /// The patterns are the ones every desktop client uses (SDL's, which are
+    /// the console's): one centred light for the first player, two for the
+    /// second, and so on. The "no fade" bit is set so the row changes at
+    /// once. A game that wants something else writes its own, and that
+    /// arrives as feedback and replaces this.
+    #[must_use]
+    pub const fn claim_player_lights(&self, seat: u8) -> Option<u8> {
+        if !self.caps.contains(PadCaps::PLAYER_LEDS) {
+            return None;
+        }
+        const ROWS: [u8; 7] = [0x04, 0x0A, 0x15, 0x1B, 0x1F, 0x11, 0x0E];
+        Some(ROWS[(seat as usize) % ROWS.len()] | 0x20)
+    }
+
     #[must_use]
     pub const fn claim_led(&self) -> Option<[u8; 3]> {
         if self.caps.contains(PadCaps::LED) {
@@ -524,6 +544,11 @@ pub enum GamepadFeedback {
     },
     /// Light colour, sRGB.
     Led { seat: u8, rgb: [u8; 3] },
+    /// The player-light row, as the pad takes it: a five-bit mask plus the
+    /// pad's own "no fade" bit. Passed through, like a trigger effect.
+    PlayerLights { seat: u8, mask: u8 },
+    /// The mic-mute light: 0 off, 1 solid, 2 pulsing.
+    MuteLight { seat: u8, mode: u8 },
 }
 
 impl GamepadFeedback {
@@ -534,7 +559,9 @@ impl GamepadFeedback {
             Self::Rumble { seat, .. }
             | Self::TriggerRumble { seat, .. }
             | Self::AdaptiveTriggers { seat, .. }
-            | Self::Led { seat, .. } => seat,
+            | Self::Led { seat, .. }
+            | Self::PlayerLights { seat, .. }
+            | Self::MuteLight { seat, .. } => seat,
         }
     }
 
@@ -547,6 +574,7 @@ impl GamepadFeedback {
             Self::TriggerRumble { .. } => PadCaps::TRIGGER_RUMBLE,
             Self::AdaptiveTriggers { .. } => PadCaps::ADAPTIVE_TRIGGERS,
             Self::Led { .. } => PadCaps::LED,
+            Self::PlayerLights { .. } | Self::MuteLight { .. } => PadCaps::PLAYER_LEDS,
         }
     }
 }

@@ -78,6 +78,12 @@ pub enum HostMessage {
     /// The host's own word on its virtual pad for `seat`: live, or gone. Only
     /// hosts that announce [`HostMessage::PadsReported`] send these.
     PadState { seat: u8, live: bool },
+    /// What the game wrote to the virtual pad's player-light row: a five-bit
+    /// mask plus the pad's own "no fade" bit, forwarded untouched.
+    PlayerLights { seat: u8, mask: u8 },
+    /// What the game wrote to the virtual pad's mic-mute light: 0 off,
+    /// 1 solid, 2 pulsing.
+    MuteLight { seat: u8, mode: u8 },
     /// This host reports pad state. Sent once when the control link comes up,
     /// so the absence of a confirmation means "not yet" on a host that speaks
     /// this, and means nothing at all on a host that does not.
@@ -107,6 +113,8 @@ impl HostMessage {
             Self::RumbleTriggers { controller, .. } => Some((1, *controller)),
             Self::SetLed { controller, .. } => Some((2, *controller)),
             Self::AdaptiveTriggers { controller, .. } => Some((3, *controller)),
+            Self::PlayerLights { seat, .. } => Some((4, u16::from(*seat))),
+            Self::MuteLight { seat, .. } => Some((5, u16::from(*seat))),
             _ => None,
         }
     }
@@ -149,6 +157,14 @@ impl HostMessage {
             }
             // A capability announcement is for the core, not the embedder.
             Self::PadsReported => None,
+            Self::PlayerLights { seat, mask } => {
+                Some(gsa_client_backend_api::BackendEvent::Feedback(
+                    gsa_client_backend_api::GamepadFeedback::PlayerLights { seat, mask },
+                ))
+            }
+            Self::MuteLight { seat, mode } => Some(gsa_client_backend_api::BackendEvent::Feedback(
+                gsa_client_backend_api::GamepadFeedback::MuteLight { seat, mode },
+            )),
             Self::SetLed { controller, rgb } => {
                 Some(gsa_client_backend_api::BackendEvent::Feedback(
                     gsa_client_backend_api::GamepadFeedback::Led {
@@ -605,6 +621,23 @@ fn interpret(plaintext: &[u8]) -> Option<HostMessage> {
                 live: true,
             }),
             2 => Some(HostMessage::PadsReported),
+            _ => None,
+        };
+    }
+    if kind == msg::PAD_LIGHTS && payload.len() >= 8 {
+        let magic = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        if magic != msg::PAD_STATE_MAGIC || payload[4] != msg::PAD_STATE_VERSION {
+            return None;
+        }
+        return match payload[6] {
+            0 => Some(HostMessage::PlayerLights {
+                seat: payload[5],
+                mask: payload[7],
+            }),
+            1 => Some(HostMessage::MuteLight {
+                seat: payload[5],
+                mode: payload[7],
+            }),
             _ => None,
         };
     }

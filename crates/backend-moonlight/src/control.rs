@@ -37,6 +37,9 @@ pub mod msg {
     /// than silently misparsed, and a host that never sends it simply leaves
     /// the client with what it announced itself.
     pub const PAD_STATE: u16 = 0x7a00;
+    /// altc's own: what the game wrote to a virtual pad's player-light row
+    /// or mic-mute light. Same magic and version as `PAD_STATE`.
+    pub const PAD_LIGHTS: u16 = 0x7a01;
     /// `altc` in ASCII: the first four bytes of every [`PAD_STATE`] body.
     pub const PAD_STATE_MAGIC: u32 = 0x616c_7463;
     /// The only body layout this client reads.

@@ -52,8 +52,15 @@ const FLAG2_LIGHTBAR_RESET: u8 = 0x08;
 /// course, in the units the pad counts in. A reset sent earlier is ignored.
 pub const CONNECTION_ANIMATION_DONE: u32 = 10_200_000;
 
+/// `ucEnableBits2`: the player-light mask is to be applied.
+const FLAG2_PLAYER_LIGHTS: u8 = 0x10;
+/// `ucEnableBits2`: the mic-light mode is to be applied.
+const FLAG2_MUTE_LIGHT: u8 = 0x01;
+
 /// Offsets in the common block.
 const RUMBLE_RIGHT: usize = 2;
+const MUTE_LIGHT_MODE: usize = 8;
+const PLAYER_LIGHTS: usize = 43;
 const LIGHTBAR_RGB: usize = 44;
 const RUMBLE_LEFT: usize = 3;
 const RIGHT_TRIGGER: usize = 10;
@@ -90,6 +97,11 @@ pub struct Effects {
     pub right_trigger: Option<[u8; TRIGGER_BLOCK_LEN]>,
     /// The light's colour, sRGB, once anyone has set one.
     pub led: Option<[u8; 3]>,
+    /// The player-light row: a five-bit mask plus the "no fade" bit, as the
+    /// pad takes it, once anyone has set one.
+    pub player_lights: Option<u8>,
+    /// The mic-mute light: 0 off, 1 solid, 2 pulsing, once anyone has set it.
+    pub mute_light: Option<u8>,
 }
 
 /// One report, as a HID transport wants it: the id, and the bytes after it.
@@ -196,6 +208,14 @@ impl OutputEncoder {
         if let Some(rgb) = effects.led {
             common[1] |= FLAG2_LIGHTBAR;
             common[LIGHTBAR_RGB..LIGHTBAR_RGB + 3].copy_from_slice(&rgb);
+        }
+        if let Some(mask) = effects.player_lights {
+            common[1] |= FLAG2_PLAYER_LIGHTS;
+            common[PLAYER_LIGHTS] = mask;
+        }
+        if let Some(mode) = effects.mute_light {
+            common[1] |= FLAG2_MUTE_LIGHT;
+            common[MUTE_LIGHT_MODE] = mode;
         }
         // Leaving the rumble bits clear is what gives the pad its audio
         // haptics back, so a zeroed report is how rumble stops.
@@ -452,6 +472,25 @@ mod tests {
                 .is_none(),
             "once is enough"
         );
+    }
+
+    #[test]
+    fn the_two_small_lights_land_in_their_bytes_and_are_flagged() {
+        let mut encoder = OutputEncoder::new();
+        let report = encoder.report(
+            Connection::Usb,
+            &Effects {
+                player_lights: Some(0x0A | 0x20),
+                mute_light: Some(1),
+                ..Effects::default()
+            },
+        );
+        assert_eq!(report.data[1] & 0x10, 0x10, "player lights flagged");
+        assert_eq!(report.data[43], 0x2A, "the mask, no-fade bit and all");
+        assert_eq!(report.data[1] & 0x01, 0x01, "mute light flagged");
+        assert_eq!(report.data[8], 1, "solid");
+        // Neither disturbs the lightbar, which was never set here.
+        assert_eq!(report.data[1] & 0x04, 0);
     }
 
     #[test]
