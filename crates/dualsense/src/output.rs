@@ -36,10 +36,25 @@ const FLAG1_MUTE_HAPTICS: u8 = 0x02;
 /// what firmware 2.24 and newer want.
 const FLAG3_RUMBLE: u8 = 0x04;
 
+/// `ucEnableBits1`: the trigger blocks are to be applied. The same values
+/// the stream uses to say which triggers a message addresses.
+const FLAG1_RIGHT_TRIGGER: u8 = 0x04;
+const FLAG1_LEFT_TRIGGER: u8 = 0x08;
+
 /// Offsets in the common block.
 const RUMBLE_RIGHT: usize = 2;
 const RUMBLE_LEFT: usize = 3;
+const RIGHT_TRIGGER: usize = 10;
+const LEFT_TRIGGER: usize = 21;
 const ENABLE_BITS_3: usize = 38;
+
+/// One trigger's effect as the pad takes it: the effect type, then ten
+/// parameter bytes whose meaning depends on the type. Passed through from
+/// the game untouched — the parameters are bit-packed per effect, and a
+/// wrong reading produces a trigger that fights the player.
+pub const TRIGGER_BLOCK_LEN: usize = 11;
+/// A block that turns the trigger's resistance off.
+pub const TRIGGER_OFF: [u8; TRIGGER_BLOCK_LEN] = [0; TRIGGER_BLOCK_LEN];
 
 /// The byte the pad's Bluetooth CRC is seeded with: the HID header, which is
 /// part of the calculation but not part of the report.
@@ -56,6 +71,11 @@ pub struct Effects {
     /// Body rumble as the stream carries it: the low-frequency (heavy) motor
     /// and the high-frequency (light) one, full scale `u16`.
     pub rumble: (u16, u16),
+    /// Each trigger's effect block, once the game has set one. `None` is a
+    /// trigger nobody has spoken to yet, which is left alone rather than told
+    /// anything; [`TRIGGER_OFF`] is a trigger the game has released.
+    pub left_trigger: Option<[u8; TRIGGER_BLOCK_LEN]>,
+    pub right_trigger: Option<[u8; TRIGGER_BLOCK_LEN]>,
 }
 
 /// One report, as a HID transport wants it: the id, and the bytes after it.
@@ -117,6 +137,17 @@ impl OutputEncoder {
                 common[RUMBLE_RIGHT] = level(high) >> 1;
             }
             common[0] |= FLAG1_MUTE_HAPTICS;
+        }
+        // A trigger the game has set is carried in every report, flagged, so
+        // a report sent for the motors does not read to the pad as a trigger
+        // going quiet. Resending the block it already has changes nothing.
+        if let Some(block) = effects.right_trigger {
+            common[0] |= FLAG1_RIGHT_TRIGGER;
+            common[RIGHT_TRIGGER..RIGHT_TRIGGER + TRIGGER_BLOCK_LEN].copy_from_slice(&block);
+        }
+        if let Some(block) = effects.left_trigger {
+            common[0] |= FLAG1_LEFT_TRIGGER;
+            common[LEFT_TRIGGER..LEFT_TRIGGER + TRIGGER_BLOCK_LEN].copy_from_slice(&block);
         }
         // Leaving the rumble bits clear is what gives the pad its audio
         // haptics back, so a zeroed report is how rumble stops.
@@ -192,6 +223,7 @@ mod tests {
             Connection::Usb,
             &Effects {
                 rumble: (0xFFFF, 0x8080),
+                ..Effects::default()
             },
         );
         assert_eq!(report.report_id, 0x02);
@@ -217,6 +249,7 @@ mod tests {
             Connection::Usb,
             &Effects {
                 rumble: (0xFFFF, 0),
+                ..Effects::default()
             },
         );
         assert_eq!(report.data[0] & 0x01, 0x01, "legacy bit");
@@ -230,6 +263,7 @@ mod tests {
             Connection::Usb,
             &Effects {
                 rumble: (0xFFFF, 0),
+                ..Effects::default()
             },
         );
         assert_eq!(report.data[38] & 0x04, 0x04);
@@ -247,6 +281,7 @@ mod tests {
             // these are exact on the way out and the way back.
             &Effects {
                 rumble: (0x4040, 0x2020),
+                ..Effects::default()
             },
         );
         assert_eq!(report.report_id, 0x31);
@@ -277,6 +312,39 @@ mod tests {
         // And seeding is chaining: the tag byte then the rest is one CRC over
         // both, which is what lets the pad's header take part in it.
         assert_eq!(crc32(b"56789", crc32(b"1234", 0)), crc32(b"123456789", 0),);
+    }
+
+    #[test]
+    fn a_trigger_effect_lands_in_its_block_and_is_flagged() {
+        let mut encoder = OutputEncoder::new();
+        let mut weapon = [0u8; 11];
+        weapon[0] = 0x25;
+        weapon[1..4].copy_from_slice(&[0x11, 0x22, 0x33]);
+        let report = encoder.report(
+            Connection::Usb,
+            &Effects {
+                right_trigger: Some(weapon),
+                ..Effects::default()
+            },
+        );
+        assert_eq!(report.data[0] & 0x04, 0x04, "right trigger flagged");
+        assert_eq!(report.data[0] & 0x08, 0, "left trigger left alone");
+        assert_eq!(&report.data[10..21], &weapon, "the block, verbatim");
+        assert!(report.data[21..32].iter().all(|&b| b == 0));
+
+        // Both, and the motors, ride one report: it carries every effect at
+        // once, so nothing the pad was doing is dropped by mentioning another.
+        let report = encoder.report(
+            Connection::Usb,
+            &Effects {
+                rumble: (0xFFFF, 0),
+                left_trigger: Some(super::TRIGGER_OFF),
+                right_trigger: Some(weapon),
+            },
+        );
+        assert_eq!(report.data[0] & 0x0c, 0x0c);
+        assert_eq!(report.data[3], 255);
+        assert_eq!(&report.data[10..21], &weapon);
     }
 
     #[test]

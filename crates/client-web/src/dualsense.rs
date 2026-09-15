@@ -16,6 +16,9 @@ use wasm_bindgen::prelude::*;
 pub struct DualSenseCodec {
     parser: Parser,
     encoder: gsa_dualsense::OutputEncoder,
+    /// Everything the pad is currently being asked to do. A report carries
+    /// all of it at once, so one effect changing must not forget the others.
+    effects: gsa_dualsense::Effects,
     clock: gsa_core::time::MediaClock,
     seat: u8,
     /// How the pad is attached, learnt from the reports it sends. Feedback
@@ -33,6 +36,7 @@ impl DualSenseCodec {
         Self {
             parser: Parser::new(seat),
             encoder: gsa_dualsense::OutputEncoder::new(),
+            effects: gsa_dualsense::Effects::default(),
             clock: gsa_core::time::MediaClock::new(),
             seat,
             conn: None,
@@ -91,15 +95,32 @@ impl DualSenseCodec {
     /// haptics back, which the motors borrow while they are running.
     #[wasm_bindgen]
     pub fn rumble_report(&mut self, low: u16, high: u16) -> Result<JsValue, JsValue> {
+        self.effects.rumble = (low, high);
+        self.current_report()
+    }
+
+    /// The report that sets the triggers' resistance: each side an eleven-byte
+    /// effect block as the game wrote it, or empty to leave that trigger as
+    /// it is. Returns `undefined` before the pad has said how it is attached.
+    #[wasm_bindgen]
+    pub fn trigger_report(&mut self, left: &[u8], right: &[u8]) -> Result<JsValue, JsValue> {
+        for (side, block) in [
+            (&mut self.effects.left_trigger, left),
+            (&mut self.effects.right_trigger, right),
+        ] {
+            if let Ok(block) = <[u8; gsa_dualsense::TRIGGER_BLOCK_LEN]>::try_from(block) {
+                *side = Some(block);
+            }
+        }
+        self.current_report()
+    }
+
+    /// Everything the pad should be doing now, framed for how it is attached.
+    fn current_report(&mut self) -> Result<JsValue, JsValue> {
         let Some(conn) = self.conn else {
             return Ok(JsValue::UNDEFINED);
         };
-        let report = self.encoder.report(
-            conn,
-            &gsa_dualsense::Effects {
-                rumble: (low, high),
-            },
-        );
+        let report = self.encoder.report(conn, &self.effects);
         serde_wasm_bindgen::to_value(&WebOutputReport {
             report_id: report.report_id,
             data: report.data,

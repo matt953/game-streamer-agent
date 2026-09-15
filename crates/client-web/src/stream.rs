@@ -46,6 +46,10 @@ struct WebFeedback {
     high: u16,
     /// A light's colour, for `led`.
     rgb: [u8; 3],
+    /// Trigger effect blocks for `adaptive_triggers`, each the game's own
+    /// eleven bytes, or empty for a trigger this message does not address.
+    left: Vec<u8>,
+    right: Vec<u8>,
 }
 
 /// One encoded access unit for the decoder.
@@ -119,7 +123,8 @@ const WEB_DUALSENSE_CAPS: gsa_client_backend_api::PadCaps =
         gsa_client_backend_api::PadCaps::TOUCHPAD.bits()
             | gsa_client_backend_api::PadCaps::BATTERY.bits()
             | gsa_client_backend_api::PadCaps::MOTION.bits()
-            | gsa_client_backend_api::PadCaps::RUMBLE.bits(),
+            | gsa_client_backend_api::PadCaps::RUMBLE.bits()
+            | gsa_client_backend_api::PadCaps::ADAPTIVE_TRIGGERS.bits(),
     );
 
 /// What a browser's haptic actuator says it can play, as capabilities.
@@ -138,6 +143,27 @@ fn browser_haptics(effects: &[String]) -> gsa_client_backend_api::PadCaps {
         }
     }
     caps
+}
+
+/// A trigger effect as the pad's own eleven-byte block, or nothing for a
+/// trigger to be left as it is.
+///
+/// Only the game's own bytes are passed on. A described effect — constant
+/// resistance from here, a break there — would have to be turned into the
+/// pad's bit-packed parameters, and no host on this path sends one; getting
+/// that translation wrong gives a trigger that fights the player, so until a
+/// host does, a described effect leaves the trigger alone.
+fn trigger_block(effect: gsa_client_backend_api::TriggerEffect) -> Vec<u8> {
+    use gsa_client_backend_api::TriggerEffect;
+    match effect {
+        TriggerEffect::Raw { effect, params } => {
+            let mut block = vec![effect];
+            block.extend_from_slice(&params);
+            block
+        }
+        TriggerEffect::Off => gsa_dualsense::TRIGGER_OFF.to_vec(),
+        _ => Vec::new(),
+    }
 }
 
 /// One seated pad, as the page renders it.
@@ -256,6 +282,8 @@ impl WebStream {
                 low,
                 high,
                 rgb: [0; 3],
+                left: Vec::new(),
+                right: Vec::new(),
             },
             GamepadFeedback::TriggerRumble { left, right, .. } => WebFeedback {
                 kind: "trigger_rumble",
@@ -263,6 +291,8 @@ impl WebStream {
                 low: left,
                 high: right,
                 rgb: [0; 3],
+                left: Vec::new(),
+                right: Vec::new(),
             },
             GamepadFeedback::Led { rgb, .. } => WebFeedback {
                 kind: "led",
@@ -270,10 +300,19 @@ impl WebStream {
                 low: 0,
                 high: 0,
                 rgb,
+                left: Vec::new(),
+                right: Vec::new(),
             },
-            // Trigger effects are the game's own opaque blobs and do not fit
-            // this shape; they arrive with their own slice, as will anything
-            // the client's vocabulary grows later.
+            GamepadFeedback::AdaptiveTriggers { left, right, .. } => WebFeedback {
+                kind: "adaptive_triggers",
+                seat,
+                low: 0,
+                high: 0,
+                rgb: [0; 3],
+                left: trigger_block(left),
+                right: trigger_block(right),
+            },
+            // Anything the client's vocabulary grows later.
             _ => return,
         };
         self.inner.feedback.borrow_mut().push_back(kept);
