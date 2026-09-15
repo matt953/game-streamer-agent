@@ -15,8 +15,13 @@ use wasm_bindgen::prelude::*;
 #[derive(Debug)]
 pub struct DualSenseCodec {
     parser: Parser,
+    encoder: gsa_dualsense::OutputEncoder,
     clock: gsa_core::time::MediaClock,
     seat: u8,
+    /// How the pad is attached, learnt from the reports it sends. Feedback
+    /// needs it: the two framings are different reports with different
+    /// lengths, and over Bluetooth a signature the pad checks.
+    conn: Option<Connection>,
 }
 
 #[wasm_bindgen]
@@ -27,8 +32,10 @@ impl DualSenseCodec {
     pub fn new(seat: u8) -> Self {
         Self {
             parser: Parser::new(seat),
+            encoder: gsa_dualsense::OutputEncoder::new(),
             clock: gsa_core::time::MediaClock::new(),
             seat,
+            conn: None,
         }
     }
 
@@ -39,6 +46,7 @@ impl DualSenseCodec {
     pub fn input_report(&mut self, report_id: u8, data: &[u8]) -> Result<JsValue, JsValue> {
         let mut out = Vec::new();
         if let Some(conn) = Connection::from_report_id(report_id) {
+            self.conn = Some(conn);
             self.parser.parse(conn, data, self.clock.now_us(), &mut out);
         }
         events_to_js(&out)
@@ -65,6 +73,40 @@ impl DualSenseCodec {
         self.parser.set_motion_rate(hz);
     }
 
+    /// Tell the codec this pad's firmware version, from feature report
+    /// `0x20` without its report id, and get back the version it read.
+    ///
+    /// It decides which rumble the pad understands. Optional: a pad whose
+    /// firmware cannot be read is driven the way a recent one wants, which is
+    /// the same assumption every desktop client makes.
+    #[wasm_bindgen]
+    pub fn firmware(&mut self, body: &[u8]) -> Option<u16> {
+        self.encoder.set_firmware(body)
+    }
+
+    /// The report that makes this pad rumble at `low` and `high`, or
+    /// `undefined` before the pad has said how it is attached.
+    ///
+    /// Zero for both is how rumble stops — and how the pad gets its audio
+    /// haptics back, which the motors borrow while they are running.
+    #[wasm_bindgen]
+    pub fn rumble_report(&mut self, low: u16, high: u16) -> Result<JsValue, JsValue> {
+        let Some(conn) = self.conn else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        let report = self.encoder.report(
+            conn,
+            &gsa_dualsense::Effects {
+                rumble: (low, high),
+            },
+        );
+        serde_wasm_bindgen::to_value(&WebOutputReport {
+            report_id: report.report_id,
+            data: report.data,
+        })
+        .map_err(Into::into)
+    }
+
     /// The event marking this pad gone, for the page to forward on unplug.
     #[wasm_bindgen]
     pub fn disconnect(&self) -> Result<JsValue, JsValue> {
@@ -74,6 +116,13 @@ impl DualSenseCodec {
         }];
         events_to_js(&out)
     }
+}
+
+/// One HID output report as the page sends it: `sendReport(id, data)`.
+#[derive(serde::Serialize)]
+struct WebOutputReport {
+    report_id: u8,
+    data: Vec<u8>,
 }
 
 fn events_to_js(events: &[InputEvent]) -> Result<JsValue, JsValue> {

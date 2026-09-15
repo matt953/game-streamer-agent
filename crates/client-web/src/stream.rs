@@ -30,6 +30,22 @@ struct Inner {
     stream: RefCell<Option<MoonlightStream>>,
     frames: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<BackendFrame>>,
     codec: Codec,
+    /// Effects waiting for the page to render, already filtered to what the
+    /// pad on that seat can do.
+    feedback: RefCell<std::collections::VecDeque<WebFeedback>>,
+}
+
+/// One effect for one pad, as the page renders it. Flat rather than tagged:
+/// a page switches on `kind` and reads the fields that kind carries.
+#[derive(Debug, serde::Serialize)]
+struct WebFeedback {
+    kind: &'static str,
+    seat: u8,
+    /// Rumble and trigger rumble: the two motor levels, full-scale `u16`.
+    low: u16,
+    high: u16,
+    /// A light's colour, for `led`.
+    rgb: [u8; 3],
 }
 
 /// One encoded access unit for the decoder.
@@ -102,8 +118,27 @@ const WEB_DUALSENSE_CAPS: gsa_client_backend_api::PadCaps =
     gsa_client_backend_api::PadCaps::from_bits(
         gsa_client_backend_api::PadCaps::TOUCHPAD.bits()
             | gsa_client_backend_api::PadCaps::BATTERY.bits()
-            | gsa_client_backend_api::PadCaps::MOTION.bits(),
+            | gsa_client_backend_api::PadCaps::MOTION.bits()
+            | gsa_client_backend_api::PadCaps::RUMBLE.bits(),
     );
+
+/// What a browser's haptic actuator says it can play, as capabilities.
+///
+/// The names are the Gamepad API's own effect types. A browser that names
+/// none — or has no actuator at all — gets nothing, and the host is told this
+/// pad has no motors rather than being asked to send effects nobody can play.
+fn browser_haptics(effects: &[String]) -> gsa_client_backend_api::PadCaps {
+    use gsa_client_backend_api::PadCaps;
+    let mut caps = PadCaps::NONE;
+    for effect in effects {
+        match effect.as_str() {
+            "dual-rumble" => caps = caps | PadCaps::RUMBLE,
+            "trigger-rumble" => caps = caps | PadCaps::TRIGGER_RUMBLE,
+            _ => {}
+        }
+    }
+    caps
+}
 
 /// One seated pad, as the page renders it.
 #[derive(serde::Serialize)]
@@ -187,8 +222,61 @@ impl WebStream {
                 codec: stream.codec,
                 stream: RefCell::new(Some(stream)),
                 frames: tokio::sync::Mutex::new(frames),
+                feedback: RefCell::new(std::collections::VecDeque::new()),
             }),
         })
+    }
+
+    /// Put aside anything in `message` that a pad of ours should render.
+    ///
+    /// The capability check is the contract the client core states: an
+    /// embedder without the feature drops the effect rather than
+    /// approximating it on another motor. Here that also keeps a page from
+    /// being told to rumble a controller the browser gave us no way to drive.
+    fn keep_feedback(
+        &self,
+        stream: &MoonlightStream,
+        message: &gsa_backend_moonlight::HostMessage,
+    ) {
+        use gsa_client_backend_api::{BackendEvent, GamepadFeedback};
+        let Some(BackendEvent::Feedback(feedback)) = message.neutral() else {
+            return;
+        };
+        let seat = feedback.seat();
+        let Some(pad) = stream.input.pads().into_iter().find(|pad| pad.seat == seat) else {
+            return;
+        };
+        if !pad.profile.caps.contains(feedback.requires()) {
+            return;
+        }
+        let kept = match feedback {
+            GamepadFeedback::Rumble { low, high, .. } => WebFeedback {
+                kind: "rumble",
+                seat,
+                low,
+                high,
+                rgb: [0; 3],
+            },
+            GamepadFeedback::TriggerRumble { left, right, .. } => WebFeedback {
+                kind: "trigger_rumble",
+                seat,
+                low: left,
+                high: right,
+                rgb: [0; 3],
+            },
+            GamepadFeedback::Led { rgb, .. } => WebFeedback {
+                kind: "led",
+                seat,
+                low: 0,
+                high: 0,
+                rgb,
+            },
+            // Trigger effects are the game's own opaque blobs and do not fit
+            // this shape; they arrive with their own slice, as will anything
+            // the client's vocabulary grows later.
+            _ => return,
+        };
+        self.inner.feedback.borrow_mut().push_back(kept);
     }
 
     /// The codec the host is sending.
@@ -218,6 +306,10 @@ impl WebStream {
 
     /// The next host message, or `undefined` when none is waiting. Never
     /// blocks: poll it from the frame loop.
+    ///
+    /// Anything the host says that is an effect for one of this client's pads
+    /// is also put aside here, in the neutral form and only where the pad can
+    /// render it, for [`WebStream::next_feedback`].
     #[wasm_bindgen]
     pub fn next_event(&self) -> Result<JsValue, JsValue> {
         let stream = self.inner.stream.borrow();
@@ -225,8 +317,26 @@ impl WebStream {
             return Ok(JsValue::UNDEFINED);
         };
         match stream.events.try_recv() {
-            Ok(message) => serde_wasm_bindgen::to_value(&message).map_err(|e| e.into()),
+            Ok(message) => {
+                self.keep_feedback(stream, &message);
+                serde_wasm_bindgen::to_value(&message).map_err(|e| e.into())
+            }
             Err(_) => Ok(JsValue::UNDEFINED),
+        }
+    }
+
+    /// The next effect one of this client's pads should render, or
+    /// `undefined` when none is waiting.
+    ///
+    /// Already decided: the host's own message turned into the client's
+    /// neutral vocabulary, addressed to a seat this client holds, and only
+    /// when that pad can actually do it. A page renders what it is given
+    /// rather than working out whether a controller has motors.
+    #[wasm_bindgen]
+    pub fn next_feedback(&self) -> Result<JsValue, JsValue> {
+        match self.inner.feedback.borrow_mut().pop_front() {
+            Some(feedback) => serde_wasm_bindgen::to_value(&feedback).map_err(Into::into),
+            None => Ok(JsValue::UNDEFINED),
         }
     }
 
@@ -259,17 +369,19 @@ impl WebStream {
     ///
     /// The core decides what the pad is, from the same rules every client
     /// uses, so the host builds a matching device and the interface can say
-    /// "Xbox Controller" rather than "Controller". Capabilities stay empty:
-    /// the Gamepad API carries buttons, sticks and triggers and nothing else,
-    /// whatever the pad in the user's hands can do.
+    /// "Xbox Controller" rather than "Controller". Capabilities come from
+    /// what this browser can actually drive, not from what the controller in
+    /// the user's hands can do: the Gamepad API carries buttons, sticks,
+    /// triggers and whichever rumble effects its actuator names.
     #[wasm_bindgen]
-    pub fn announce_gamepad(&self, seat: u8, id: &str) {
-        use gsa_client_backend_api::{GamepadProfile, PadCaps, PadKind};
+    pub fn announce_gamepad(&self, seat: u8, id: &str, effects: Vec<String>) {
+        use gsa_client_backend_api::{GamepadProfile, PadKind};
         if let Some(stream) = self.inner.stream.borrow().as_ref() {
             let kind = PadKind::from_browser_id(id);
+            let caps = browser_haptics(&effects);
             stream
                 .input
-                .announce_pad(seat, GamepadProfile::new(kind, PadCaps::NONE));
+                .announce_pad(seat, GamepadProfile::new(kind, caps));
         }
     }
 
