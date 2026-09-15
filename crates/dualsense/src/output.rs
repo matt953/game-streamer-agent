@@ -267,6 +267,18 @@ mod tests {
         assert_eq!(&frame[end..], &want.to_le_bytes());
     }
 
+    /// The canonical CRC-32 check value. The pad's framing is only as good as
+    /// this being the same CRC-32 everyone else means — a private variant
+    /// would pass every test written against itself and be refused by the
+    /// controller.
+    #[test]
+    fn the_crc_is_the_standard_one() {
+        assert_eq!(crc32(b"123456789", 0), 0xCBF4_3926);
+        // And seeding is chaining: the tag byte then the rest is one CRC over
+        // both, which is what lets the pad's header take part in it.
+        assert_eq!(crc32(b"56789", crc32(b"1234", 0)), crc32(b"123456789", 0),);
+    }
+
     #[test]
     fn silence_clears_every_rumble_bit() {
         let mut encoder = OutputEncoder::new();
