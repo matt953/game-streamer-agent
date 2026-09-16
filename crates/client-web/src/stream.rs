@@ -5,7 +5,7 @@ use crate::authority::JsAuthority;
 use crate::to_js;
 use crate::transport::WebTunnel;
 use gsa_backend_moonlight::tunnel::TunnelLinks;
-use gsa_backend_moonlight::{MoonlightStream, StreamMode, start_with};
+use gsa_backend_moonlight::{MoonlightStream, SessionAuthority, StreamMode, start_with};
 use gsa_client_backend_api::BackendFrame;
 use gsa_core::Error;
 use gsa_core::error::ProtocolError;
@@ -27,6 +27,10 @@ pub struct WebStream {
 
 #[derive(Debug)]
 struct Inner {
+    /// Kept for the life of the stream: what the host is asked for after it
+    /// has started — a new bitrate today — goes back through the same
+    /// authority the session was launched with.
+    authority: JsAuthority,
     stream: RefCell<Option<MoonlightStream>>,
     frames: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<BackendFrame>>,
     codec: Codec,
@@ -247,12 +251,24 @@ impl WebStream {
             .ok_or_else(|| to_js(Error::Session("frames already claimed".into())))?;
         Ok(Self {
             inner: Rc::new(Inner {
+                authority,
                 codec: stream.codec,
                 stream: RefCell::new(Some(stream)),
                 frames: tokio::sync::Mutex::new(frames),
                 feedback: RefCell::new(std::collections::VecDeque::new()),
             }),
         })
+    }
+
+    /// Encode this session at `kbps` from now on: the whole rate this
+    /// client will receive, its FEC share included.
+    ///
+    /// Rejects with `unsupported` where the host has no such verb, which is
+    /// what a page should read to disable the control rather than offer one
+    /// that does nothing.
+    #[wasm_bindgen]
+    pub async fn set_bitrate(&self, kbps: u32) -> Result<(), JsValue> {
+        self.inner.authority.set_bitrate(kbps).await.map_err(to_js)
     }
 
     /// Put aside anything in `message` that a pad of ours should render.

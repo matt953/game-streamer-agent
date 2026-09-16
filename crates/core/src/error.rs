@@ -34,6 +34,11 @@ pub enum Error {
     #[error("config: {0}")]
     Config(String),
 
+    /// The host does not offer this at all. Distinct from a failure: a
+    /// control for something unsupported belongs greyed out, not retried.
+    #[error("unsupported by this host: {0}")]
+    Unsupported(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

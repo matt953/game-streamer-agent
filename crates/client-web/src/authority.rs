@@ -37,6 +37,14 @@ impl JsAuthority {
         Ok(Self { object })
     }
 
+    /// Whether the authority carries `method` at all.
+    fn has(&self, method: &str) -> bool {
+        js_sys::Reflect::get(&self.object, &JsValue::from_str(method))
+            .ok()
+            .and_then(|value| value.dyn_into::<js_sys::Function>().ok())
+            .is_some()
+    }
+
     /// Call `method` with `args`, await its promise, and deserialise.
     async fn call<T: serde::de::DeserializeOwned>(
         &self,
@@ -88,5 +96,17 @@ impl SessionAuthority for JsAuthority {
 
     async fn cancel(&self) -> Result<()> {
         self.call_raw("cancel", &[]).await.map(|_| ())
+    }
+
+    async fn set_bitrate(&self, kbps: u32) -> Result<()> {
+        // An authority written before this existed simply has no such
+        // method, which is a host that cannot do it rather than one that
+        // failed to.
+        if !self.has("setBitrate") {
+            return Err(Error::Unsupported("changing the bitrate".into()));
+        }
+        self.call_raw("setBitrate", &[JsValue::from(kbps)])
+            .await
+            .map(|_| ())
     }
 }

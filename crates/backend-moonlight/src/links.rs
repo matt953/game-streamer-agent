@@ -30,6 +30,17 @@ pub trait SessionAuthority {
     ) -> impl std::future::Future<Output = Result<LaunchedSession>>;
     /// Stop whatever the host is streaming. Safe to call when idle.
     fn cancel(&self) -> impl std::future::Future<Output = Result<()>>;
+    /// Encode the session this client is watching at `kbps` from now on.
+    ///
+    /// The rate is the whole the client will receive, its FEC share
+    /// included, which is what a person setting a bitrate means by it; the
+    /// host takes the parity off before telling its encoder. Hosts that
+    /// cannot do this answer [`Error::Unsupported`], and a control offering
+    /// it belongs disabled rather than silently doing nothing.
+    fn set_bitrate(&self, kbps: u32) -> impl std::future::Future<Output = Result<()>> {
+        let _ = kbps;
+        async { Err(gsa_core::Error::Unsupported("changing the bitrate".into())) }
+    }
 }
 
 /// Opens the channels of one negotiated session.
