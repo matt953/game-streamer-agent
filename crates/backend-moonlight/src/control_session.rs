@@ -78,6 +78,11 @@ pub enum HostMessage {
     /// The host's own word on its virtual pad for `seat`: live, or gone. Only
     /// hosts that announce [`HostMessage::PadsReported`] send these.
     PadState { seat: u8, live: bool },
+    /// Another client took the session over; `by` names its device. The
+    /// host terminates this connection right after, so the reason for that
+    /// termination is known before it arrives. The session itself lives on
+    /// — it can be taken back the same way.
+    Displaced { by: String },
     /// What the game wrote to the virtual pad's player-light row: a five-bit
     /// mask plus the pad's own "no fade" bit, forwarded untouched.
     PlayerLights { seat: u8, mask: u8 },
@@ -624,6 +629,20 @@ fn interpret(plaintext: &[u8]) -> Option<HostMessage> {
             _ => None,
         };
     }
+    if kind == msg::DISPLACED && payload.len() >= 6 {
+        let magic = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        if magic != msg::PAD_STATE_MAGIC || payload[4] != msg::PAD_STATE_VERSION {
+            return None;
+        }
+        // `len(u8) | name(len bytes, UTF-8)`; a name cut short by the wire is
+        // still a name.
+        let len = usize::from(payload[5]);
+        let name = payload.get(6..).unwrap_or(&[]);
+        let name = &name[..len.min(name.len())];
+        return Some(HostMessage::Displaced {
+            by: String::from_utf8_lossy(name).into_owned(),
+        });
+    }
     if kind == msg::PAD_LIGHTS && payload.len() >= 8 {
         let magic = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
         if magic != msg::PAD_STATE_MAGIC || payload[4] != msg::PAD_STATE_VERSION {
@@ -930,6 +949,39 @@ mod tests {
     /// introduce itself with our magic and version must be refused rather than
     /// read: that is what keeps a future upstream message on this type from
     /// being silently misparsed as a pad state.
+    /// A takeover names the device that did it, behind our magic and
+    /// version like every message of ours; a body without them is refused.
+    #[test]
+    fn a_takeover_names_the_device_that_took_over() {
+        let body = |magic: u32, version: u8, name: &[u8]| {
+            let mut b = magic.to_be_bytes().to_vec();
+            b.push(version);
+            b.push(name.len() as u8);
+            b.extend_from_slice(name);
+            message(msg::DISPLACED, &b)
+        };
+        assert_eq!(
+            interpret(&body(
+                msg::PAD_STATE_MAGIC,
+                msg::PAD_STATE_VERSION,
+                "Matt's phone".as_bytes()
+            )),
+            Some(HostMessage::Displaced {
+                by: "Matt's phone".into()
+            })
+        );
+        assert_eq!(
+            interpret(&body(0x1234_5678, msg::PAD_STATE_VERSION, b"x")),
+            None,
+            "not ours"
+        );
+        assert_eq!(
+            interpret(&body(msg::PAD_STATE_MAGIC, msg::PAD_STATE_VERSION, b"")),
+            Some(HostMessage::Displaced { by: String::new() }),
+            "a nameless device still displaces"
+        );
+    }
+
     #[test]
     fn pad_state_is_read_only_when_it_identifies_itself() {
         let body = |magic: u32, version: u8, seat: u8, state: u8| {
