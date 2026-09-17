@@ -325,6 +325,9 @@ pub enum SessionOrigin {
     Launched,
     /// We rejoined a session the host was already running.
     Rejoined,
+    /// We joined a session someone else opened to be watched together. The
+    /// game is not ours: leaving does not end it.
+    Joined,
 }
 
 /// A streaming protocol the client can speak.

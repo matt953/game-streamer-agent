@@ -260,6 +260,60 @@ impl WebStream {
         })
     }
 
+    /// Join a session someone else opened to be watched together.
+    ///
+    /// The same stream as [`WebStream::start`], reached the other way: the
+    /// session is already running and is not ours, so nothing here launches
+    /// anything or cancels anything on a retry.
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn join(
+        tunnel: &WebTunnel,
+        authority: JsValue,
+        session_id: String,
+        code: Option<String>,
+        mode: JsValue,
+        bitrate_kbps: u32,
+        codecs: Vec<String>,
+        audio: JsValue,
+    ) -> Result<WebStream, JsValue> {
+        let mode: StreamMode = serde_wasm_bindgen::from_value(mode).map_err(|e| {
+            to_js(Error::Protocol(ProtocolError::Deserialize(format!(
+                "mode: {e}"
+            ))))
+        })?;
+        let codecs = codecs
+            .iter()
+            .map(|name| codec_from_name(name))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_js)?;
+        let mut authority = JsAuthority::new(authority).map_err(to_js)?;
+        let mut links = TunnelLinks::new(tunnel.clone(), Box::new(JsOpusSink::new(audio)));
+        let mut stream = gsa_backend_moonlight::join_with(
+            &mut authority,
+            &mut links,
+            &session_id,
+            code.as_deref(),
+            mode,
+            bitrate_kbps,
+            &codecs,
+        )
+        .await
+        .map_err(to_js)?;
+        let frames = stream
+            .take_frames()
+            .ok_or_else(|| to_js(Error::Session("frames already claimed".into())))?;
+        Ok(Self {
+            inner: Rc::new(Inner {
+                authority,
+                codec: stream.codec,
+                stream: RefCell::new(Some(stream)),
+                frames: tokio::sync::Mutex::new(frames),
+                feedback: RefCell::new(std::collections::VecDeque::new()),
+            }),
+        })
+    }
+
     /// Encode this session at `kbps` from now on: the whole rate this
     /// client will receive, its FEC share included.
     ///

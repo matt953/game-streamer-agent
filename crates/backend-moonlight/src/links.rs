@@ -41,6 +41,21 @@ pub trait SessionAuthority {
         let _ = kbps;
         async { Err(gsa_core::Error::Unsupported("changing the bitrate".into())) }
     }
+    /// Join a session someone else opened to be watched together, giving
+    /// `code` where the lobby asks for one.
+    ///
+    /// Distinct from [`SessionAuthority::resume`], which rejoins a session
+    /// of one's own: this one belongs to somebody else, and the reply is the
+    /// same shape a launch gives so everything after it is identical.
+    fn join(
+        &self,
+        session_id: &str,
+        code: Option<&str>,
+        mode: StreamMode,
+    ) -> impl std::future::Future<Output = Result<LaunchedSession>> {
+        let _ = (session_id, code, mode);
+        async { Err(gsa_core::Error::Unsupported("joining a lobby".into())) }
+    }
 }
 
 /// Opens the channels of one negotiated session.

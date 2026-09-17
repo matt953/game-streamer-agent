@@ -385,6 +385,70 @@ pub async fn start_with<A: SessionAuthority, L: StreamLinks>(
     ))
 }
 
+/// Join a session someone else opened, and bring every stream up over
+/// `links`.
+///
+/// Unlike [`start_with`] this never launches and never cancels: the session
+/// is not ours to start or to end, and a retry that cancelled would stop a
+/// game other people are in the middle of playing.
+pub async fn join_with<A: SessionAuthority, L: StreamLinks>(
+    authority: &mut A,
+    links: &mut L,
+    session_id: &str,
+    code: Option<&str>,
+    mode: StreamMode,
+    bitrate_kbps: u32,
+    decode_codecs: &[Codec],
+) -> Result<MoonlightStream> {
+    const FIRST_MEDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const SETTLE: [u64; 3] = [0, 2, 4];
+
+    let (host_codecs, app_version) = match authority.server_info().await {
+        Ok(info) => (
+            codec::HostCodecs {
+                modes: info.codec_mode_support,
+                max_luma_hevc: info.max_luma_pixels_hevc,
+            },
+            info.app_version,
+        ),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read host capabilities; assuming H.264");
+            (codec::HostCodecs::default(), String::new())
+        }
+    };
+    let modern_start = app_version_at_least(&app_version, 7, 1, 431);
+    let chosen = codec::choose(host_codecs, decode_codecs);
+
+    for (attempt, settle) in SETTLE.iter().enumerate() {
+        if *settle > 0 {
+            gsa_core::runtime::sleep(std::time::Duration::from_secs(*settle)).await;
+        }
+        let launched = authority.join(session_id, code, mode).await?;
+        let mut stream = connect(
+            &launched,
+            links,
+            mode,
+            bitrate_kbps,
+            chosen,
+            host_codecs,
+            modern_start,
+        )
+        .await?;
+        stream.origin = SessionOrigin::Joined;
+        if stream.wait_for_media(FIRST_MEDIA_TIMEOUT).await {
+            if attempt > 0 {
+                tracing::info!(attempt, "media flowing after retry");
+            }
+            return Ok(stream);
+        }
+        drop(stream);
+        tracing::warn!(attempt, "the lobby accepted us but sent no media");
+    }
+    Err(Error::Session(
+        "the lobby accepted us but never sent media, after three attempts".into(),
+    ))
+}
+
 /// Start the app, or rejoin the one the host is already running.
 ///
 /// The host's state must be read first: launching over a session the host

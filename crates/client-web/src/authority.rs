@@ -98,6 +98,26 @@ impl SessionAuthority for JsAuthority {
         self.call_raw("cancel", &[]).await.map(|_| ())
     }
 
+    async fn join(
+        &self,
+        session_id: &str,
+        code: Option<&str>,
+        mode: StreamMode,
+    ) -> Result<LaunchedSession> {
+        if !self.has("join") {
+            return Err(Error::Unsupported("joining a lobby".into()));
+        }
+        self.call(
+            "join",
+            &[
+                JsValue::from_str(session_id),
+                code.map(JsValue::from_str).unwrap_or(JsValue::NULL),
+                mode_value(mode)?,
+            ],
+        )
+        .await
+    }
+
     async fn set_bitrate(&self, kbps: u32) -> Result<()> {
         // An authority written before this existed simply has no such
         // method, which is a host that cannot do it rather than one that

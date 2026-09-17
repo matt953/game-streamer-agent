@@ -52,7 +52,7 @@ pub use audio::PcmSink;
 pub use audio::{AudioCipher, AudioReceive, OpusSink, SinkBox};
 #[cfg(feature = "native")]
 pub use backend::start;
-pub use backend::{MoonlightStream, start_with};
+pub use backend::{MoonlightStream, join_with, start_with};
 pub use control::{Crypto, message, message_type, msg};
 pub use control_session::{
     Command, ControlLink, ControlSession, Delivery, HostMessage, LinkEvent, Outgoing, drive,
