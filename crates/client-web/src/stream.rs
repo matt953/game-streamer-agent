@@ -1,10 +1,10 @@
 //! The stream handle JavaScript drives.
 
-use crate::audio::JsOpusSink;
+use crate::audio::{JsOpusSink, JsVoiceSink};
 use crate::authority::JsAuthority;
 use crate::to_js;
 use crate::transport::WebTunnel;
-use gsa_backend_moonlight::tunnel::TunnelLinks;
+use gsa_backend_moonlight::tunnel::{TunnelLinks, TunnelVoice};
 use gsa_backend_moonlight::{MoonlightStream, SessionAuthority, StreamMode, start_with};
 use gsa_client_backend_api::BackendFrame;
 use gsa_core::Error;
@@ -37,6 +37,8 @@ struct Inner {
     /// Effects waiting for the page to render, already filtered to what the
     /// pad on that seat can do.
     feedback: RefCell<std::collections::VecDeque<WebFeedback>>,
+    /// Speaking into the room this stream is of.
+    voice: TunnelVoice<WebTunnel>,
 }
 
 /// One effect for one pad, as the page renders it. Flat rather than tagged:
@@ -213,8 +215,11 @@ impl WebStream {
     ///
     /// `mode` is a `StreamMode` object, `codecs` the decoder's codecs by
     /// name (`"h264"`, `"hevc"`, `"av1"`) best first, `audio` an object with
-    /// `frame(bytes)` and `lost(count)` for the Opus packets.
+    /// `frame(bytes)` and `lost(count)` for the Opus packets, and `voice` an
+    /// object with `heard(from, seq, bytes)` for the voices of the other
+    /// people in the game.
     #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         tunnel: &WebTunnel,
         authority: JsValue,
@@ -223,6 +228,7 @@ impl WebStream {
         bitrate_kbps: u32,
         codecs: Vec<String>,
         audio: JsValue,
+        voice: JsValue,
     ) -> Result<WebStream, JsValue> {
         let mode: StreamMode = serde_wasm_bindgen::from_value(mode).map_err(|e| {
             to_js(Error::Protocol(ProtocolError::Deserialize(format!(
@@ -235,7 +241,9 @@ impl WebStream {
             .collect::<Result<Vec<_>, _>>()
             .map_err(to_js)?;
         let mut authority = JsAuthority::new(authority).map_err(to_js)?;
-        let mut links = TunnelLinks::new(tunnel.clone(), Box::new(JsOpusSink::new(audio)));
+        let mut links = TunnelLinks::new(tunnel.clone(), Box::new(JsOpusSink::new(audio)))
+            .with_voice(Box::new(JsVoiceSink::new(voice)));
+        let voice = links.voice_sender();
         let mut stream = start_with(
             &mut authority,
             &mut links,
@@ -256,6 +264,7 @@ impl WebStream {
                 stream: RefCell::new(Some(stream)),
                 frames: tokio::sync::Mutex::new(frames),
                 feedback: RefCell::new(std::collections::VecDeque::new()),
+                voice,
             }),
         })
     }
@@ -276,6 +285,7 @@ impl WebStream {
         bitrate_kbps: u32,
         codecs: Vec<String>,
         audio: JsValue,
+        voice: JsValue,
     ) -> Result<WebStream, JsValue> {
         let mode: StreamMode = serde_wasm_bindgen::from_value(mode).map_err(|e| {
             to_js(Error::Protocol(ProtocolError::Deserialize(format!(
@@ -288,7 +298,9 @@ impl WebStream {
             .collect::<Result<Vec<_>, _>>()
             .map_err(to_js)?;
         let mut authority = JsAuthority::new(authority).map_err(to_js)?;
-        let mut links = TunnelLinks::new(tunnel.clone(), Box::new(JsOpusSink::new(audio)));
+        let mut links = TunnelLinks::new(tunnel.clone(), Box::new(JsOpusSink::new(audio)))
+            .with_voice(Box::new(JsVoiceSink::new(voice)));
+        let voice = links.voice_sender();
         let mut stream = gsa_backend_moonlight::join_with(
             &mut authority,
             &mut links,
@@ -310,8 +322,22 @@ impl WebStream {
                 stream: RefCell::new(Some(stream)),
                 frames: tokio::sync::Mutex::new(frames),
                 feedback: RefCell::new(std::collections::VecDeque::new()),
+                voice,
             }),
         })
+    }
+
+    /// Say one 48 kHz mono Opus frame into the game: the host relays it to
+    /// everybody else here, and never back to this client.
+    ///
+    /// Unreliable, like every other datagram: a frame that will not fit or
+    /// cannot go out now is dropped rather than queued, because late speech
+    /// is worse than missing speech.
+    #[wasm_bindgen]
+    pub fn send_voice(&self, opus: &[u8]) {
+        if let Err(e) = self.inner.voice.speak(opus) {
+            tracing::debug!(error = %e, "a voice frame did not go out");
+        }
     }
 
     /// Encode this session at `kbps` from now on: the whole rate this

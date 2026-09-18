@@ -10,11 +10,13 @@
 use crate::links::StreamLinks;
 use crate::{
     AudioReceive, ControlLink, Delivery, LaunchedSession, LinkEvent, MediaDatagram, MediaLink,
-    Negotiated, Outgoing, Rtsp, RtspExchange, SinkBox,
+    Negotiated, Outgoing, Rtsp, RtspExchange, SinkBox, VoiceBox,
 };
 use gsa_core::runtime::MaybeSend;
 use gsa_core::{Error, Result};
-use gsa_tunnel::{Datagram, Frame, FrameReader, Hello, Reject, StreamKind, Welcome, datagram};
+use gsa_tunnel::{
+    Datagram, Frame, FrameReader, Hello, Reject, StreamKind, Voice, Welcome, datagram,
+};
 use std::future::Future;
 
 /// The sending half of one bidirectional stream.
@@ -53,6 +55,7 @@ pub trait TunnelSession: Clone + MaybeSend + 'static {
 pub struct TunnelLinks<S: TunnelSession> {
     session: S,
     audio: Option<SinkBox>,
+    voice: Option<VoiceBox>,
     control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LinkEvent>>,
     media_rx: Option<tokio::sync::mpsc::UnboundedReceiver<MediaDatagram>>,
     pump: Option<Pump>,
@@ -82,6 +85,7 @@ impl<S: TunnelSession> TunnelLinks<S> {
         Self {
             session,
             audio: Some(audio),
+            voice: None,
             control_rx: Some(control_rx),
             media_rx: Some(media_rx),
             pump: Some(Pump {
@@ -91,6 +95,22 @@ impl<S: TunnelSession> TunnelLinks<S> {
         }
     }
 
+    /// Hear the other people in this game: their frames go to `voice` as
+    /// they arrive, each stamped with whoever said it. Without this the
+    /// room's voice is simply not listened to, and the host's relay falls
+    /// on a closed session. Must be set before the links are opened, since
+    /// that is when the datagram pump starts.
+    #[must_use]
+    pub fn with_voice(mut self, voice: VoiceBox) -> Self {
+        self.voice = Some(voice);
+        self
+    }
+
+    /// A handle for speaking into this game, which numbers the frames.
+    pub fn voice_sender(&self) -> TunnelVoice<S> {
+        TunnelVoice::new(self.session.clone())
+    }
+
     /// Start routing datagrams by tag, once. Runs until the session ends;
     /// closing the channels then tells both links.
     fn start_pump(&mut self) {
@@ -98,6 +118,7 @@ impl<S: TunnelSession> TunnelLinks<S> {
             return;
         };
         let session = self.session.clone();
+        let mut voice = self.voice.take();
         gsa_core::runtime::spawn(async move {
             let clock = gsa_core::time::MediaClock::new();
             while let Some(bytes) = session.recv_datagram().await {
@@ -120,6 +141,15 @@ impl<S: TunnelSession> TunnelLinks<S> {
                     datagram::CONTROL => {
                         if control.send(LinkEvent::Frame(payload.to_vec())).is_err() {
                             return;
+                        }
+                    }
+                    datagram::VOICE => {
+                        // A page that is not listening drops them here: one
+                        // person's voice is never worth holding the pump up.
+                        if let Some(sink) = voice.as_mut()
+                            && let Ok(said) = Voice::decode(payload)
+                        {
+                            sink.heard(said.from, said.seq, said.opus);
                         }
                     }
                     other => tracing::debug!(tag = other, "datagram with an unknown tag"),
@@ -366,6 +396,35 @@ impl<S: TunnelSession> ControlLink for TunnelControlLink<S> {
             writer.finish().await;
         }
         self.writers.clear();
+    }
+}
+
+/// Speaking into a game: Opus frames out on the tunnel, numbered so the
+/// people hearing them can tell a gap from a reordering.
+///
+/// Cheap to clone; every clone keeps its own count, so one per speaking
+/// path is the point rather than an accident.
+#[derive(Debug)]
+pub struct TunnelVoice<S: TunnelSession> {
+    session: S,
+    seq: std::sync::atomic::AtomicU16,
+}
+
+impl<S: TunnelSession> TunnelVoice<S> {
+    #[must_use]
+    pub fn new(session: S) -> Self {
+        Self {
+            session,
+            seq: std::sync::atomic::AtomicU16::new(0),
+        }
+    }
+
+    /// Say one Opus frame. The speaker is left at 0: the host knows whose
+    /// tunnel this is and stamps it, so nobody can speak as somebody else.
+    pub fn speak(&self, opus: &[u8]) -> Result<()> {
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.session
+            .send_datagram(&Voice { from: 0, seq, opus }.encode())
     }
 }
 
@@ -733,5 +792,77 @@ mod tests {
         let (_audio, pcm) = links.audio(&negotiated()).unwrap();
         assert!(pcm.try_recv().is_err());
         assert!(links.audio(&negotiated()).is_err());
+    }
+    /// A room's voices arrive one speaker at a time, and speaking never
+    /// claims to be anybody: the host decides whose voice a frame is.
+    #[tokio::test]
+    async fn voices_arrive_named_and_leave_anonymous() {
+        /// (speaker, counter, frame), in the order they were heard.
+        type Said = Vec<(u16, u16, Vec<u8>)>;
+        #[derive(Clone, Default)]
+        struct Heard(Arc<Mutex<Said>>);
+        impl crate::VoiceSink for Heard {
+            fn heard(&mut self, from: u16, seq: u16, opus: &[u8]) {
+                self.0.lock().unwrap().push((from, seq, opus.to_vec()));
+            }
+        }
+        let (session, datagrams_in) = mock();
+        let heard = Heard::default();
+        let mut links = TunnelLinks::new(session.clone(), Box::new(CountingSink::default()))
+            .with_voice(Box::new(heard.clone()));
+        let voice = links.voice_sender();
+        let mut media = links.media(&negotiated()).await.unwrap();
+
+        datagrams_in
+            .send(
+                Voice {
+                    from: 4,
+                    seq: 11,
+                    opus: b"alice",
+                }
+                .encode(),
+            )
+            .unwrap();
+        datagrams_in
+            .send(
+                Voice {
+                    from: 7,
+                    seq: 2,
+                    opus: b"bob",
+                }
+                .encode(),
+            )
+            .unwrap();
+        // A voice frame is not media: the media link must not see one.
+        datagrams_in
+            .send([&[datagram::VIDEO][..], b"video-rtp"].concat())
+            .unwrap();
+        assert_eq!(media.recv().await.unwrap().bytes, b"video-rtp");
+        assert_eq!(
+            *heard.0.lock().unwrap(),
+            vec![(4, 11, b"alice".to_vec()), (7, 2, b"bob".to_vec()),]
+        );
+
+        // Two frames out: numbered in order, speaker left for the host.
+        voice.speak(b"hello").unwrap();
+        voice.speak(b"again").unwrap();
+        let sent = session.inner.lock().unwrap().sent_datagrams.clone();
+        assert_eq!(
+            sent,
+            vec![
+                Voice {
+                    from: 0,
+                    seq: 0,
+                    opus: b"hello"
+                }
+                .encode(),
+                Voice {
+                    from: 0,
+                    seq: 1,
+                    opus: b"again"
+                }
+                .encode(),
+            ]
+        );
     }
 }

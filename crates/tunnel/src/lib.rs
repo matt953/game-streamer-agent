@@ -20,6 +20,7 @@
 //! | Control, unreliable | datagrams | tag [`datagram::CONTROL`] |
 //! | Video RTP + FEC | datagrams | tag [`datagram::VIDEO`] |
 //! | Audio RTP + FEC | datagrams | tag [`datagram::AUDIO`] |
+//! | Voice, both directions | datagrams | tag [`datagram::VOICE`] |
 //!
 //! Streams carry length-prefixed [`Frame`]s after their header; the RTSP
 //! stream's first frame is the [`Hello`], answered by one [`Welcome`] byte,
@@ -30,6 +31,10 @@
 //! are the tag byte followed by the payload exactly as it would leave the
 //! UDP socket: the host's RTP and FEC framing is untouched, so the shared
 //! depacketiser reads it unchanged.
+//!
+//! Voice is altc's own: [`Voice`] frames of Opus between the people in one
+//! game, relayed by the host rather than mixed by it, and carried on no
+//! Moonlight channel because Moonlight has none.
 //!
 //! The session token replaces both the ENet connect data and the media ping
 //! payload: the server binds the whole session, streams and datagrams alike,
@@ -55,6 +60,8 @@ pub mod datagram {
     pub const AUDIO: u8 = 1;
     /// Unreliable sealed control messages, either direction.
     pub const CONTROL: u8 = 2;
+    /// One person's voice, either direction: a [`crate::Voice`] frame.
+    pub const VOICE: u8 = 3;
 }
 
 /// What a client-opened stream carries, from its first byte(s).
@@ -293,6 +300,61 @@ impl<'a> Datagram<'a> {
     }
 }
 
+/// One 20 ms Opus frame of somebody's voice.
+///
+/// The same shape both ways, so one encoder and one decoder serve both
+/// ends. On the way *to* the host `from` is not read — the host knows whose
+/// tunnel the datagram arrived on and stamps the speaker itself, which is
+/// also why a client cannot put words in anyone else's mouth — so a client
+/// writes 0 there. On the way *out* to a room it names the speaker, and the
+/// client shows whoever the lobby says that is.
+///
+/// `seq` counts frames from one speaker so a receiver can tell a gap from a
+/// reordering; it wraps, as a 20 ms counter must.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Voice<'a> {
+    /// Who is speaking, as the room numbers them; 0 on the way to the host.
+    pub from: u16,
+    /// This speaker's frame counter.
+    pub seq: u16,
+    /// The Opus frame itself: 48 kHz mono, as WebCodecs produces it.
+    pub opus: &'a [u8],
+}
+
+impl<'a> Voice<'a> {
+    /// The whole datagram, tag included, ready to send.
+    #[must_use]
+    pub fn encode(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + self.opus.len());
+        out.push(datagram::VOICE);
+        out.extend_from_slice(&self.from.to_le_bytes());
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(self.opus);
+        out
+    }
+
+    /// Reads a voice frame from a datagram's payload — what
+    /// [`Datagram::decode`] hands back for [`datagram::VOICE`], the tag
+    /// already taken off.
+    pub fn decode(payload: &'a [u8]) -> Result<Self, Error> {
+        match payload {
+            [a, b, c, d, opus @ ..] => Ok(Self {
+                from: u16::from_le_bytes([*a, *b]),
+                seq: u16::from_le_bytes([*c, *d]),
+                opus,
+            }),
+            _ => Err(Error::Malformed("voice frame shorter than its header")),
+        }
+    }
+
+    /// The same frame said to come from `from`: what the host sends on,
+    /// having decided whose voice this is.
+    #[must_use]
+    pub fn from_speaker(self, from: u16) -> Self {
+        Self { from, ..self }
+    }
+}
+
 /// What can go wrong reading the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -409,5 +471,36 @@ mod tests {
             Err(Error::Malformed("empty datagram"))
         );
         assert_eq!(Datagram::decode(&[2]).unwrap().payload, b"");
+    }
+    #[test]
+    fn a_voice_frame_names_its_speaker_and_survives_the_trip() {
+        let out = Voice {
+            from: 0,
+            seq: 7,
+            opus: b"opus",
+        };
+        let wire = out.encode();
+        assert_eq!(wire[0], datagram::VOICE);
+        let payload = Datagram::decode(&wire).unwrap().payload;
+        // The host stamps the speaker and sends the same frame on.
+        let on = Voice::decode(payload).unwrap().from_speaker(513);
+        assert_eq!(on.seq, 7);
+        let relayed = on.encode();
+        let heard = Voice::decode(Datagram::decode(&relayed).unwrap().payload).unwrap();
+        assert_eq!(
+            heard,
+            Voice {
+                from: 513,
+                seq: 7,
+                opus: b"opus"
+            }
+        );
+        // A frame with nothing but a header is silence, not a malformation;
+        // anything shorter than the header is.
+        assert_eq!(Voice::decode(&[1, 0, 0, 0]).unwrap().opus, b"");
+        assert_eq!(
+            Voice::decode(&[1, 0, 0]),
+            Err(Error::Malformed("voice frame shorter than its header"))
+        );
     }
 }

@@ -49,7 +49,7 @@ mod video;
 
 #[cfg(feature = "native")]
 pub use audio::PcmSink;
-pub use audio::{AudioCipher, AudioReceive, OpusSink, SinkBox};
+pub use audio::{AudioCipher, AudioReceive, OpusSink, SinkBox, VoiceBox, VoiceSink};
 #[cfg(feature = "native")]
 pub use backend::start;
 pub use backend::{MoonlightStream, join_with, start_with};

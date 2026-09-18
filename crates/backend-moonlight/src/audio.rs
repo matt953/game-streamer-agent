@@ -364,3 +364,20 @@ mod tests {
         assert!(!AudioReceive::owns(&[]));
     }
 }
+
+/// Where the voices of the other people in a game go.
+///
+/// The host relays rather than mixes — one frame per speaker, as they said
+/// it — so this is told who is talking as well as what they said, and the
+/// embedder decodes and mixes however it plays sound.
+pub trait VoiceSink {
+    /// One Opus frame from `from`, the room's number for that person, with
+    /// that speaker's own frame counter.
+    fn heard(&mut self, from: u16, seq: u16, opus: &[u8]);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A boxed voice sink: `Send` where threads exist.
+pub type VoiceBox = Box<dyn VoiceSink + Send>;
+#[cfg(target_arch = "wasm32")]
+pub type VoiceBox = Box<dyn VoiceSink>;

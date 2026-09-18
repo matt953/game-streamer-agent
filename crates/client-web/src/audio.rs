@@ -49,3 +49,41 @@ impl OpusSink for JsOpusSink {
         }
     }
 }
+
+/// Calls `heard(from: number, seq: number, bytes: Uint8Array)` on a
+/// JavaScript object: one Opus frame of one person's voice, as the host
+/// relayed it.
+#[derive(Debug)]
+pub struct JsVoiceSink {
+    object: js_sys::Object,
+    heard: Option<js_sys::Function>,
+}
+
+impl JsVoiceSink {
+    /// A page that is not listening passes an empty object, and the room's
+    /// voices are dropped here.
+    #[must_use]
+    pub fn new(object: JsValue) -> Self {
+        let object = object.dyn_into::<js_sys::Object>().unwrap_or_default();
+        let heard = js_sys::Reflect::get(&object, &JsValue::from_str("heard"))
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
+        Self { object, heard }
+    }
+}
+
+impl gsa_backend_moonlight::VoiceSink for JsVoiceSink {
+    fn heard(&mut self, from: u16, seq: u16, opus: &[u8]) {
+        if let Some(heard) = &self.heard {
+            let bytes = js_sys::Uint8Array::from(opus);
+            if let Err(e) = heard.call3(
+                &self.object,
+                &JsValue::from(from),
+                &JsValue::from(seq),
+                &bytes,
+            ) {
+                tracing::debug!(error = ?e, "voice callback failed");
+            }
+        }
+    }
+}
